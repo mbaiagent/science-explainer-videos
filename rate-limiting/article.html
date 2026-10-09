@@ -1,0 +1,368 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>限流算法：固定窗口、滑动窗口、漏桶、令牌桶 · 拾星</title>
+<meta name="description" content="为什么要限流，四种经典算法的原理、动画演示与代码实现，单机与分布式限流，以及被限流之后该怎么做">
+<link rel="stylesheet" href="../assets/article.css">
+<style>:root{--acc:#c084fc}</style>
+</head>
+<body>
+<div class="wrap">
+  <nav class="top"><a href="../index.html">← 拾星 · 全部内容</a><a class="watch" href="landscape.html">▶ 看视频</a></nav>
+  <header class="hero">
+    <div class="tag">拾星 · 计算机与后端</div>
+    <h1>限流算法：固定窗口、滑动窗口、漏桶、令牌桶</h1>
+    <p>为什么要限流，四种经典算法的原理、动画演示与代码实现，单机与分布式限流，以及被限流之后该怎么做</p>
+    <div class="meta">约 12 分钟读完 · 配套视频 1:20</div>
+  </header>
+  <nav class="toc">
+<ul>
+<li><a href="#_1">为什么需要限流</a></li>
+<li><a href="#1">① 固定窗口计数器</a></li>
+<li><a href="#2">② 滑动窗口</a></li>
+<li><a href="#3">③ 漏桶</a></li>
+<li><a href="#4">④ 令牌桶</a></li>
+<li><a href="#_12">四种算法对比</a></li>
+<li><a href="#_13">分布式限流</a></li>
+<li><a href="#_14">在哪一层限流</a></li>
+<li><a href="#_15">被限流之后怎么做</a></li>
+<li><a href="#_19">阈值怎么定</a></li>
+<li><a href="#_20">高频面试题速答</a></li>
+<li><a href="#_21">总结</a></li>
+</ul>
+</nav>
+
+  <article>
+<figure><img src="img/f-4.5.jpg" alt="流量超过系统能力，所有人都用不了" loading="lazy"><figcaption>流量超过系统能力，所有人都用不了</figcaption></figure>
+<h2 id="_1">为什么需要限流</h2>
+<p>任何系统都有处理能力的上限。假设一个服务每秒最多稳定处理 1000 个请求（1000 QPS），而秒杀开始的那一刻涌进来 3000 QPS：</p>
+<ul>
+<li>线程池被占满，请求开始排队，响应越来越慢；</li>
+<li>数据库连接耗尽，慢查询堆积；</li>
+<li>最终服务被拖垮，<strong>所有人</strong>都用不了，包括原本能被正常服务的那 1000 个请求。</li>
+</ul>
+<p><strong>限流</strong>（Rate Limiting）的思路是：只放行系统能承受的那部分请求，超出的部分直接拒绝或排队。宁可让一部分请求失败，也不能让整个系统崩溃。</p>
+<figure><img src="img/f-16.jpg" alt="限流器挡在请求和服务之间" loading="lazy"><figcaption>限流器挡在请求和服务之间</figcaption></figure>
+<p>限流的作用不止于此：</p>
+<table>
+<thead>
+<tr>
+<th>目的</th>
+<th>例子</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>保护系统</td>
+<td>秒杀、大促、突发热点时防止被打垮</td>
+</tr>
+<tr>
+<td>公平使用</td>
+<td>限制单个用户、单个 IP 的请求频率，防止爬虫和恶意刷接口</td>
+</tr>
+<tr>
+<td>控制成本</td>
+<td>调用按次计费的第三方接口、大模型 API 时控制用量</td>
+</tr>
+<tr>
+<td>遵守外部约束</td>
+<td>下游服务或第三方平台本身有调用频率限制</td>
+</tr>
+</tbody>
+</table>
+<p>限流可以有不同的<strong>维度</strong>：按整个接口、按用户、按 IP、按 API Key、按租户等。</p>
+<p>所有限流算法要回答的核心问题都是同一个：<strong>现在这个请求，该不该放行？</strong> 下面用同一组请求来比较四种经典算法。示例中的上限是「每秒 5 个」。</p>
+<h2 id="1">① 固定窗口计数器</h2>
+<figure><img src="img/f-28.jpg" alt="固定窗口：窗口边界处会放过两倍的请求" loading="lazy"><figcaption>固定窗口：窗口边界处会放过两倍的请求</figcaption></figure>
+<h3 id="_2">原理</h3>
+<p>把时间切成固定长度的窗口（比如每 1 秒一个），每个窗口一个计数器：</p>
+<ol>
+<li>请求到来，看它落在哪个窗口；</li>
+<li>计数器小于上限，放行并加 1；否则拒绝；</li>
+<li>进入下一个窗口时，计数器清零。</li>
+</ol>
+<h3 id="_3">代码</h3>
+<pre><code class="language-java">public class FixedWindowLimiter {
+    private final int limit;
+    private final long windowMillis;
+    private long windowStart = System.currentTimeMillis();
+    private int count = 0;
+
+    public FixedWindowLimiter(int limit, long windowMillis) {
+        this.limit = limit;
+        this.windowMillis = windowMillis;
+    }
+
+    public synchronized boolean tryAcquire() {
+        long now = System.currentTimeMillis();
+        if (now - windowStart &gt;= windowMillis) {   // 进入新窗口，清零
+            windowStart = now;
+            count = 0;
+        }
+        if (count &lt; limit) {
+            count++;
+            return true;
+        }
+        return false;
+    }
+}
+</code></pre>
+<p>用 Redis 实现更简单：<code>INCR</code> 一个以「当前秒」命名的 key，第一次创建时设置过期时间。</p>
+<h3 id="_4">问题：窗口边界的突刺</h3>
+<p>假设在第 0.8 到 1.0 秒之间来了 5 个请求，第 1.0 到 1.2 秒之间又来了 5 个。它们分属两个窗口，各自都没超过 5，于是<strong>全部放行</strong>。结果在短短 0.4 秒内放过了 10 个请求，是上限的 2 倍。</p>
+<p>固定窗口实现极其简单，但在窗口切换的瞬间无法真正控制住速率。</p>
+<h2 id="2">② 滑动窗口</h2>
+<figure><img src="img/f-40.jpg" alt="滑动窗口：任何时刻都统计「过去 1 秒」" loading="lazy"><figcaption>滑动窗口：任何时刻都统计「过去 1 秒」</figcaption></figure>
+<h3 id="_5">原理</h3>
+<p>不再使用固定的窗口边界，而是在每个请求到来时，统计<strong>以当前时刻为终点、往前 1 秒</strong>之内已经放行了多少个请求。窗口随时间连续滑动，所以不存在「边界」。</p>
+<p>在同样的请求序列下，第一波 5 个请求放行后，第二波 5 个请求到来时，「过去 1 秒」内已经有 5 个了，于是全部被拒绝，突刺问题解决了。</p>
+<h3 id="_6">两种实现方式</h3>
+<p><strong>滑动日志</strong>：记录每个被放行请求的时间戳，每次请求时删掉 1 秒以前的记录，再看剩下的数量。结果精确，但请求多时占用内存较大。</p>
+<pre><code class="language-java">public class SlidingLogLimiter {
+    private final int limit;
+    private final long windowMillis;
+    private final Deque&lt;Long&gt; log = new ArrayDeque&lt;&gt;();
+
+    public SlidingLogLimiter(int limit, long windowMillis) {
+        this.limit = limit;
+        this.windowMillis = windowMillis;
+    }
+
+    public synchronized boolean tryAcquire() {
+        long now = System.currentTimeMillis();
+        while (!log.isEmpty() &amp;&amp; now - log.peekFirst() &gt;= windowMillis) {
+            log.pollFirst();                       // 移出窗口之外的记录
+        }
+        if (log.size() &lt; limit) {
+            log.addLast(now);
+            return true;
+        }
+        return false;
+    }
+}
+</code></pre>
+<p><strong>滑动窗口计数</strong>：把 1 秒切成 10 个 100 毫秒的小格，每格各自计数，统计时把最近 10 格加起来。格子越细越精确，内存占用固定。Sentinel 等框架就是用这种思路统计 QPS 的。</p>
+<h2 id="3">③ 漏桶</h2>
+<figure><img src="img/f-49.jpg" alt="漏桶：进来再快，流出永远匀速" loading="lazy"><figcaption>漏桶：进来再快，流出永远匀速</figcaption></figure>
+<h3 id="_7">原理</h3>
+<p>想象一个底部有小孔的桶：</p>
+<ul>
+<li>请求像水一样从上面倒进桶里（进入队列）；</li>
+<li>桶底以<strong>固定的速率</strong>漏出水（按固定速度处理请求）；</li>
+<li>桶的容量有限，水满了，再倒进来的就会溢出（请求被拒绝）。</li>
+</ul>
+<p>不管进来的请求多么集中，出去的速度永远是匀速的。</p>
+<h3 id="_8">特点</h3>
+<ul>
+<li><strong>优点</strong>：输出非常平滑，适合保护处理能力固定、经不起任何波动的下游；</li>
+<li><strong>缺点</strong>：无法利用系统的空闲能力应对突发。即使系统此刻很空闲，突然来的一批请求也只能排队、按固定速度慢慢处理，延迟会增加。</li>
+</ul>
+<p>Nginx 的 <code>limit_req</code> 模块就是基于漏桶思想实现的：</p>
+<pre><code class="language-nginx">limit_req_zone $binary_remote_addr zone=api:10m rate=10r/s;
+
+server {
+    location /api/ {
+        limit_req zone=api burst=20 nodelay;   # 允许最多 20 个突发请求
+    }
+}
+</code></pre>
+<h2 id="4">④ 令牌桶</h2>
+<figure><img src="img/f-61.jpg" alt="令牌桶：攒着的令牌可以应对突发" loading="lazy"><figcaption>令牌桶：攒着的令牌可以应对突发</figcaption></figure>
+<h3 id="_9">原理</h3>
+<p>把思路反过来：</p>
+<ul>
+<li>系统以<strong>固定速率</strong>往桶里放「令牌」，比如每秒 5 个；</li>
+<li>桶有容量上限，满了就不再放；</li>
+<li>每个请求必须先从桶里<strong>拿到一个令牌</strong>才能被处理，拿不到就拒绝（或等待）。</li>
+</ul>
+<h3 id="_10">为什么能应对突发</h3>
+<p>系统空闲的时候，令牌会在桶里攒起来。当突发流量到来时，攒下的令牌可以被<strong>立即用掉</strong>，请求不需要排队。</p>
+<p>比如令牌桶容量是 5、每秒放 1 个。平时桶是满的，突然来了 7 个请求：前 5 个立刻拿到令牌通过，后 2 个被拒绝。之后每秒恢复 1 个令牌。</p>
+<p>所以令牌桶<strong>既限制了长期的平均速率，又允许一定程度的突发</strong>，这正是大多数业务想要的，因此它是最常用的限流算法。</p>
+<h3 id="_11">代码</h3>
+<p>实现时不需要真的有一个线程每秒往桶里放令牌，只要在每次请求时，根据距离上次补充过去了多久，「补算」出应该增加的令牌数：</p>
+<pre><code class="language-java">public class TokenBucketLimiter {
+    private final double capacity;      // 桶容量：允许的最大突发
+    private final double ratePerMs;     // 每毫秒补充的令牌数
+    private double tokens;
+    private long lastRefill = System.currentTimeMillis();
+
+    public TokenBucketLimiter(double capacity, double ratePerSecond) {
+        this.capacity = capacity;
+        this.ratePerMs = ratePerSecond / 1000.0;
+        this.tokens = capacity;
+    }
+
+    public synchronized boolean tryAcquire() {
+        long now = System.currentTimeMillis();
+        tokens = Math.min(capacity, tokens + (now - lastRefill) * ratePerMs);  // 补算令牌
+        lastRefill = now;
+        if (tokens &gt;= 1) {
+            tokens -= 1;
+            return true;
+        }
+        return false;
+    }
+}
+</code></pre>
+<p>Google Guava 提供了现成的实现：</p>
+<pre><code class="language-java">RateLimiter limiter = RateLimiter.create(5.0);   // 每秒 5 个许可
+if (limiter.tryAcquire()) {
+    handle(request);
+} else {
+    reject(request);                              // 返回 429
+}
+</code></pre>
+<h2 id="_12">四种算法对比</h2>
+<figure><img src="img/f-73.jpg" alt="怎么选" loading="lazy"><figcaption>怎么选</figcaption></figure>
+<table>
+<thead>
+<tr>
+<th>算法</th>
+<th>原理</th>
+<th>优点</th>
+<th>缺点</th>
+<th>适合</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>固定窗口</td>
+<td>每个窗口一个计数器</td>
+<td>实现最简单，开销最小</td>
+<td>窗口边界可能放过 2 倍流量</td>
+<td>对精度要求不高的场景</td>
+</tr>
+<tr>
+<td>滑动窗口</td>
+<td>统计过去一段时间的请求数</td>
+<td>统计精确，没有边界突刺</td>
+<td>内存或计算开销稍大</td>
+<td>需要精确控制的接口限流</td>
+</tr>
+<tr>
+<td>漏桶</td>
+<td>请求排队，匀速处理</td>
+<td>输出绝对平滑</td>
+<td>不能利用空闲能力应对突发，会增加延迟</td>
+<td>保护处理能力固定的下游</td>
+</tr>
+<tr>
+<td>令牌桶</td>
+<td>匀速产生令牌，请求消耗令牌</td>
+<td>限制平均速率，同时允许突发</td>
+<td>需要合理设置容量和速率</td>
+<td>大多数 API 限流（最常用）</td>
+</tr>
+</tbody>
+</table>
+<h2 id="_13">分布式限流</h2>
+<p>上面的代码都是<strong>单机</strong>限流：每台机器各自计数。如果服务部署了 10 台机器，每台限 100 QPS，整体就是约 1000 QPS。但负载不均衡时，有的机器先触发限流，有的还很空闲。</p>
+<p>如果需要<strong>多台机器共享同一个额度</strong>（比如「每个用户每分钟最多调用 60 次」），计数器必须放在一个公共的地方，最常用的是 Redis。为了保证「读取计数、判断、更新」这几步不被其他请求插队，通常用 <strong>Lua 脚本</strong>让它们在 Redis 中原子执行。</p>
+<p>一个基于有序集合（ZSET）的滑动窗口实现：</p>
+<pre><code class="language-lua">-- KEYS[1]: 限流的 key，如 rate:user:1001
+-- ARGV[1]: 当前时间（毫秒）  ARGV[2]: 窗口长度（毫秒）  ARGV[3]: 上限  ARGV[4]: 本次请求的唯一 ID
+local key, now, window, limit = KEYS[1], tonumber(ARGV[1]), tonumber(ARGV[2]), tonumber(ARGV[3])
+redis.call('ZREMRANGEBYSCORE', key, 0, now - window)          -- 删除窗口之外的记录
+if redis.call('ZCARD', key) &lt; limit then
+  redis.call('ZADD', key, now, ARGV[4])                       -- 记录本次请求
+  redis.call('PEXPIRE', key, window)
+  return 1                                                    -- 放行
+end
+return 0                                                      -- 拒绝
+</code></pre>
+<p>分布式限流要注意：</p>
+<ul>
+<li>每次请求都要访问一次 Redis，会增加延迟，Redis 本身也可能成为瓶颈；</li>
+<li>要想好 Redis 不可用时怎么办：是放行所有请求（保可用），还是拒绝所有请求（保护系统）；</li>
+<li>多台机器的时钟可能有偏差，用 Redis 服务端的时间（<code>TIME</code> 命令）更可靠。</li>
+</ul>
+<h2 id="_14">在哪一层限流</h2>
+<table>
+<thead>
+<tr>
+<th>层次</th>
+<th>工具</th>
+<th>特点</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>接入层 / 网关</td>
+<td>Nginx、API 网关（如 Spring Cloud Gateway、Kong）</td>
+<td>最早拦截，保护整个后端</td>
+</tr>
+<tr>
+<td>服务内部</td>
+<td>Guava RateLimiter、Sentinel、Resilience4j</td>
+<td>粒度细，可以按方法、按参数限流</td>
+</tr>
+<tr>
+<td>下游调用</td>
+<td>客户端侧的速率控制</td>
+<td>遵守第三方接口的调用频率限制</td>
+</tr>
+</tbody>
+</table>
+<p>实践中常常多层组合：网关挡住明显异常的流量，服务内部再做精细控制。</p>
+<h2 id="_15">被限流之后怎么做</h2>
+<h3 id="_16">服务端：给出明确的响应</h3>
+<ul>
+<li>返回 HTTP 状态码 <strong>429 Too Many Requests</strong>；</li>
+<li>通过 <code>Retry-After</code> 响应头告诉客户端多久之后可以重试；</li>
+<li>很多 API 还会返回 <code>X-RateLimit-Limit</code>、<code>X-RateLimit-Remaining</code> 等头部，让客户端知道自己的额度。</li>
+</ul>
+<h3 id="_17">客户端：优雅地重试</h3>
+<ul>
+<li><strong>不要立刻重试</strong>，否则只会让情况更糟；</li>
+<li>使用<strong>指数退避</strong>：第一次等 1 秒，第二次 2 秒，第三次 4 秒……</li>
+<li>加上<strong>随机抖动</strong>，避免大量客户端在同一时刻一起重试；</li>
+<li>设置最大重试次数。</li>
+</ul>
+<h3 id="_18">其他保护手段</h3>
+<p>限流常常和这些机制配合使用：</p>
+<ul>
+<li><strong>熔断</strong>：下游持续出错时，暂时停止调用它，快速失败；</li>
+<li><strong>降级</strong>：关闭非核心功能，或返回兜底数据；</li>
+<li><strong>排队</strong>：对于不着急的请求，放进消息队列慢慢处理（见本系列《消息队列》）。</li>
+</ul>
+<h2 id="_19">阈值怎么定</h2>
+<ol>
+<li><strong>压测</strong>：找到系统在可接受延迟下的最大吞吐量；</li>
+<li><strong>留余量</strong>：阈值设在压测极限的 70%～80% 左右；</li>
+<li><strong>按资源最紧张的环节定</strong>：瓶颈往往在数据库或某个下游，而不是应用本身；</li>
+<li><strong>持续观测和调整</strong>：随着代码和机器配置变化，阈值也要更新。很多框架支持动态修改限流规则，无需重启。</li>
+</ol>
+<h2 id="_20">高频面试题速答</h2>
+<p><strong>Q：令牌桶和漏桶有什么区别？</strong>
+漏桶控制的是<strong>流出速率</strong>，输出绝对平滑，不允许突发；令牌桶控制的是<strong>令牌的产生速率</strong>，桶中攒下的令牌可以应对突发流量。</p>
+<p><strong>Q：固定窗口有什么问题？如何解决？</strong>
+在窗口边界附近可能放过两倍于上限的请求。使用滑动窗口可以解决。</p>
+<p><strong>Q：分布式环境下怎么限流？</strong>
+把计数放到 Redis 等共享存储中，用 Lua 脚本保证原子性；或者使用 Sentinel 集群限流等方案。</p>
+<h2 id="_21">总结</h2>
+<figure><img src="img/f-78.jpg" alt="四种算法" loading="lazy"><figcaption>四种算法</figcaption></figure>
+<ul>
+<li>限流的目的：<strong>宁可拒绝一部分，也不能全部崩溃</strong>；</li>
+<li><strong>固定窗口</strong>最简单，但有边界突刺；<strong>滑动窗口</strong>统计精确；</li>
+<li><strong>漏桶</strong>输出平滑，<strong>令牌桶</strong>允许突发，后者最常用；</li>
+<li>多台机器共享额度时，用 <strong>Redis + Lua</strong> 做分布式限流；</li>
+<li>被限流时返回 <strong>429 + Retry-After</strong>，客户端用<strong>指数退避</strong>重试。</li>
+</ul>
+<div class="refs">
+<h3 id="_22">参考资料</h3>
+<ul>
+<li>Google Guava 文档：<code>com.google.common.util.concurrent.RateLimiter</code>.</li>
+<li>Nginx 文档：ngx_http_limit_req_module.</li>
+<li>Alibaba Sentinel 文档：流量控制.</li>
+<li>RFC 6585：Additional HTTP Status Codes（429 Too Many Requests）.</li>
+<li>Stripe Engineering (2017). Scaling your API with rate limiters.</li>
+</ul>
+</div>
+  </article>
+  <div class="foot"><a href="../index.html">← 拾星首页</a><a href="landscape.html">▶ 看配套视频</a></div>
+</div>
+</body>
+</html>

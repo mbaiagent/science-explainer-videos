@@ -28,6 +28,7 @@
 | 消息队列 | `message-queue/landscape.html` | 横屏 1920×1080 | 84s |
 | Function Calling 与 MCP | `function-calling-mcp/landscape.html` | 横屏 1920×1080 | 80s |
 | CAP 与 BASE | `cap-theorem/landscape.html` | 横屏 1920×1080 | 80s |
+| 限流算法 | `rate-limiting/landscape.html` | 横屏 1920×1080 | 80s |
 
 ### 幸福的科学
 钩子 → 享乐适应（快乐曲线 + 跑步机）→ 哈佛成人发展研究（关系网络）→ 心流（挑战 × 技能坐标图）→ 今晚就能做的 3 件事 → 收尾
@@ -85,6 +86,9 @@
 
 ### CAP 与 BASE
 数据两份网络断了 → C、A、P 的定义 → CP 与 AP 的选择 → 常见系统取舍 → 「三选二」的误解与 PACELC → BASE → 业务怎么选 → 收尾
+
+### 限流算法
+秒杀打垮服务 → 为什么限流 → 固定窗口与边界突刺 → 滑动窗口 → 漏桶 → 令牌桶 → 对比与实战 → 收尾
 
 ## 预览
 
