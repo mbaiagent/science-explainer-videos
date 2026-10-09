@@ -8,8 +8,7 @@
 
 | 主题 | 文件 | 画幅 | 时长 |
 |---|---|---|---|
-| 幸福的科学 | `happiness/vertical.html` | 竖屏 1080×1920（抖音） | 72s |
-| 幸福的科学 | `happiness/landscape.html` | 横屏 1920×1080（B 站） | 72s |
+| 幸福的科学 | `happiness/landscape.html` | 横屏 1920×1080 | 72s |
 | 人生的意义 | `meaning-of-life/landscape.html` | 横屏 1920×1080 | 72s |
 | 什么是 LLM | `llm/landscape.html` | 横屏 1920×1080 | 72s |
 | 从零做一个 Claude Code | `claude-code/landscape.html` | 横屏 1920×1080 | 84s |
