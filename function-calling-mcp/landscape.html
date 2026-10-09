@@ -1,0 +1,339 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Function Calling 与 MCP</title>
+<style>
+  :root{--bg:#07080f;--fg:#f4ede4;--muted:#9a93a8;--acc:#f472b6}
+  html,body{margin:0;height:100%;background:var(--bg);color:var(--fg);
+    font-family:-apple-system,"PingFang SC","Noto Sans SC","Noto Sans CJK SC","Microsoft YaHei",sans-serif}
+  body{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;overflow:hidden}
+  #stage{display:block;background:#07080f;border-radius:12px;box-shadow:0 20px 60px rgba(0,0,0,.55);cursor:pointer}
+  #bar{display:flex;align-items:center;gap:12px;width:min(calc(100vw - 32px),640px)}
+  #btn{width:40px;height:40px;border-radius:50%;border:1px solid rgba(244,114,182,.5);background:transparent;
+    color:var(--acc);font-size:16px;cursor:pointer;flex:none}
+  #seek{flex:1;accent-color:var(--acc)}
+  #time{font-variant-numeric:tabular-nums;font-size:13px;color:var(--muted);min-width:84px;text-align:right}
+  body.render{display:block}
+  body.render #bar{display:none}
+  body.render #stage{border-radius:0;box-shadow:none}
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="bar">
+  <button id="btn" aria-label="播放/暂停">❚❚</button>
+  <input id="seek" type="range" min="0" max="80" step="0.01" value="0">
+  <span id="time">0:00 / 1:20</span>
+</div>
+<script>
+/* ============ 基础设置（横屏 1920×1080） ============ */
+const W = 1920, H = 1080, DUR = 80;
+const cv = document.getElementById('stage'), ctx = cv.getContext('2d');
+cv.width = W; cv.height = H;
+const FONT = '"PingFang SC","Noto Sans SC","Noto Sans CJK SC","Source Han Sans SC","Microsoft YaHei",sans-serif';
+const MONO = '"JetBrains Mono","SF Mono",Menlo,Consolas,"DejaVu Sans Mono","Noto Sans Mono CJK SC","PingFang SC","Microsoft YaHei",monospace';
+const C = {acc:'#f472b6', mint:'#6ee7c8', gold:'#ffd38a', coral:'#ff9e7a', rose:'#ff8a8a', blue:'#9cc3ff', text:'#f4ede4', muted:'#9a93a8', dim:'#4a4558', panel:'#0f0e1f'};
+
+const clamp = (x,a=0,b=1) => Math.max(a, Math.min(b, x));
+const lerp = (a,b,t) => a + (b-a)*t;
+const p = (t,a,b) => clamp((t-a)/(b-a));
+const eo = x => 1 - Math.pow(1-x, 3);
+const eio = x => x < .5 ? 4*x*x*x : 1 - Math.pow(-2*x+2, 3)/2;
+const eback = x => { const c1=1.70158, c3=c1+1; return 1 + c3*Math.pow(x-1,3) + c1*Math.pow(x-1,2); };
+function rnd(seed){ let s = seed>>>0; return () => { s = (s*1664525 + 1013904223)>>>0; return s/4294967296; }; }
+
+let SA = 1;
+const al = a => { ctx.globalAlpha = clamp(SA*a); };
+const sceneA = (t,a,b,f=.5) => Math.min(p(t,a,a+f), 1 - p(t,b-f,b));
+
+function txt(s, x, y, o = {}){
+  const {size=64, weight=700, color=C.text, alpha=1, align='center', glow=0, scale=1, font=FONT} = o;
+  if (alpha <= 0) return;
+  ctx.save(); al(alpha);
+  ctx.font = `${weight} ${size}px ${font}`;
+  ctx.textAlign = align; ctx.textBaseline = 'middle'; ctx.fillStyle = color;
+  if (glow){ ctx.shadowColor = color; ctx.shadowBlur = glow; }
+  if (scale !== 1){ ctx.translate(x, y); ctx.scale(scale, scale); ctx.fillText(s, 0, 0); }
+  else ctx.fillText(s, x, y);
+  ctx.restore();
+}
+function rise(s, x, y, t, t0, o = {}, d = .7){
+  const e = eo(p(t, t0, t0+d));
+  if (e <= 0) return;
+  txt(s, x, y + (1-e)*36, {...o, alpha:(o.alpha ?? 1)*e});
+}
+function rr(x,y,w,h,r){ ctx.beginPath(); ctx.roundRect(x,y,w,h,r); }
+function box(x, y, w, h, a, o = {}){
+  const {fill='rgba(255,255,255,.05)', stroke='rgba(244,114,182,.35)', lw=2, glow=0, r=18, dash=null} = o;
+  if (a <= 0) return;
+  ctx.save(); al(a); rr(x, y, w, h, r); ctx.fillStyle = fill; ctx.fill();
+  if (dash) ctx.setLineDash(dash);
+  ctx.strokeStyle = stroke; ctx.lineWidth = lw; if (glow){ ctx.shadowColor = stroke; ctx.shadowBlur = glow; } ctx.stroke(); ctx.restore();
+}
+function arrow(x1, y1, x2, y2, e, a, color = C.acc, lw = 3){
+  if (e <= 0 || a <= 0) return;
+  const x = lerp(x1, x2, e), y = lerp(y1, y2, e), ang = Math.atan2(y2 - y1, x2 - x1);
+  ctx.save(); al(a); ctx.strokeStyle = color; ctx.fillStyle = color; ctx.lineWidth = lw; ctx.lineCap = 'round';
+  ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x, y); ctx.stroke();
+  if (e > .85){ ctx.translate(x, y); ctx.rotate(ang); ctx.beginPath(); ctx.moveTo(4, 0); ctx.lineTo(-14, -9); ctx.lineTo(-14, 9); ctx.closePath(); ctx.fill(); }
+  ctx.restore();
+}
+function panel(x, y, w, h, title, a){
+  box(x, y, w, h, a, {fill:C.panel, stroke:'rgba(255,255,255,.1)', r:20});
+  if (a <= 0) return;
+  ctx.save(); al(a); ctx.strokeStyle = 'rgba(255,255,255,.07)'; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(x, y + 52); ctx.lineTo(x + w, y + 52); ctx.stroke();
+  ['#ff6b6b','#ffd166','#6ee7a0'].forEach((c, i) => { ctx.fillStyle = c; ctx.globalAlpha = clamp(SA*a*.8); ctx.beginPath(); ctx.arc(x + 30 + i*24, y + 26, 7, 0, 6.283); ctx.fill(); });
+  ctx.restore();
+  txt(title, x + w/2, y + 27, {size:22, weight:500, color:C.muted, font:MONO, alpha:a});
+}
+
+/* ============ 背景 ============ */
+const PARTS = (() => { const r = rnd(163); return Array.from({length:100}, () => ({
+  x:r()*W, y:r()*H, s:r()*2.2+.5, v:r()*12+4, ph:r()*6.283, c:r()<.25})); })();
+function background(t){
+  const g = ctx.createLinearGradient(0,0,W,H);
+  g.addColorStop(0,'#0a0916'); g.addColorStop(.55,'#110f24'); g.addColorStop(1,'#18122c');
+  ctx.globalAlpha = 1; ctx.fillStyle = g; ctx.fillRect(0,0,W,H);
+  const gx = W*.5 + Math.sin(t*.27)*140;
+  const rg = ctx.createRadialGradient(gx, H*.45, 0, gx, H*.45, 950);
+  rg.addColorStop(0,'rgba(244,114,182,0.09)'); rg.addColorStop(1,'rgba(244,114,182,0)');
+  ctx.fillStyle = rg; ctx.fillRect(0,0,W,H);
+  ctx.fillStyle = C.acc;
+  for (let x = 40; x < W; x += 80) for (let y = 40; y < H; y += 80){ ctx.globalAlpha = .06; ctx.fillRect(x, y, 2, 2); }
+  for (const q of PARTS){
+    const y = ((q.y - t*q.v) % H + H) % H, x = q.x + Math.sin(t*.35 + q.ph)*12;
+    ctx.globalAlpha = .2 + .3*(.5 + .5*Math.sin(t*1.2 + q.ph));
+    ctx.fillStyle = q.c ? C.acc : '#d8d0ff';
+    ctx.beginPath(); ctx.arc(x, y, q.s, 0, 6.283); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+}
+function vignette(){
+  const v = ctx.createRadialGradient(W/2, H/2, W*.28, W/2, H/2, W*.62);
+  v.addColorStop(0,'rgba(0,0,0,0)'); v.addColorStop(1,'rgba(0,0,0,.55)');
+  ctx.globalAlpha = 1; ctx.fillStyle = v; ctx.fillRect(0,0,W,H);
+}
+function codeLine(s, x, y, size, a, kw = /\b(public|class|static|void|new|return)\b/){
+  const parts = s.split(/("[^"]*"|\b(?:public|class|static|void|new|return|getstatic|ldc|invokevirtual)\b)/g);
+  ctx.save(); al(a); ctx.font = `500 ${size}px ${MONO}`; ctx.textBaseline = 'middle'; ctx.textAlign = 'left';
+  let xx = x;
+  for (const seg of parts){ if (!seg) continue;
+    ctx.fillStyle = seg.startsWith('"') ? C.mint : /^(public|class|static|void|new|return|getstatic|ldc|invokevirtual)$/.test(seg) ? C.acc : C.text;
+    ctx.fillText(seg, xx, y); xx += ctx.measureText(seg).width; }
+  ctx.restore();
+}
+
+function pill(s, x, y, a, o = {}){
+  const {size=30, color=C.text, stroke='rgba(255,255,255,.2)', fill='rgba(255,255,255,.05)', font=FONT, weight=700} = o;
+  if (a <= 0) return;
+  ctx.save(); ctx.font = `${weight} ${size}px ${font}`; const w = ctx.measureText(s).width + 52; ctx.restore();
+  box(x - w/2, y - size*.9, w, size*1.8, a, {fill, stroke, r:size*.9});
+  txt(s, x, y, {size, weight, color, font, alpha:a});
+}
+function node(s, sub, x, y, w, h, a, o = {}){
+  box(x - w/2, y - h/2, w, h, a, o);
+  txt(s, x, sub ? y - 15 : y, {size:o.size || 30, weight:900, color:o.tc || C.text, alpha:a});
+  if (sub) txt(sub, x, y + 22, {size:22, weight:600, color:o.sc || C.muted, alpha:a});
+}
+function bubble(s, side, y, t, t0, o = {}){
+  const {font=FONT, size=30, color=C.text} = o;
+  const e = eback(p(t, t0, t0 + .5)); if (e <= 0) return;
+  ctx.save(); ctx.font = `600 ${size}px ${font}`; const w = ctx.measureText(s).width + 60; ctx.restore();
+  const x = side === 'r' ? 1500 - w : 420;
+  ctx.save(); ctx.translate(x + (side === 'r' ? w : 0), y); ctx.scale(e, e); ctx.translate(-(x + (side === 'r' ? w : 0)), -y);
+  box(x, y - 36, w, 72, clamp(e), {fill:side === 'r' ? 'rgba(244,114,182,.16)' : 'rgba(255,255,255,.06)', stroke:side === 'r' ? 'rgba(244,114,182,.5)' : 'rgba(255,255,255,.15)', r:24}); ctx.restore();
+  txt(s, x + 30, y + 2, {size, weight:600, font, color, align:'left', alpha:clamp(e)});
+}
+
+/* ============ 场景 1 · 钩子 (0–7s) ============ */
+function s1(t){
+  bubble('北京今天天气怎么样？', 'r', 200, t, .3);
+  bubble('抱歉，我无法获取实时天气信息……', 'l', 310, t, 1.2);
+  rise('大模型只会「说」，不会「做」：查不了实时数据，也动不了外部系统', W/2, 470, t, 2.2, {size:40, weight:900});
+  const k = p(t, 3.6, 4.2);
+  if (k > 0) txt('Function Calling', W/2, 640, {size:96, weight:900, font:MONO, color:C.acc, glow:36, alpha:clamp(k*2), scale:eback(k)});
+  const k2 = p(t, 4.8, 5.4);
+  if (k2 > 0) txt('+ MCP', W/2, 780, {size:80, weight:900, font:MONO, color:C.gold, glow:30, alpha:clamp(k2*2), scale:eback(k2)});
+  rise('给大模型装上「手」，再给这些手定一个统一的接口标准', W/2, 920, t, 5.6, {size:34, weight:700, color:C.muted});
+}
+
+/* ============ 场景 2 · 调用流程 (7–22s) ============ */
+function s2(t){
+  rise('Function Calling：五步走', W/2, 100, t, 7.2, {size:58, weight:900});
+  const a = eo(p(t, 7.6, 8.1));
+  node('你的程序', '', 260, 500, 300, 120, a, {stroke:'rgba(255,255,255,.35)', size:34});
+  node('大模型', '', 960, 260, 300, 120, a, {fill:'rgba(244,114,182,.12)', stroke:C.acc, tc:C.acc, size:34});
+  node('天气 API', '', 1660, 500, 300, 120, a, {stroke:'rgba(255,211,138,.6)', tc:C.gold, size:34});
+  const steps = [
+    ['① 问题 + 工具清单', 8.6, [410, 470], [810, 290], C.text],
+    ['② 我要调用 get_weather', 10.4, [810, 320], [410, 520], C.acc],
+    ['③ 程序真正去调 API', 12.2, [410, 500], [1510, 500], C.gold],
+    ['④ 把结果交还给模型', 14.0, [410, 530], [810, 330], C.mint]
+  ];
+  steps.forEach(([s, ts, f, to, c], i) => {
+    const e = eo(p(t, ts, ts + .7)); arrow(f[0], f[1], to[0], to[1], e, e*.9, c, 3);
+  });
+  const L = [['① 问题 + 工具清单（名字、描述、参数格式）', 8.6, C.text], ['② 模型不回答，而是返回：调用 get_weather，参数 {"city": "北京"}', 10.4, C.acc], ['③ 你的程序去请求真实的天气接口', 12.2, C.gold], ['④ 把「晴，25°C」作为工具结果发回给模型', 14.0, C.mint], ['⑤ 模型回答：「北京今天晴，气温 25°C，适合出门。」', 15.8, C.text]];
+  L.forEach(([s, ts, c], i) => txt(s, 160, 680 + i*52, {size:28, weight:800, color:c, align:'left', alpha:eo(p(t, ts, ts + .5))}));
+  rise('关键：模型自己从不执行任何操作，它只是「决定」调用什么、传什么参数', W/2, 975, t, 17.6, {size:32, weight:900, color:C.gold});
+}
+
+/* ============ 场景 3 · 工具定义 (22–34s) ============ */
+const TD = ['{', '  "name": "get_weather",', '  "description": "查询某个城市当天的天气。', '                  用户问到天气、温度、是否下雨时使用",', '  "input_schema": {', '    "type": "object",', '    "properties": {', '      "city": { "type": "string", "description": "城市名，如 北京" }', '    },', '    "required": ["city"]', '  }', '}'];
+function s3(t){
+  rise('模型怎么知道该用哪个工具？看说明书', W/2, 100, t, 22.2, {size:54, weight:900});
+  const pa = eo(p(t, 22.6, 23.1));
+  panel(110, 180, 1080, 690, '工具定义（以 Anthropic API 格式为例）', pa);
+  TD.forEach((s, i) => {
+    const e = eo(p(t, 23 + i*.18, 23.4 + i*.18)), y = 270 + i*48;
+    const parts = s.split(/("[^"]*"?)/g);
+    ctx.save(); al(e); ctx.font = `500 23px ${MONO}`; ctx.textBaseline = 'middle'; ctx.textAlign = 'left'; let x = 140;
+    parts.forEach((seg, j) => { if (!seg) return; const isStr = seg.startsWith('"'), isKey = isStr && (parts[j + 1] || '').trimStart().startsWith(':');
+      ctx.fillStyle = isKey ? C.blue : isStr ? C.mint : C.muted; ctx.fillText(seg, x, y); x += ctx.measureText(seg).width; });
+    ctx.restore();
+  });
+  const hl = eo(p(t, 26.4, 26.9));
+  box(130, 270 + 2*48 - 24, 1040, 96, hl, {fill:'rgba(0,0,0,0)', stroke:C.gold, lw:3, glow:14, r:10});
+  [['名字', '简短、清楚，像函数名'], ['描述', '最重要：什么时候该用、什么时候不该用'], ['参数格式', '用 JSON Schema 约束类型和必填项']].forEach(([h, d], i) => {
+    const e = eo(p(t, 26.8 + i*.8, 27.2 + i*.8)), y = 290 + i*150;
+    box(1250, y - 55, 560, 120, e, {fill:'rgba(244,114,182,.06)', stroke:'rgba(244,114,182,.45)', r:18});
+    txt(h, 1280, y - 15, {size:32, weight:900, color:C.acc, align:'left', alpha:e}); txt(d, 1280, y + 30, {size:22, weight:600, color:'#d9d2e4', align:'left', alpha:e});
+  });
+  rise('模型还能一次调用多个工具，或者根据上一步的结果连续调用多轮', 1530, 790, t, 30, {size:22, weight:700, color:C.gold});
+  rise('描述写得越清楚，模型选得越准：工具描述就是写给模型看的文档', W/2, 950, t, 31.0, {size:34, weight:900});
+}
+
+/* ============ 场景 4 · M×N 问题 (34–46s) ============ */
+const APPS = ['聊天助手', 'IDE 插件', '客服机器人'], SRVS = ['GitHub', '数据库', '日历', '文件系统'];
+function s4(t){
+  rise('问题来了：每接一个工具，都要写一遍对接代码', W/2, 100, t, 34.2, {size:52, weight:900});
+  const a = eo(p(t, 34.6, 35.1)), mcp = t > 40.2, k = eo(p(t, 40.2, 41.2));
+  APPS.forEach((s, i) => node(s, '', 330, 300 + i*170, 280, 100, a, {size:28, stroke:'rgba(244,114,182,.5)'}));
+  SRVS.forEach((s, i) => node(s, '', 1590, 250 + i*140, 280, 90, a, {size:28, stroke:'rgba(255,211,138,.5)'}));
+  APPS.forEach((_, i) => SRVS.forEach((_, j) => { const e = eo(p(t, 35.4 + (i*4 + j)*.08, 35.8 + (i*4 + j)*.08));
+    ctx.save(); al(e*(1 - k)*.7); ctx.strokeStyle = C.rose; ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(470, 300 + i*170); ctx.lineTo(1450, 250 + j*140); ctx.stroke(); ctx.restore(); }));
+  txt('3 × 4 = 12 套对接代码', 960, 520, {size:40, weight:900, color:C.rose, alpha:eo(p(t, 36.8, 37.2))*(1 - k)});
+  txt('每个应用 × 每个工具，各写一遍', 960, 580, {size:26, weight:700, color:C.muted, alpha:eo(p(t, 37.2, 37.6))*(1 - k)});
+  if (k > 0){
+    node('MCP', '统一协议', 960, 500, 260, 150, k, {fill:'rgba(244,114,182,.18)', stroke:C.acc, lw:3, glow:24, tc:C.acc, size:48});
+    APPS.forEach((_, i) => { ctx.save(); al(k*.8); ctx.strokeStyle = C.acc; ctx.lineWidth = 3; ctx.beginPath(); ctx.moveTo(470, 300 + i*170); ctx.lineTo(830, 500); ctx.stroke(); ctx.restore(); });
+    SRVS.forEach((_, j) => { ctx.save(); al(k*.8); ctx.strokeStyle = C.gold; ctx.lineWidth = 3; ctx.beginPath(); ctx.moveTo(1090, 500); ctx.lineTo(1450, 250 + j*140); ctx.stroke(); ctx.restore(); });
+    txt('3 + 4 = 7 个实现', 960, 640, {size:36, weight:900, color:C.mint, alpha:eo(p(t, 41.2, 41.6))});
+  }
+  rise('MCP（Model Context Protocol）：AI 应用连接外部工具和数据的开放标准', W/2, 880, t, 41.6, {size:36, weight:900});
+  rise('常被比作 AI 世界的「USB-C 接口」：一次实现，处处可用', W/2, 950, t, 43.0, {size:30, weight:700, color:C.gold});
+}
+
+/* ============ 场景 5 · MCP 架构 (46–60s) ============ */
+function s5(t){
+  rise('MCP 的架构', W/2, 100, t, 46.2, {size:58, weight:900});
+  const a = eo(p(t, 46.6, 47.1));
+  box(120, 190, 640, 620, a, {fill:'rgba(244,114,182,.05)', stroke:'rgba(244,114,182,.5)', r:24});
+  txt('Host（宿主应用）', 440, 240, {size:32, weight:900, color:C.acc, alpha:a});
+  txt('如桌面版 AI 助手、IDE', 440, 285, {size:22, weight:600, color:C.muted, alpha:a});
+  node('大模型', '', 440, 380, 300, 90, a, {size:30, stroke:'rgba(255,255,255,.3)'});
+  [0, 1, 2].forEach(i => node('MCP Client', '', 440, 520 + i*95, 300, 74, eo(p(t, 47.4 + i*.3, 47.8 + i*.3)), {size:24, stroke:C.acc, tc:C.acc}));
+  [['GitHub Server', 'stdio（本地）', 520], ['数据库 Server', 'stdio（本地）', 615], ['日历 Server', 'Streamable HTTP（远程）', 710]].forEach(([s, tr, y], i) => {
+    const e = eo(p(t, 48.6 + i*.4, 49 + i*.4));
+    arrow(595, y, 1020, y, e, e, C.gold, 3); txt(tr, 808, y - 20, {size:20, weight:700, color:C.gold, alpha:e});
+    node(s, '', 1170, y, 300, 74, e, {size:24, stroke:'rgba(255,211,138,.6)', tc:C.gold});
+  });
+  txt('每个 Client 和一个 Server 一对一连接', 440, 790, {size:20, weight:600, color:C.muted, alpha:eo(p(t, 49, 49.4))});
+  txt('JSON-RPC 消息', 808, 440, {size:22, weight:800, font:FONT, color:C.text, alpha:eo(p(t, 50, 50.4))});
+  [['Tools 工具', '可以执行的动作：建 issue、查数据库'], ['Resources 资源', '可以读取的数据：文件、表结构'], ['Prompts 提示词', '预置的提示词模板']].forEach(([h, d], i) => {
+    const e = eo(p(t, 51.2 + i*.7, 51.6 + i*.7)), y = 260 + i*150;
+    box(1380, y - 55, 440, 120, e, {fill:'rgba(255,211,138,.06)', stroke:'rgba(255,211,138,.45)', r:18});
+    txt(h, 1405, y - 15, {size:28, weight:900, color:C.gold, align:'left', alpha:e}); txt(d, 1405, y + 28, {size:20, weight:600, color:'#d9d2e4', align:'left', alpha:e});
+  });
+  txt('Server 能提供的三类能力', 1600, 175, {size:22, weight:700, color:C.muted, alpha:eo(p(t, 51.2, 51.6))});
+  rise('写一个 MCP Server，所有支持 MCP 的应用都能直接用上', W/2, 900, t, 54.0, {size:38, weight:900});
+  rise('宿主负责管理连接，并把各个 Server 的工具交给模型选择', W/2, 965, t, 55.4, {size:28, weight:600, color:C.muted});
+}
+
+/* ============ 场景 6 · 一次调用 (60–70s) ============ */
+const RPC = [['→', '{"method": "tools/list"}', C.text, 60.8], ['←', '{"tools": [{"name": "create_issue", "description": "…", "inputSchema": {…}}]}', C.gold, 61.8], ['→', '{"method": "tools/call", "params": {"name": "create_issue",', C.text, 63.4], ['', '   "arguments": {"title": "登录页白屏"}}}', C.text, 63.4], ['←', '{"content": [{"type": "text", "text": "已创建 issue #128"}]}', C.mint, 64.8]];
+function s6(t){
+  rise('看一次真实的交互（简化）', W/2, 105, t, 60.2, {size:56, weight:900});
+  panel(110, 180, 1700, 470, 'Client ⇄ Server（JSON-RPC）', eo(p(t, 60.4, 60.9)));
+  RPC.forEach(([d, s, c, ts], i) => { const e = eo(p(t, ts, ts + .4)), y = 280 + i*72;
+    if (d) txt(d, 150, y, {size:30, weight:900, color:d === '→' ? C.acc : C.gold, align:'left', alpha:e});
+    txt(s, 200, y, {size:24, weight:600, font:MONO, color:c, align:'left', alpha:e}); });
+  [['① 连接后，先问 Server 有哪些工具', 61.0], ['② 把工具交给模型；模型决定调用 create_issue', 63.4], ['③ Server 执行并返回结果，模型继续回答用户', 65.0]].forEach(([s, ts], i) =>
+    txt(s, 160, 730 + i*58, {size:30, weight:800, color:'#d9d2e4', align:'left', alpha:eo(p(t, ts, ts + .4))}));
+  rise('这和 Function Calling 是一回事：MCP 只是把「工具从哪来」标准化了', W/2, 960, t, 66.4, {size:32, weight:900, color:C.gold});
+}
+
+/* ============ 场景 7 · 安全 (70–76s) ============ */
+function s7(t){
+  rise('能动手，就要管住手', W/2, 120, t, 70.2, {size:58, weight:900});
+  [['权限确认', '删除、付款、发消息等操作，执行前让用户确认'], ['最小权限', '只给工具完成任务所需的最少权限'], ['提防注入', '网页、邮件、文档里可能藏着「指令」，工具返回的内容不能当命令执行'], ['只用可信的 Server', 'Server 能读你的数据、执行操作，来源要可靠']].forEach(([h, d], i) => {
+    const st = 70.6 + i*.5, e = eo(p(t, st, st + .4)), y = 250 + i*150;
+    box(160, y - 60, 1600, 125, e, {fill:'rgba(255,138,138,.05)', stroke:'rgba(255,138,138,.4)', r:20});
+    txt(h, 200, y - 18, {size:34, weight:900, color:C.rose, align:'left', alpha:e}); txt(d, 200, y + 30, {size:26, weight:600, color:'#d9d2e4', align:'left', alpha:e});
+  });
+}
+
+/* ============ 场景 8 · 收尾 (76–80s) ============ */
+function s8(t){
+  [['Function Calling', '模型学会「用工具」', C.acc], ['MCP', '工具接入的统一标准', C.gold]].forEach(([h, d, c], i) => {
+    const e = eback(p(t, 76.2 + i*.4, 76.8 + i*.4)); if (e <= 0) return;
+    const x = 620 + i*680, y = 330;
+    ctx.save(); ctx.translate(x, y); ctx.scale(e, e); ctx.translate(-x, -y);
+    box(x - 300, y - 110, 600, 220, clamp(e), {fill:'rgba(255,255,255,.04)', stroke:c, r:28}); ctx.restore();
+    txt(h, x, y - 28, {size:50, weight:900, font:MONO, color:c, alpha:clamp(e)}); txt(d, x, y + 48, {size:32, weight:600, color:C.muted, alpha:clamp(e)});
+  });
+  rise('从「会说」到「会做」', W/2, 620, t, 77.2, {size:88, weight:900, glow:24});
+  rise('关注我，一起看懂 AI', W/2, 780, t, 77.8, {size:36, weight:500, color:C.muted});
+}
+
+/* ============ 总调度 ============ */
+const SCENES = [[s1,-1,7],[s2,7,22],[s3,22,34],[s4,34,46],[s5,46,60],[s6,60,70],[s7,70,76],[s8,76,80]];
+function draw(t){
+  t = clamp(t, 0, DUR);
+  ctx.save(); ctx.globalAlpha = 1; ctx.clearRect(0,0,W,H); background(t);
+  for (const [fn,a,b] of SCENES){
+    if (t < a || t > b) continue;
+    SA = sceneA(t, a, b, b === DUR ? .8 : .5);
+    if (SA > 0){ ctx.save(); fn(t); ctx.restore(); }
+  }
+  SA = 1; vignette();
+  const fo = p(t, DUR - .8, DUR);
+  if (fo > 0){ ctx.globalAlpha = fo; ctx.fillStyle = '#000'; ctx.fillRect(0,0,W,H); }
+  ctx.restore();
+}
+
+/* ============ 播放器 / 逐帧渲染接口 ============ */
+const isRender = new URLSearchParams(location.search).has('render');
+window.DURATION = DUR;
+window.renderFrame = t => draw(t);
+const btn = document.getElementById('btn'), seek = document.getElementById('seek'), timeEl = document.getElementById('time');
+const fmt = s => `${Math.floor(s/60)}:${String(Math.floor(s%60)).padStart(2,'0')}`;
+function fit(){
+  if (isRender){ cv.style.width = W+'px'; cv.style.height = H+'px'; return; }
+  const w = Math.min(innerWidth - 32, (innerHeight - 84)*16/9);
+  cv.style.width = w + 'px'; cv.style.height = w*9/16 + 'px';
+}
+addEventListener('resize', fit); fit();
+
+let cur = 0, playing = !isRender, last = null;
+function toggle(){ if (cur >= DUR) cur = 0; playing = !playing; }
+btn.onclick = toggle; cv.onclick = toggle;
+addEventListener('keydown', e => { if (e.code === 'Space'){ e.preventDefault(); toggle(); } });
+seek.oninput = () => { cur = +seek.value; draw(cur); };
+function loop(ts){
+  if (playing && last != null){ cur += (ts - last)/1000; if (cur >= DUR){ cur = DUR; playing = false; } }
+  last = ts; draw(cur);
+  seek.value = cur; timeEl.textContent = `${fmt(cur)} / ${fmt(DUR)}`;
+  btn.textContent = playing ? '❚❚' : (cur >= DUR ? '↺' : '▶');
+  requestAnimationFrame(loop);
+}
+document.fonts.ready.then(() => {
+  window.ready = true;
+  if (isRender) draw(0); else requestAnimationFrame(loop);
+});
+</script>
+</body>
+</html>

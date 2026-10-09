@@ -24,6 +24,7 @@
 | Redis 缓存 | `redis-cache/landscape.html` | 横屏 1920×1080 | 80s |
 | Embedding 向量 | `embedding/landscape.html` | 横屏 1920×1080 | 80s |
 | 消息队列 | `message-queue/landscape.html` | 横屏 1920×1080 | 84s |
+| Function Calling 与 MCP | `function-calling-mcp/landscape.html` | 横屏 1920×1080 | 80s |
 
 ### 幸福的科学
 钩子 → 享乐适应（快乐曲线 + 跑步机）→ 哈佛成人发展研究（关系网络）→ 心流（挑战 × 技能坐标图）→ 今晚就能做的 3 件事 → 收尾
@@ -75,6 +76,9 @@
 
 ### 消息队列
 同步调用的问题 → 解耦、异步、削峰 → 削峰填谷 → Kafka 核心概念 → 三个环节保证不丢 → 重复与幂等 → 顺序与分区 key → 收尾
+
+### Function Calling 与 MCP
+模型只会说不会做 → Function Calling 五步 → 工具定义 → M×N 到 M+N → MCP 架构 → 一次 JSON-RPC 交互 → 安全 → 收尾
 
 ## 预览
 
