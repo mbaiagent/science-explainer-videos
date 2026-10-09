@@ -1,0 +1,341 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Opus 5.5 怎么做视频</title>
+<style>
+  :root{--bg:#07080f;--fg:#f4ede4;--muted:#9a93a8;--acc:#ffcc66}
+  html,body{margin:0;height:100%;background:var(--bg);color:var(--fg);
+    font-family:-apple-system,"PingFang SC","Noto Sans SC","Noto Sans CJK SC","Microsoft YaHei",sans-serif}
+  body{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;overflow:hidden}
+  #stage{display:block;background:#07080f;border-radius:12px;box-shadow:0 20px 60px rgba(0,0,0,.55);cursor:pointer}
+  #bar{display:flex;align-items:center;gap:12px;width:min(calc(100vw - 32px),640px)}
+  #btn{width:40px;height:40px;border-radius:50%;border:1px solid rgba(255,204,102,.5);background:transparent;
+    color:var(--acc);font-size:16px;cursor:pointer;flex:none}
+  #seek{flex:1;accent-color:var(--acc)}
+  #time{font-variant-numeric:tabular-nums;font-size:13px;color:var(--muted);min-width:84px;text-align:right}
+  body.render{display:block}
+  body.render #bar{display:none}
+  body.render #stage{border-radius:0;box-shadow:none}
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="bar">
+  <button id="btn" aria-label="播放/暂停">❚❚</button>
+  <input id="seek" type="range" min="0" max="76" step="0.01" value="0">
+  <span id="time">0:00 / 1:16</span>
+</div>
+<script>
+/* ============ 基础设置（横屏 1920×1080） ============ */
+const W = 1920, H = 1080, DUR = 76;
+const cv = document.getElementById('stage'), ctx = cv.getContext('2d');
+cv.width = W; cv.height = H;
+const FONT = '"PingFang SC","Noto Sans SC","Noto Sans CJK SC","Source Han Sans SC","Microsoft YaHei",sans-serif';
+const MONO = '"JetBrains Mono","SF Mono",Menlo,Consolas,"DejaVu Sans Mono","Noto Sans Mono CJK SC","PingFang SC","Microsoft YaHei",monospace';
+const C = {acc:'#ffcc66', mint:'#6ee7c8', gold:'#ffd38a', coral:'#ff9e7a', rose:'#ff8a8a', blue:'#9cc3ff', text:'#f4ede4', muted:'#9a93a8', dim:'#4a4558', panel:'#0f0e1f'};
+
+const clamp = (x,a=0,b=1) => Math.max(a, Math.min(b, x));
+const lerp = (a,b,t) => a + (b-a)*t;
+const p = (t,a,b) => clamp((t-a)/(b-a));
+const eo = x => 1 - Math.pow(1-x, 3);
+const eio = x => x < .5 ? 4*x*x*x : 1 - Math.pow(-2*x+2, 3)/2;
+const eback = x => { const c1=1.70158, c3=c1+1; return 1 + c3*Math.pow(x-1,3) + c1*Math.pow(x-1,2); };
+function rnd(seed){ let s = seed>>>0; return () => { s = (s*1664525 + 1013904223)>>>0; return s/4294967296; }; }
+
+let SA = 1;
+const al = a => { ctx.globalAlpha = clamp(SA*a); };
+const sceneA = (t,a,b,f=.5) => Math.min(p(t,a,a+f), 1 - p(t,b-f,b));
+
+function txt(s, x, y, o = {}){
+  const {size=64, weight=700, color=C.text, alpha=1, align='center', glow=0, scale=1, font=FONT} = o;
+  if (alpha <= 0) return;
+  ctx.save(); al(alpha);
+  ctx.font = `${weight} ${size}px ${font}`;
+  ctx.textAlign = align; ctx.textBaseline = 'middle'; ctx.fillStyle = color;
+  if (glow){ ctx.shadowColor = color; ctx.shadowBlur = glow; }
+  if (scale !== 1){ ctx.translate(x, y); ctx.scale(scale, scale); ctx.fillText(s, 0, 0); }
+  else ctx.fillText(s, x, y);
+  ctx.restore();
+}
+function rise(s, x, y, t, t0, o = {}, d = .7){
+  const e = eo(p(t, t0, t0+d));
+  if (e <= 0) return;
+  txt(s, x, y + (1-e)*36, {...o, alpha:(o.alpha ?? 1)*e});
+}
+function rr(x,y,w,h,r){ ctx.beginPath(); ctx.roundRect(x,y,w,h,r); }
+function box(x, y, w, h, a, o = {}){
+  const {fill='rgba(255,255,255,.05)', stroke='rgba(255,204,102,.35)', lw=2, glow=0, r=18, dash=null} = o;
+  if (a <= 0) return;
+  ctx.save(); al(a); rr(x, y, w, h, r); ctx.fillStyle = fill; ctx.fill();
+  if (dash) ctx.setLineDash(dash);
+  ctx.strokeStyle = stroke; ctx.lineWidth = lw; if (glow){ ctx.shadowColor = stroke; ctx.shadowBlur = glow; } ctx.stroke(); ctx.restore();
+}
+function arrow(x1, y1, x2, y2, e, a, color = C.acc, lw = 3){
+  if (e <= 0 || a <= 0) return;
+  const x = lerp(x1, x2, e), y = lerp(y1, y2, e), ang = Math.atan2(y2 - y1, x2 - x1);
+  ctx.save(); al(a); ctx.strokeStyle = color; ctx.fillStyle = color; ctx.lineWidth = lw; ctx.lineCap = 'round';
+  ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x, y); ctx.stroke();
+  if (e > .85){ ctx.translate(x, y); ctx.rotate(ang); ctx.beginPath(); ctx.moveTo(4, 0); ctx.lineTo(-14, -9); ctx.lineTo(-14, 9); ctx.closePath(); ctx.fill(); }
+  ctx.restore();
+}
+function panel(x, y, w, h, title, a){
+  box(x, y, w, h, a, {fill:C.panel, stroke:'rgba(255,255,255,.1)', r:20});
+  if (a <= 0) return;
+  ctx.save(); al(a); ctx.strokeStyle = 'rgba(255,255,255,.07)'; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(x, y + 52); ctx.lineTo(x + w, y + 52); ctx.stroke();
+  ['#ff6b6b','#ffd166','#6ee7a0'].forEach((c, i) => { ctx.fillStyle = c; ctx.globalAlpha = clamp(SA*a*.8); ctx.beginPath(); ctx.arc(x + 30 + i*24, y + 26, 7, 0, 6.283); ctx.fill(); });
+  ctx.restore();
+  txt(title, x + w/2, y + 27, {size:22, weight:500, color:C.muted, font:MONO, alpha:a});
+}
+
+/* ============ 背景 ============ */
+const PARTS = (() => { const r = rnd(97); return Array.from({length:100}, () => ({
+  x:r()*W, y:r()*H, s:r()*2.2+.5, v:r()*12+4, ph:r()*6.283, c:r()<.25})); })();
+function background(t){
+  const g = ctx.createLinearGradient(0,0,W,H);
+  g.addColorStop(0,'#0a0916'); g.addColorStop(.55,'#110f24'); g.addColorStop(1,'#18122c');
+  ctx.globalAlpha = 1; ctx.fillStyle = g; ctx.fillRect(0,0,W,H);
+  const gx = W*.5 + Math.sin(t*.27)*140;
+  const rg = ctx.createRadialGradient(gx, H*.45, 0, gx, H*.45, 950);
+  rg.addColorStop(0,'rgba(255,204,102,0.09)'); rg.addColorStop(1,'rgba(255,204,102,0)');
+  ctx.fillStyle = rg; ctx.fillRect(0,0,W,H);
+  ctx.fillStyle = C.acc;
+  for (let x = 40; x < W; x += 80) for (let y = 40; y < H; y += 80){ ctx.globalAlpha = .06; ctx.fillRect(x, y, 2, 2); }
+  for (const q of PARTS){
+    const y = ((q.y - t*q.v) % H + H) % H, x = q.x + Math.sin(t*.35 + q.ph)*12;
+    ctx.globalAlpha = .2 + .3*(.5 + .5*Math.sin(t*1.2 + q.ph));
+    ctx.fillStyle = q.c ? C.acc : '#d8d0ff';
+    ctx.beginPath(); ctx.arc(x, y, q.s, 0, 6.283); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+}
+function vignette(){
+  const v = ctx.createRadialGradient(W/2, H/2, W*.28, W/2, H/2, W*.62);
+  v.addColorStop(0,'rgba(0,0,0,0)'); v.addColorStop(1,'rgba(0,0,0,.55)');
+  ctx.globalAlpha = 1; ctx.fillStyle = v; ctx.fillRect(0,0,W,H);
+}
+function codeLine(s, x, y, size, a, kw = /\b(public|class|static|void|new|return)\b/){
+  const parts = s.split(/("[^"]*"|\b(?:public|class|static|void|new|return|getstatic|ldc|invokevirtual)\b)/g);
+  ctx.save(); al(a); ctx.font = `500 ${size}px ${MONO}`; ctx.textBaseline = 'middle'; ctx.textAlign = 'left';
+  let xx = x;
+  for (const seg of parts){ if (!seg) continue;
+    ctx.fillStyle = seg.startsWith('"') ? C.mint : /^(public|class|static|void|new|return|getstatic|ldc|invokevirtual)$/.test(seg) ? C.acc : C.text;
+    ctx.fillText(seg, xx, y); xx += ctx.measureText(seg).width; }
+  ctx.restore();
+}
+
+function jsLine(s, x, y, size, a){
+  const KW = /^(function|const|let|return|if)$/;
+  const parts = s.split(/(\/\/.*$|"[^"]*"|\b(?:function|const|let|return|if)\b)/g);
+  ctx.save(); al(a); ctx.font = `500 ${size}px ${MONO}`; ctx.textBaseline = 'middle'; ctx.textAlign = 'left';
+  let xx = x;
+  for (const seg of parts){ if (!seg) continue;
+    ctx.fillStyle = seg.startsWith('//') ? C.muted : seg.startsWith('"') ? C.mint : KW.test(seg) ? C.acc : C.text;
+    ctx.fillText(seg, xx, y); xx += ctx.measureText(seg).width; }
+  ctx.restore();
+}
+
+/* ============ 场景 1 · 钩子 (0–7s) ============ */
+const THUMBS = [['幸福的科学', '#ffb36b'], ['人生的意义', '#9cc3ff'], ['什么是 LLM', '#6ee7c8'], ['从零做 Claude Code', '#ff9e7a'], ['JVM 是什么', '#b39dff'], ['RAG 是什么', '#7cc7ff']];
+const SNIP = ['ctx.fillText(title, x, y);', 'const e = easeOut(k);', 'ctx.arc(cx, cy, r, 0, 2π);', 'draw(t);'];
+function s1(t){
+  const flip = eio(p(t, 3.8, 4.6));
+  THUMBS.forEach(([s, c], i) => {
+    const e = eback(p(t, .2 + i*.15, .7 + i*.15)); if (e <= 0) return;
+    const x = 255 + (i % 3)*480, y = 140 + Math.floor(i/3)*270, cx = x + 200, cy = y + 112;
+    ctx.save(); ctx.translate(cx, cy); ctx.scale(e, e); ctx.translate(-cx, -cy);
+    box(x, y, 400, 225, clamp(e), {fill:'#0f0e1c', stroke:c, lw:2, r:14}); ctx.restore();
+    txt(s, cx, cy - 20, {size:32, weight:900, color:c, alpha:clamp(e)*(1 - flip), glow:12});
+    ctx.save(); al(clamp(e)*(1 - flip)*.5); ctx.fillStyle = c; rr(cx - 90, cy + 30, 180, 8, 4); ctx.fill(); rr(cx - 60, cy + 50, 120, 8, 4); ctx.fill(); ctx.restore();
+    SNIP.forEach((l, k) => txt(l, x + 26, y + 50 + k*42, {size:20, weight:500, font:MONO, color:k % 2 ? C.acc : C.text, align:'left', alpha:clamp(e)*flip}));
+  });
+  rise('这个系列的视频，全是 Opus 5.5 做的', W/2, 760, t, 2.4, {size:52, weight:900});
+  rise('但它一个像素都没「画」——它写的是代码', W/2, 860, t, 4.4, {size:46, weight:900, color:C.acc, glow:16});
+}
+
+/* ============ 场景 2 · 不是视频生成模型 (7–20s) ============ */
+function flowCol(x, y0, items, a0, color, t, st){
+  items.forEach((s, i) => {
+    const e = eo(p(t, st + i*.6, st + i*.6 + .5)), y = y0 + i*130, isBox = i === 1;
+    box(x - 260, y - 40, 520, 80, e, isBox ? {fill:color === C.acc ? 'rgba(255,204,102,.16)' : 'rgba(156,195,255,.12)', stroke:color, lw:3, r:16} : {stroke:'rgba(255,255,255,.18)', r:40});
+    txt(s, x, y, {size:30, weight:isBox ? 900 : 700, color:isBox ? color : C.text, alpha:e});
+    if (i < items.length - 1) arrow(x, y + 44, x, y + 86, eo(p(t, st + i*.6 + .4, st + i*.6 + .7)), e, color, 3);
+  });
+}
+function s2(t){
+  rise('它不是「视频生成模型」', W/2, 115, t, 7.2, {size:60, weight:900});
+  const la = eo(p(t, 7.8, 8.3)), ra = eo(p(t, 10.6, 11.1));
+  box(150, 200, 760, 580, la, {stroke:'rgba(156,195,255,.35)', r:28});
+  txt('视频生成模型', 530, 255, {size:40, weight:900, color:C.blue, alpha:la});
+  txt('如可灵、Sora 这一类', 530, 300, {size:24, weight:500, color:C.muted, alpha:la});
+  flowCol(530, 390, ['一段文字描述', '模型直接生成每一帧像素', '视频'], la, C.blue, t, 8.2);
+  txt('擅长：真实场景、人物、镜头感', 530, 730, {size:28, weight:700, color:C.blue, alpha:eo(p(t, 10, 10.5))});
+  box(1010, 200, 760, 580, ra, {stroke:C.acc, glow:14, r:28});
+  txt('Opus 5.5', 1390, 255, {size:40, weight:900, color:C.acc, font:MONO, alpha:ra});
+  txt('一个会写代码的语言模型', 1390, 300, {size:24, weight:500, color:C.muted, alpha:ra});
+  flowCol(1390, 390, ['需求 + 脚本', '写出「画画面」的代码', '浏览器渲染成视频'], ra, C.acc, t, 11.0);
+  txt('擅长：图表、文字、动画讲解', 1390, 730, {size:28, weight:700, color:C.acc, alpha:eo(p(t, 12.8, 13.3))});
+  rise('一个是「拍」出视频，一个是「编程」出视频', W/2, 880, t, 14.4, {size:46, weight:900});
+}
+
+/* ============ 场景 3 · 四步流水线 (20–36s) ============ */
+const STAGES = [['写脚本和分镜', '定好几个场景', '每段讲什么'], ['写一个 HTML 动画', '用 Canvas', '画出每个画面'], ['浏览器逐帧截图', '每秒 30 张', 'Playwright 自动拍'], ['合成 MP4', 'ffmpeg 把图片', '拼成视频']];
+function stageIcon(i, cx, cy, a, t){
+  ctx.save(); al(a); ctx.strokeStyle = C.acc; ctx.fillStyle = C.acc; ctx.lineWidth = 4; ctx.lineCap = 'round';
+  if (i === 0){ for (let k = 0; k < 3; k++){ ctx.beginPath(); ctx.arc(cx - 40, cy - 24 + k*24, 4, 0, 6.283); ctx.fill(); ctx.beginPath(); ctx.moveTo(cx - 24, cy - 24 + k*24); ctx.lineTo(cx + 44 - k*14, cy - 24 + k*24); ctx.stroke(); } }
+  else if (i === 1){ ctx.font = `800 44px ${MONO}`; ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.fillText('</>', cx, cy); }
+  else if (i === 2){ for (let k = 2; k >= 0; k--){ ctx.globalAlpha = clamp(SA*a*(1 - k*.25)); rr(cx - 40 + k*12, cy - 30 - k*10, 70, 50, 6); ctx.stroke(); } }
+  else { ctx.beginPath(); ctx.arc(cx, cy, 38, 0, 6.283); ctx.stroke(); ctx.beginPath(); ctx.moveTo(cx - 10, cy - 18); ctx.lineTo(cx + 18, cy); ctx.lineTo(cx - 10, cy + 18); ctx.closePath(); ctx.fill(); }
+  ctx.restore();
+}
+function s3(t){
+  rise('四步，从一句话到一个 MP4', W/2, 115, t, 20.2, {size:60, weight:900});
+  STAGES.forEach(([a, b, c], i) => {
+    const st = 21.0 + i*1.2, e = eback(p(t, st, st + .6)); if (e <= 0) return;
+    const x = 110 + i*440, cx = x + 190, al1 = clamp(e);
+    ctx.save(); ctx.translate(cx, 410); ctx.scale(e, e); ctx.translate(-cx, -410);
+    box(x, 250, 380, 320, al1, {fill:'rgba(255,204,102,.06)', stroke:'rgba(255,204,102,.45)', r:26}); ctx.restore();
+    txt(String(i + 1), x + 34, 284, {size:28, weight:900, font:MONO, color:C.acc, alpha:al1});
+    stageIcon(i, cx, 340, al1, t);
+    txt(a, cx, 440, {size:36, weight:900, alpha:al1});
+    txt(b, cx, 495, {size:26, weight:500, color:C.muted, alpha:al1});
+    txt(c, cx, 532, {size:26, weight:500, color:C.muted, alpha:al1});
+    if (i > 0) arrow(x - 52, 410, x - 8, 410, eo(p(t, st - .2, st + .2)), 1, C.acc, 3);
+  });
+  const fa = eo(p(t, 25.6, 26.2));                 // 胶片
+  if (fa > 0){
+    ctx.save(); al(fa); ctx.fillStyle = 'rgba(255,255,255,.06)'; ctx.fillRect(110, 620, 1700, 120); ctx.restore();
+    ctx.save(); ctx.beginPath(); ctx.rect(110, 620, 1700, 120); ctx.clip();
+    const off = (t*220) % 170;
+    for (let x = 110 - 170 + off; x < 1810; x += 170){
+      box(x + 10, 634, 150, 92, fa, {fill:'#121020', stroke:'rgba(255,204,102,.4)', r:6});
+      const hue = Math.floor((x + 400) / 170) % THUMBS.length;
+      ctx.save(); al(fa*.8); ctx.fillStyle = THUMBS[hue][1]; rr(x + 40, 668, 90, 10, 5); ctx.fill(); rr(x + 55, 688, 60, 8, 4); ctx.fill(); ctx.restore();
+    }
+    ctx.restore();
+    const fr = Math.min(2160, Math.floor(clamp((t - 26)/6)*2160));
+    txt(`第 ${fr} / 2160 帧`, 1810, 775, {size:26, weight:700, font:MONO, color:C.acc, align:'right', alpha:fa});
+  }
+  rise('72 秒的视频 = 2160 张截图', W/2, 870, t, 30.0, {size:48, weight:900, color:C.acc, glow:16});
+  rise('每一张，都是代码画出来的', W/2, 945, t, 31.6, {size:34, weight:600, color:C.muted});
+}
+
+/* ============ 场景 4 · draw(t) (36–50s) ============ */
+const DCODE = ['function draw(t) {', '  background(t);', '', '  // 标题在 2.0s 到 2.7s 之间淡入、上浮', '  const e = easeOut(progress(t, 2.0, 2.7));', '  text("标题", x, y + (1 - e) * 40,', '       { alpha: e });', '}'];
+function s4(t){
+  rise('核心秘诀：画面 = 时间的函数', W/2, 110, t, 36.2, {size:58, weight:900});
+  const pa = eo(p(t, 36.8, 37.3));
+  panel(100, 190, 920, 560, 'video.html', pa);
+  DCODE.forEach((s, i) => { if (s) jsLine(s, 140, 290 + i*58, 26, eo(p(t, 37.2 + i*.25, 37.6 + i*.25))); });
+  const va = eo(p(t, 39.2, 39.7));
+  const tt = 1.6 + 1.4*(.5 - .5*Math.cos(Math.max(0, t - 39.6)*1.15));
+  const k = eo(clamp((tt - 2.0)/.7));
+  box(1090, 190, 720, 405, va, {fill:'#0f0e1c', stroke:'rgba(255,255,255,.15)', r:14});
+  txt('预览', 1110, 215, {size:20, weight:600, color:C.muted, align:'left', alpha:va});
+  txt('标题', 1450, 392, {size:80, weight:900, color:'rgba(255,255,255,.12)', alpha:va*(1 - k)});
+  txt('标题', 1450, 392 + (1 - k)*40, {size:80, weight:900, color:C.text, alpha:va*k, glow:14});
+  txt(`t = ${tt.toFixed(2)}s`, 1110, 640, {size:30, weight:700, font:MONO, color:C.acc, align:'left', alpha:va});
+  txt(`e = ${k.toFixed(2)}`, 1810, 640, {size:30, weight:700, font:MONO, color:C.mint, align:'right', alpha:va});
+  const sx = v => lerp(1110, 1790, (v - 1.6)/1.4);
+  ctx.save(); al(va*.6); ctx.strokeStyle = 'rgba(255,255,255,.3)'; ctx.lineWidth = 4; ctx.beginPath(); ctx.moveTo(1110, 710); ctx.lineTo(1790, 710); ctx.stroke();
+  al(va); ctx.strokeStyle = C.mint; ctx.lineWidth = 6; ctx.beginPath(); ctx.moveTo(sx(2.0), 710); ctx.lineTo(sx(2.7), 710); ctx.stroke(); ctx.restore();
+  txt('2.0s', sx(2.0), 745, {size:22, weight:600, font:MONO, color:C.muted, alpha:va}); txt('2.7s', sx(2.7), 745, {size:22, weight:600, font:MONO, color:C.muted, alpha:va});
+  ctx.save(); al(va); ctx.fillStyle = C.acc; ctx.shadowColor = C.acc; ctx.shadowBlur = 18; ctx.beginPath(); ctx.arc(sx(tt), 710, 13, 0, 6.283); ctx.fill(); ctx.restore();
+  rise('给它任意一个时刻 t，就能算出那一帧', W/2, 860, t, 43.4, {size:46, weight:900});
+  rise('所以能一帧不差地导出，也能随时拖动预览', W/2, 935, t, 45.2, {size:34, weight:600, color:C.muted});
+}
+
+/* ============ 场景 5 · 自己检查 (50–64s) ============ */
+const LOOP = [[560, 300, '写代码'], [830, 560, '截几帧看看'], [560, 820, '发现问题'], [290, 560, '改代码']];
+function s5(t){
+  rise('AI 怎么知道自己画得好不好？', W/2, 110, t, 50.2, {size:58, weight:900});
+  const cx = 560, cy = 560, R = 260, ca = eo(p(t, 50.8, 51.4));
+  ctx.save(); al(ca*.5); ctx.strokeStyle = C.acc; ctx.lineWidth = 3; ctx.setLineDash([12, 12]); ctx.lineDashOffset = -t*40;
+  ctx.beginPath(); ctx.arc(cx, cy, R, 0, 6.283); ctx.stroke(); ctx.restore();
+  const lt = t - 52, active = lt > 0 ? Math.floor((lt/1.4) % 4) : -1;
+  if (lt > 0){ const ang = -Math.PI/2 + (lt/5.6)*6.283; ctx.save(); al(1); ctx.fillStyle = C.gold; ctx.shadowColor = C.gold; ctx.shadowBlur = 30;
+    ctx.beginPath(); ctx.arc(cx + Math.cos(ang)*R, cy + Math.sin(ang)*R, 13, 0, 6.283); ctx.fill(); ctx.restore(); }
+  LOOP.forEach(([x, y, s], i) => {
+    const e = eo(p(t, 51.2 + i*.25, 51.6 + i*.25)), on = active === i, w = 230;
+    box(x - w/2, y - 38, w, 76, e, on ? {fill:'rgba(255,204,102,.2)', stroke:C.acc, lw:3, glow:20, r:38} : {fill:'rgba(20,18,32,.92)', stroke:'rgba(255,204,102,.35)', r:38});
+    txt(s, x, y, {size:32, weight:800, alpha:e});
+  });
+  // 右侧：前后对比
+  const fixed = t > 58.4, fa = eo(p(t, 53.0, 53.5));
+  box(1060, 250, 720, 405, fa, {fill:'#0f0e1c', stroke:fixed ? C.mint : 'rgba(255,255,255,.15)', lw:fixed ? 3 : 2, r:14});
+  txt(fixed ? '第 2 版' : '第 1 版', 1080, 280, {size:22, weight:700, color:fixed ? C.mint : C.muted, align:'left', alpha:fa});
+  const m = eio(p(t, 58.4, 59.2));
+  txt('关键结构：注意力', 1420, lerp(430, 390, m), {size:44, weight:900, alpha:fa});
+  txt('「它」指的是谁？', 1420, lerp(452, 490, m), {size:44, weight:900, color:C.acc, alpha:fa});
+  if (!fixed && t > 55){ const k = eo(p(t, 55, 55.4)); box(1190, 395, 460, 95, k, {fill:'rgba(255,138,138,.08)', stroke:C.rose, lw:3, dash:[8, 6], r:10});
+    txt('文字重叠！', 1420, 545, {size:30, weight:900, color:C.rose, alpha:k}); }
+  if (fixed) txt('✓ 修好了', 1420, 580, {size:32, weight:900, color:C.mint, alpha:eo(p(t, 59.2, 59.6))});
+  rise('它会给自己截图，像人一样「看」画面', 1420, 760, t, 55.6, {size:34, weight:800});
+  rise('发现重叠、出框，就改代码重来', 1420, 820, t, 57.0, {size:30, weight:600, color:C.muted});
+  rise('写 → 看 → 改，转几圈，画面就干净了', W/2, 960, t, 60.4, {size:42, weight:900, color:C.acc, glow:14});
+}
+
+/* ============ 场景 6 · 收尾 (64–76s) ============ */
+function s6(t){
+  rise('适合做什么？', W/2, 120, t, 64.2, {size:58, weight:900});
+  const la = eo(p(t, 64.8, 65.3)), ra = eo(p(t, 66.2, 66.7));
+  box(180, 210, 740, 380, la, {fill:'rgba(255,204,102,.07)', stroke:C.acc, r:28});
+  txt('擅长', 550, 265, {size:40, weight:900, color:C.acc, alpha:la});
+  ['知识讲解、原理演示', '数据图表、流程动画', '文字动效、片头片尾'].forEach((s, i) => rise('✓  ' + s, 550, 350 + i*70, t, 65.2 + i*.3, {size:32, weight:700}));
+  box(1000, 210, 740, 380, ra, {stroke:'rgba(255,255,255,.2)', r:28});
+  txt('交给别的工具', 1370, 265, {size:40, weight:900, color:C.muted, alpha:ra});
+  ['真人、实拍感画面 → 视频模型', '配音、背景音乐 → 后期剪辑', '复杂 3D 镜头 → 专业软件'].forEach((s, i) => rise(s, 1370, 350 + i*70, t, 66.6 + i*.3, {size:30, weight:600, color:'#d9d2e4'}));
+  rise('你正在看的这一期，也是这样做出来的', W/2, 730, t, 69.4, {size:58, weight:900, color:C.acc, glow:22});
+  rise('关注我，一起玩转 AI', W/2, 870, t, 71.0, {size:36, weight:500, color:C.muted});
+}
+
+/* ============ 总调度 ============ */
+const SCENES = [[s1,-1,7],[s2,7,20],[s3,20,36],[s4,36,50],[s5,50,64],[s6,64,76]];
+function draw(t){
+  t = clamp(t, 0, DUR);
+  ctx.save(); ctx.globalAlpha = 1; ctx.clearRect(0,0,W,H); background(t);
+  for (const [fn,a,b] of SCENES){
+    if (t < a || t > b) continue;
+    SA = sceneA(t, a, b, b === DUR ? .8 : .5);
+    if (SA > 0){ ctx.save(); fn(t); ctx.restore(); }
+  }
+  SA = 1; vignette();
+  const fo = p(t, DUR - .8, DUR);
+  if (fo > 0){ ctx.globalAlpha = fo; ctx.fillStyle = '#000'; ctx.fillRect(0,0,W,H); }
+  ctx.restore();
+}
+
+/* ============ 播放器 / 逐帧渲染接口 ============ */
+const isRender = new URLSearchParams(location.search).has('render');
+window.DURATION = DUR;
+window.renderFrame = t => draw(t);
+const btn = document.getElementById('btn'), seek = document.getElementById('seek'), timeEl = document.getElementById('time');
+const fmt = s => `${Math.floor(s/60)}:${String(Math.floor(s%60)).padStart(2,'0')}`;
+function fit(){
+  if (isRender){ cv.style.width = W+'px'; cv.style.height = H+'px'; return; }
+  const w = Math.min(innerWidth - 32, (innerHeight - 84)*16/9);
+  cv.style.width = w + 'px'; cv.style.height = w*9/16 + 'px';
+}
+addEventListener('resize', fit); fit();
+
+let cur = 0, playing = !isRender, last = null;
+function toggle(){ if (cur >= DUR) cur = 0; playing = !playing; }
+btn.onclick = toggle; cv.onclick = toggle;
+addEventListener('keydown', e => { if (e.code === 'Space'){ e.preventDefault(); toggle(); } });
+seek.oninput = () => { cur = +seek.value; draw(cur); };
+function loop(ts){
+  if (playing && last != null){ cur += (ts - last)/1000; if (cur >= DUR){ cur = DUR; playing = false; } }
+  last = ts; draw(cur);
+  seek.value = cur; timeEl.textContent = `${fmt(cur)} / ${fmt(DUR)}`;
+  btn.textContent = playing ? '❚❚' : (cur >= DUR ? '↺' : '▶');
+  requestAnimationFrame(loop);
+}
+document.fonts.ready.then(() => {
+  window.ready = true;
+  if (isRender) draw(0); else requestAnimationFrame(loop);
+});
+</script>
+</body>
+</html>
