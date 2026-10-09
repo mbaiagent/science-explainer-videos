@@ -11,6 +11,7 @@
 | 人生的意义 | `meaning-of-life/landscape.html` | 横屏 1920×1080 | 72s |
 | 什么是 LLM | `llm/landscape.html` | 横屏 1920×1080 | 72s |
 | 从零做一个 Claude Code | `claude-code/landscape.html` | 横屏 1920×1080 | 84s |
+| JVM 是什么 | `jvm/landscape.html` | 横屏 1920×1080 | 72s |
 
 ### 幸福的科学
 钩子 → 享乐适应（快乐曲线 + 跑步机）→ 哈佛成人发展研究（关系网络）→ 心流（挑战 × 技能坐标图）→ 今晚就能做的 3 件事 → 收尾
@@ -24,9 +25,14 @@
 ### 从零做一个 Claude Code
 终端演示 → 核心公式（大模型 + 工具 + 循环）→ Agent 循环图 → 十几行核心代码 → 工具定义（JSON Schema）→ 从能用到好用的 4 个细节 → 收尾
 
+### JVM 是什么
+一份代码到处运行 → 源码 → 字节码 → 机器码 → 内存区域（栈 / 堆 / 方法区）→ 垃圾回收（可达性分析 + 分代）→ JIT 即时编译 → 收尾
+
 ## 预览
 
 在线播放：https://mbwjs.github.io/science-explainer-videos/（需仓库开启 GitHub Pages）
+
+首页按「计算机 · AI」「心理学 · 人生」分类，只列横屏版；竖屏版文件仍保留在 `happiness/vertical.html`。新增视频时在 `index.html` 的 `VIDEOS` 数组里加一行即可。
 
 也可以用浏览器直接打开任意 HTML 文件。点击画面或按空格键暂停，底部进度条可以拖动。
 
