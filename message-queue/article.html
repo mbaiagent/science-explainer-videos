@@ -1,0 +1,292 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>消息队列：解耦、异步、削峰，以及不丢、不重、有序 · 图文详解</title>
+<meta name="description" content="以 Kafka 为例讲清 Topic、分区、Offset 和消费者组；三个环节怎么保证不丢消息，为什么一定要幂等，怎么保证顺序，以及积压、死信、事务消息和选型">
+<link rel="stylesheet" href="../assets/article.css">
+<style>:root{--acc:#38bdf8}</style>
+</head>
+<body>
+<div class="wrap">
+  <nav class="top"><a href="../index.html">← 全部视频</a><a class="watch" href="landscape.html">▶ 看视频</a></nav>
+  <header class="hero">
+    <div class="tag">计算机与后端 · 图文详解</div>
+    <h1>消息队列：解耦、异步、削峰，以及不丢、不重、有序</h1>
+    <p>以 Kafka 为例讲清 Topic、分区、Offset 和消费者组；三个环节怎么保证不丢消息，为什么一定要幂等，怎么保证顺序，以及积压、死信、事务消息和选型</p>
+    <div class="meta">约 9 分钟读完 · 配套视频 1:24</div>
+  </header>
+  <nav class="toc">
+<ul>
+<li><a href="#_1">同步调用的两个问题</a></li>
+<li><a href="#_2">三大作用</a></li>
+<li><a href="#kafka">核心概念：以 Kafka 为例</a></li>
+<li><a href="#_6">怎么保证消息不丢</a></li>
+<li><a href="#_7">消息会重复吗：幂等</a></li>
+<li><a href="#_8">怎么保证顺序</a></li>
+<li><a href="#_9">实战中的常见问题</a></li>
+<li><a href="#_13">常见消息队列对比</a></li>
+<li><a href="#_14">高频面试题速答</a></li>
+<li><a href="#_15">总结</a></li>
+</ul>
+</nav>
+
+  <article>
+<figure><img src="img/f-4.5.jpg" alt="同步调用：一个比一个慢，一个挂了全部失败" loading="lazy"><figcaption>同步调用：一个比一个慢，一个挂了全部失败</figcaption></figure>
+<h2 id="_1">同步调用的两个问题</h2>
+<p>用户下单后，订单服务要依次调用：扣库存、加积分、发短信、发邮件。如果全部同步调用：</p>
+<ol>
+<li><strong>慢</strong>：总耗时是所有调用之和，用户要等每一个下游都处理完；</li>
+<li><strong>脆弱</strong>：任何一个下游超时或宕机，整个下单流程都失败了，哪怕发短信这种和下单本身关系不大的步骤。</li>
+</ol>
+<p>更麻烦的是，每加一个新的下游（比如「下单后给推荐系统发数据」），订单服务的代码都要改一次。</p>
+<p><strong>消息队列</strong>（Message Queue，MQ）的思路是：订单服务完成核心操作后，只发一条「订单已创建」的消息到队列，就立即返回；其他服务各自从队列中订阅、处理这条消息。</p>
+<h2 id="_2">三大作用</h2>
+<figure><img src="img/f-17.jpg" alt="解耦、异步、削峰" loading="lazy"><figcaption>解耦、异步、削峰</figcaption></figure>
+<table>
+<thead>
+<tr>
+<th>作用</th>
+<th>解决什么问题</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>解耦</strong></td>
+<td>生产者不需要知道谁在消费。新增一个下游，只需要它自己去订阅，生产者的代码不用动</td>
+</tr>
+<tr>
+<td><strong>异步</strong></td>
+<td>主流程只做最核心的事，耗时的操作在后台处理，接口响应快得多</td>
+</tr>
+<tr>
+<td><strong>削峰</strong></td>
+<td>流量高峰时先把请求存进队列，下游按自己的能力稳定消费，不会被瞬间压垮</td>
+</tr>
+</tbody>
+</table>
+<p>除此之外，消息队列还常用于<strong>日志收集</strong>、<strong>数据同步</strong>（比如把数据库变更同步到搜索引擎）、<strong>流式计算</strong>等场景。</p>
+<h3 id="_3">削峰填谷</h3>
+<figure><img src="img/f-25.5.jpg" alt="削峰：高峰时存起来，低谷时慢慢消化" loading="lazy"><figcaption>削峰：高峰时存起来，低谷时慢慢消化</figcaption></figure>
+<p>秒杀开始的那一刻，请求量可能是平时的几十倍，而数据库每秒能处理的写入是有限的。如果请求直接打到数据库，数据库很可能被压垮。</p>
+<p>把请求先写入消息队列，下游服务按固定速度消费：高峰时，多出来的请求在队列里<strong>积压</strong>；高峰过后，下游继续以稳定速度把积压<strong>消化</strong>掉。数据库始终工作在安全负载之内，代价是一部分请求处理得晚一些。</p>
+<h3 id="_4">引入消息队列的代价</h3>
+<p>消息队列不是免费的：</p>
+<ul>
+<li>系统多了一个组件，需要部署、监控和运维；</li>
+<li>数据从「立即一致」变成「<strong>最终一致</strong>」：下单成功的那一刻，积分可能还没加上；</li>
+<li>需要处理消息丢失、重复、乱序、积压等新问题，也就是本文后半部分的内容。</li>
+</ul>
+<h2 id="kafka">核心概念：以 Kafka 为例</h2>
+<figure><img src="img/f-45.jpg" alt="Topic、分区、Offset 与消费者组" loading="lazy"><figcaption>Topic、分区、Offset 与消费者组</figcaption></figure>
+<table>
+<thead>
+<tr>
+<th>概念</th>
+<th>解释</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Producer（生产者）</strong></td>
+<td>发送消息的一方</td>
+</tr>
+<tr>
+<td><strong>Broker</strong></td>
+<td>消息队列的服务器节点，多个 Broker 组成集群</td>
+</tr>
+<tr>
+<td><strong>Topic（主题）</strong></td>
+<td>一类消息的名字，比如 <code>orders</code></td>
+</tr>
+<tr>
+<td><strong>Partition（分区）</strong></td>
+<td>一个 Topic 被分成多个分区，每个分区是一个<strong>只能在末尾追加</strong>的日志文件</td>
+</tr>
+<tr>
+<td><strong>Offset（偏移量）</strong></td>
+<td>消息在分区中的位置编号，从 0 开始递增</td>
+</tr>
+<tr>
+<td><strong>Consumer Group（消费者组）</strong></td>
+<td>一组共同消费同一个 Topic 的消费者</td>
+</tr>
+</tbody>
+</table>
+<h3 id="_5">分区：并行的关键</h3>
+<p>一个 Topic 的多个分区可以分布在不同的 Broker 上，生产者往不同分区写，消费者从不同分区读，从而实现<strong>水平扩展</strong>。</p>
+<p>在一个消费者组内，<strong>每个分区同一时刻只会分配给组内的一个消费者</strong>。所以组内消费者的数量超过分区数时，多出来的消费者会闲着。<strong>分区数决定了一个消费者组的最大并行度。</strong> 当组内消费者增减时，分区会重新分配，这个过程叫<strong>再均衡</strong>（rebalance）。</p>
+<h3 id="offset">Offset：各读各的</h3>
+<p>消息被消费后<strong>不会立即删除</strong>，而是按照配置的保留时间或大小保留一段时间。每个消费者组各自记录自己在每个分区上读到了哪个 Offset。所以：</p>
+<ul>
+<li>不同的消费者组可以独立地读取同一份数据，互不影响（这就是「发布-订阅」）；</li>
+<li>必要时，还可以把 Offset 调回去，<strong>重新消费</strong>历史消息。</li>
+</ul>
+<h3 id="kafka_1">Kafka 为什么吞吐量高</h3>
+<ul>
+<li><strong>顺序写磁盘</strong>：消息只在分区末尾追加，顺序写的速度远高于随机写；</li>
+<li><strong>利用操作系统的页缓存</strong>：读写大多发生在内存中；</li>
+<li><strong>零拷贝</strong>：发送数据时，减少数据在内核和用户空间之间的复制；</li>
+<li><strong>批量和压缩</strong>：生产者和消费者都可以批量收发，并压缩数据。</li>
+</ul>
+<h2 id="_6">怎么保证消息不丢</h2>
+<figure><img src="img/f-60.jpg" alt="三个环节都要管" loading="lazy"><figcaption>三个环节都要管</figcaption></figure>
+<p>消息从发出到被成功处理，要经过三个环节，每个环节都可能丢消息。</p>
+<h3 id="1">1. 生产端</h3>
+<p><strong>风险</strong>：网络抖动，消息根本没有到达 Broker，而生产者以为发成功了。</p>
+<p><strong>对策</strong>：</p>
+<ul>
+<li>设置 <code>acks=all</code>：消息被所有同步副本（ISR）写入后，Broker 才返回成功；</li>
+<li>发送失败时<strong>重试</strong>，并处理回调中的异常，不要「发了就不管」；</li>
+<li>开启生产者幂等（<code>enable.idempotence=true</code>，较新版本的 Kafka 默认开启），避免重试导致消息在 Broker 端重复。</li>
+</ul>
+<h3 id="2-broker">2. Broker 端</h3>
+<p><strong>风险</strong>：消息只写在一台机器上，这台机器坏了，消息就没了。</p>
+<p><strong>对策</strong>：</p>
+<ul>
+<li>每个分区设置多个<strong>副本</strong>，比如 <code>replication.factor=3</code>；</li>
+<li>设置 <code>min.insync.replicas=2</code>：至少有 2 个副本写入成功，才算写入成功；</li>
+<li>关闭「非同步副本当选领导者」（<code>unclean.leader.election.enable=false</code>），避免数据不全的副本成为主副本。</li>
+</ul>
+<h3 id="3">3. 消费端</h3>
+<p><strong>风险</strong>：消费者先提交了 Offset，然后在处理消息的过程中崩溃了。重启后从新的 Offset 开始读，那条消息就再也不会被处理。</p>
+<p><strong>对策</strong>：<strong>处理成功之后，再提交 Offset</strong>。通常要关闭自动提交（<code>enable.auto.commit=false</code>），在业务逻辑完成后手动提交。</p>
+<h2 id="_7">消息会重复吗：幂等</h2>
+<figure><img src="img/f-70.jpg" alt="消息会重复，所以要幂等" loading="lazy"><figcaption>消息会重复，所以要幂等</figcaption></figure>
+<p>「处理成功后再提交 Offset」带来了另一个问题：如果消息处理完了，<strong>还没来得及提交 Offset</strong> 消费者就崩溃了，重启后会从上次提交的位置重新读取，同一条消息就会被<strong>再处理一次</strong>。</p>
+<p>这几乎无法完全避免。所以消息队列通常保证的是<strong>至少一次</strong>（at least once）投递：宁可重复，也不丢。</p>
+<table>
+<thead>
+<tr>
+<th>投递语义</th>
+<th>含义</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>最多一次</td>
+<td>可能丢，但不会重复</td>
+</tr>
+<tr>
+<td><strong>至少一次</strong></td>
+<td>不会丢，但可能重复（最常用）</td>
+</tr>
+<tr>
+<td>恰好一次</td>
+<td>不丢不重，实现成本最高</td>
+</tr>
+</tbody>
+</table>
+<p>既然会重复，<strong>消费逻辑就必须是幂等的</strong>：同一条消息处理多少次，结果都和处理一次一样。常见做法：</p>
+<pre><code class="language-sql">-- 1. 用唯一索引防重：消息 ID 重复插入会失败，说明已经处理过
+CREATE TABLE consumed_message (
+  message_id VARCHAR(64) PRIMARY KEY,
+  consumed_at DATETIME NOT NULL
+);
+
+-- 2. 用状态机：只有「待支付」的订单才能变成「已支付」
+UPDATE orders SET status = 'PAID' WHERE id = 1001 AND status = 'UNPAID';
+</code></pre>
+<p>把「记录消息 ID」和「执行业务操作」放在<strong>同一个本地事务</strong>里，就能保证两者同时成功或同时失败。</p>
+<blockquote>
+<p>Kafka 提供了事务和幂等生产者，可以在「Kafka 读取 → 处理 → 写回 Kafka」的链路内实现恰好一次。但只要处理过程涉及外部系统（比如写数据库、调接口），仍然需要业务层面的幂等。</p>
+</blockquote>
+<h2 id="_8">怎么保证顺序</h2>
+<figure><img src="img/f-77.jpg" alt="同一个 key 进同一个分区" loading="lazy"><figcaption>同一个 key 进同一个分区</figcaption></figure>
+<p>订单 1001 的三条消息「创建 → 支付 → 发货」必须按顺序处理。如果它们被分散到不同的分区，被不同的消费者并行处理，就可能先处理「发货」再处理「创建」。</p>
+<p>Kafka <strong>只保证单个分区内的消息有序</strong>。解决办法是：发送时指定<strong>消息的 key</strong>，比如用订单号作为 key。Kafka 会对 key 做哈希，相同 key 的消息总是进入同一个分区，于是同一个订单的消息就是有序的，而不同订单之间仍然可以并行处理。</p>
+<p>还要注意：</p>
+<ul>
+<li>消费者内部如果用多线程处理，也要保证同一个 key 的消息交给同一个线程；</li>
+<li>生产者重试可能导致乱序，开启幂等生产者可以在重试时保持分区内的顺序；</li>
+<li>如果要求<strong>全局</strong>严格有序，只能使用一个分区，代价是失去并行能力。</li>
+</ul>
+<h2 id="_9">实战中的常见问题</h2>
+<h3 id="_10">消息积压了怎么办</h3>
+<ol>
+<li><strong>先排查消费者</strong>：是不是下游变慢了、出现了报错重试、有慢 SQL；</li>
+<li><strong>扩容消费者</strong>：增加消费者实例，但不能超过分区数；</li>
+<li><strong>增加分区</strong>：分区数是并行度的上限（注意：增加分区会改变 key 到分区的映射，影响顺序性）；</li>
+<li><strong>临时方案</strong>：写一个程序把积压的消息快速转移到一个分区更多的临时 Topic，再用更多的消费者处理。</li>
+</ol>
+<h3 id="_11">处理一直失败的消息：重试与死信</h3>
+<p>某条消息因为数据问题，无论重试多少次都失败。如果一直重试，它会卡住后面所有的消息。常见做法是：重试几次仍然失败后，把它投递到<strong>死信队列</strong>（Dead Letter Queue），并发送告警，由人工排查处理，让正常消息继续流动。</p>
+<h3 id="_12">数据库和消息怎么保持一致</h3>
+<p>「先写数据库，再发消息」：如果写库成功、发消息失败，下游就永远收不到通知。「先发消息，再写数据库」：如果消息发出了、写库失败，下游就会处理一条「不存在」的订单。</p>
+<p>常用的解法：</p>
+<ul>
+<li><strong>本地消息表（Outbox）</strong>：在同一个本地事务里，同时写业务数据和一条「待发送消息」记录；再由后台任务把消息可靠地发到队列，发送成功后标记为已发送；</li>
+<li><strong>事务消息</strong>：RocketMQ 支持「半消息」机制：先发一条对消费者不可见的消息，本地事务提交后再确认投递，并能在状态不明时回查。</li>
+</ul>
+<h2 id="_13">常见消息队列对比</h2>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>Kafka</th>
+<th>RocketMQ</th>
+<th>RabbitMQ</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>定位</td>
+<td>高吞吐的分布式日志，流处理</td>
+<td>业务消息，阿里开源</td>
+<td>灵活路由的传统消息代理</td>
+</tr>
+<tr>
+<td>吞吐量</td>
+<td>非常高</td>
+<td>高</td>
+<td>中等</td>
+</tr>
+<tr>
+<td>特色功能</td>
+<td>消息可长期保留、可回放</td>
+<td>事务消息、延时消息、消息过滤</td>
+<td>丰富的交换机路由规则，协议支持多</td>
+</tr>
+<tr>
+<td>适合场景</td>
+<td>日志收集、大数据管道、事件流</td>
+<td>电商订单、交易等业务消息</td>
+<td>中小规模业务、复杂路由需求</td>
+</tr>
+</tbody>
+</table>
+<p>没有绝对的好坏，要根据吞吐量、可靠性要求、功能需求和团队熟悉程度来选择。</p>
+<h2 id="_14">高频面试题速答</h2>
+<p><strong>Q：为什么使用消息队列？</strong>
+解耦、异步、削峰。代价是系统复杂度增加，数据变为最终一致。</p>
+<p><strong>Q：如何保证消息不丢失？</strong>
+生产端 <code>acks=all</code> 加重试；Broker 多副本，<code>min.insync.replicas</code> 至少为 2；消费端处理成功后再手动提交 Offset。</p>
+<p><strong>Q：如何避免重复消费？</strong>
+无法完全避免，消费逻辑要做幂等：唯一消息 ID、数据库唯一索引、状态机。</p>
+<p><strong>Q：如何保证消息顺序？</strong>
+相同业务 key 的消息发往同一个分区，分区内有序；消费端也要保证同一个 key 串行处理。</p>
+<h2 id="_15">总结</h2>
+<figure><img src="img/f-82.jpg" alt="解耦、异步、削峰；不丢、不重、有序" loading="lazy"><figcaption>解耦、异步、削峰；不丢、不重、有序</figcaption></figure>
+<ul>
+<li>消息队列的三大作用：<strong>解耦、异步、削峰</strong>；</li>
+<li>Kafka 的核心：<strong>Topic、分区、Offset、消费者组</strong>，分区数决定并行度；</li>
+<li><strong>不丢</strong>：生产端确认重试、Broker 多副本、消费端处理完再提交；</li>
+<li><strong>不重</strong>：至少一次投递下，消费者必须<strong>幂等</strong>；</li>
+<li><strong>有序</strong>：同一个 key 进同一个分区；</li>
+<li>实战中还要处理<strong>积压、死信，以及数据库和消息的一致性</strong>。</li>
+</ul>
+<div class="refs">
+<h3 id="_16">参考资料</h3>
+<ul>
+<li>Apache Kafka Documentation：Design；Producer Configs；Consumer Configs；Semantics.</li>
+<li>Kreps, J., Narkhede, N., &amp; Rao, J. (2011). Kafka: a Distributed Messaging System for Log Processing. <em>NetDB</em>.</li>
+<li>Apache RocketMQ 官方文档：事务消息.</li>
+<li>Richardson, C. Microservices Patterns: Transactional Outbox.</li>
+</ul>
+</div>
+  </article>
+  <div class="foot"><a href="../index.html">← 返回首页</a><a href="landscape.html">▶ 看配套视频</a></div>
+</div>
+</body>
+</html>
