@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>科普动画视频</title>
+<style>
+  :root{--bg:#0b0c17;--card:#14142a;--fg:#f4ede4;--muted:#9a93a8;--warm:#ffb36b;--blue:#9cc3ff;--line:rgba(255,255,255,.08)}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);
+    font-family:-apple-system,"PingFang SC","Noto Sans SC","Microsoft YaHei",sans-serif;
+    min-height:100vh;padding:56px 16px}
+  main{max-width:720px;margin:0 auto}
+  h1{font-size:32px;margin:0 0 8px}
+  p.sub{color:var(--muted);margin:0 0 36px;line-height:1.6}
+  h2{font-size:20px;margin:32px 0 12px}
+  h2 .dot{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:10px;vertical-align:middle}
+  .row{display:flex;gap:12px;flex-wrap:wrap}
+  a.card{flex:1 1 220px;display:block;padding:18px 20px;border-radius:16px;background:var(--card);
+    border:1px solid var(--line);color:var(--fg);text-decoration:none;transition:border-color .2s,transform .2s}
+  a.card:hover{border-color:var(--accent);transform:translateY(-2px)}
+  a.card b{display:block;font-size:17px;margin-bottom:6px}
+  a.card span{color:var(--muted);font-size:14px}
+  footer{margin-top:48px;color:var(--muted);font-size:13px;line-height:1.7}
+</style>
+</head>
+<body>
+<main>
+  <h1>科普动画视频</h1>
+  <p class="sub">用代码绘制的心理学科普短片。点开即可播放：点击画面或按空格键暂停，底部可以拖动进度。</p>
+
+  <h2><span class="dot" style="background:var(--warm)"></span>幸福的科学</h2>
+  <div class="row" style="--accent:var(--warm)">
+    <a class="card" href="happiness/landscape.html"><b>横屏版 ▶</b><span>1920×1080 · 72 秒 · 适合 B 站</span></a>
+    <a class="card" href="happiness/vertical.html"><b>竖屏版 ▶</b><span>1080×1920 · 72 秒 · 适合抖音</span></a>
+  </div>
+
+  <h2><span class="dot" style="background:var(--blue)"></span>人生的意义</h2>
+  <div class="row" style="--accent:var(--blue)">
+    <a class="card" href="meaning-of-life/landscape.html"><b>横屏版 ▶</b><span>1920×1080 · 72 秒</span></a>
+  </div>
+
+  <footer>导出 MP4：<code>node render.mjs &lt;html&gt; &lt;out.mp4&gt;</code>，详见 README。</footer>
+</main>
+</body>
+</html>

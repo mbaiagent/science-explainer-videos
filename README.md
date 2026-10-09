@@ -18,7 +18,9 @@
 
 ## 预览
 
-用浏览器打开任意 HTML 文件即可播放。点击画面或按空格键暂停，底部进度条可以拖动。
+在线播放：https://mbwjs.github.io/science-explainer-videos/（需仓库开启 GitHub Pages）
+
+也可以用浏览器直接打开任意 HTML 文件。点击画面或按空格键暂停，底部进度条可以拖动。
 
 ## 导出 MP4
 
