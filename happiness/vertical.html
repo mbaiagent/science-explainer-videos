@@ -1,0 +1,369 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>幸福的科学</title>
+<style>
+  :root{--bg:#07080f;--fg:#f4ede4;--muted:#9a93a8;--warm:#ffb36b}
+  html,body{margin:0;height:100%;background:var(--bg);color:var(--fg);
+    font-family:-apple-system,"PingFang SC","Noto Sans SC","Noto Sans CJK SC","Microsoft YaHei",sans-serif}
+  body{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;overflow:hidden}
+  #stage{display:block;background:#07080f;border-radius:14px;box-shadow:0 20px 60px rgba(0,0,0,.55);cursor:pointer}
+  #bar{display:flex;align-items:center;gap:12px;width:min(calc(100vw - 32px),420px)}
+  #btn{width:40px;height:40px;border-radius:50%;border:1px solid rgba(255,179,107,.5);background:transparent;
+    color:var(--warm);font-size:16px;cursor:pointer;flex:none}
+  #seek{flex:1;accent-color:var(--warm)}
+  #time{font-variant-numeric:tabular-nums;font-size:13px;color:var(--muted);min-width:84px;text-align:right}
+  body.render{display:block}
+  body.render #bar{display:none}
+  body.render #stage{border-radius:0;box-shadow:none}
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="bar">
+  <button id="btn" aria-label="播放/暂停">❚❚</button>
+  <input id="seek" type="range" min="0" max="72" step="0.01" value="0">
+  <span id="time">0:00 / 1:12</span>
+</div>
+<script>
+/* ============ 基础设置 ============ */
+const W = 1080, H = 1920, DUR = 72;
+const cv = document.getElementById('stage'), ctx = cv.getContext('2d');
+cv.width = W; cv.height = H;
+const FONT = '"PingFang SC","Noto Sans SC","Noto Sans CJK SC","Source Han Sans SC","Microsoft YaHei",sans-serif';
+const C = {warm:'#ffb36b', gold:'#ffd38a', rose:'#ff7a7a', text:'#f4ede4', muted:'#9a93a8', dim:'#4a4558'};
+
+const clamp = (x,a=0,b=1) => Math.max(a, Math.min(b, x));
+const lerp = (a,b,t) => a + (b-a)*t;
+const p = (t,a,b) => clamp((t-a)/(b-a));
+const eo = x => 1 - Math.pow(1-x, 3);
+const eio = x => x < .5 ? 4*x*x*x : 1 - Math.pow(-2*x+2, 3)/2;
+const eback = x => { const c1=1.70158, c3=c1+1; return 1 + c3*Math.pow(x-1,3) + c1*Math.pow(x-1,2); };
+function rnd(seed){ let s = seed>>>0; return () => { s = (s*1664525 + 1013904223)>>>0; return s/4294967296; }; }
+
+let SA = 1;                                   // 当前场景透明度
+const al = a => { ctx.globalAlpha = clamp(SA*a); };
+const sceneA = (t,a,b,f=.5) => Math.min(p(t,a,a+f), 1 - p(t,b-f,b));
+
+function txt(s, x, y, o = {}){
+  const {size=64, weight=700, color=C.text, alpha=1, align='center', glow=0, scale=1} = o;
+  if (alpha <= 0) return;
+  ctx.save(); al(alpha);
+  ctx.font = `${weight} ${size}px ${FONT}`;
+  ctx.textAlign = align; ctx.textBaseline = 'middle'; ctx.fillStyle = color;
+  if (glow){ ctx.shadowColor = color; ctx.shadowBlur = glow; }
+  if (scale !== 1){ ctx.translate(x, y); ctx.scale(scale, scale); ctx.fillText(s, 0, 0); }
+  else ctx.fillText(s, x, y);
+  ctx.restore();
+}
+function rise(s, x, y, t, t0, o = {}, d = .7){
+  const e = eo(p(t, t0, t0+d));
+  if (e <= 0) return;
+  txt(s, x, y + (1-e)*40, {...o, alpha:(o.alpha ?? 1)*e});
+}
+function rr(x,y,w,h,r){ ctx.beginPath(); ctx.roundRect(x,y,w,h,r); }
+
+/* ============ 背景 ============ */
+const PARTS = (() => { const r = rnd(7); return Array.from({length:90}, () => ({
+  x:r()*W, y:r()*H, s:r()*2.4+.6, v:r()*18+6, ph:r()*6.283, warm:r()<.3})); })();
+
+function background(t){
+  const g = ctx.createLinearGradient(0,0,0,H);
+  g.addColorStop(0,'#0a0b16'); g.addColorStop(.55,'#120f22'); g.addColorStop(1,'#1b1226');
+  ctx.globalAlpha = 1; ctx.fillStyle = g; ctx.fillRect(0,0,W,H);
+  const gy = H*.42 + Math.sin(t*.3)*60;
+  const rg = ctx.createRadialGradient(W/2, gy, 0, W/2, gy, 950);
+  rg.addColorStop(0,'rgba(255,170,100,0.11)'); rg.addColorStop(1,'rgba(255,170,100,0)');
+  ctx.fillStyle = rg; ctx.fillRect(0,0,W,H);
+  for (const q of PARTS){
+    const y = ((q.y - t*q.v) % H + H) % H, x = q.x + Math.sin(t*.4 + q.ph)*14;
+    ctx.globalAlpha = .22 + .3*(.5 + .5*Math.sin(t*1.3 + q.ph));
+    ctx.fillStyle = q.warm ? C.warm : '#cfc8ff';
+    ctx.beginPath(); ctx.arc(x, y, q.s, 0, 6.283); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+}
+function vignette(){
+  const v = ctx.createRadialGradient(W/2, H/2, H*.32, W/2, H/2, H*.72);
+  v.addColorStop(0,'rgba(0,0,0,0)'); v.addColorStop(1,'rgba(0,0,0,.55)');
+  ctx.globalAlpha = 1; ctx.fillStyle = v; ctx.fillRect(0,0,W,H);
+}
+
+/* ============ 场景 1 · 钩子 (0–6s) ============ */
+function chars(s, cx, y, size, weight, color, t, t0, k, seed, glow = 0){
+  ctx.font = `${weight} ${size}px ${FONT}`;
+  const cs = [...s], ws = cs.map(c => ctx.measureText(c).width);
+  let x = cx - ws.reduce((a,b) => a+b, 0)/2;
+  const r = rnd(seed);
+  cs.forEach((c,i) => {
+    const vx = (r()-.5)*1200, vy = -(r()*650 + 200), rot = (r()-.5)*5;
+    const e = eo(p(t, t0+i*.07, t0+i*.07+.45));
+    const dx = vx*k, dy = vy*k + 1500*k*k;
+    ctx.save();
+    ctx.translate(x + ws[i]/2 + dx, y + (1-e)*36 + dy); ctx.rotate(rot*k);
+    al(e*(1-k)); ctx.fillStyle = color; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    if (glow){ ctx.shadowColor = color; ctx.shadowBlur = glow; }
+    ctx.fillText(c, 0, 0); ctx.restore();
+    x += ws[i];
+  });
+}
+function s1(t){
+  rise('幸 福 的 科 学', W/2, 300, t, .2, {size:38, weight:500, color:C.muted});
+  const k = p(t, 4.3, 5.6);
+  chars('越用力追求幸福', W/2, 820, 104, 900, C.text, t, .35, k, 11);
+  chars('可能越不幸福', W/2, 965, 104, 900, C.warm, t, 1.25, k, 23, 30);
+  rise('因为我们，追错了方向', W/2, 1135, t, 2.6, {size:46, weight:500, color:C.muted, alpha:1 - p(t,4.2,4.7)});
+  const f = p(t, 4.05, 4.45);                 // 裂纹闪光
+  if (f > 0 && f < 1){
+    ctx.save(); al(1 - p(t,4.35,4.5)); ctx.strokeStyle = C.gold; ctx.lineWidth = 5;
+    ctx.shadowColor = C.gold; ctx.shadowBlur = 30; ctx.beginPath();
+    const r = rnd(5); ctx.moveTo(90, 892);
+    for (let x = 90; x <= 90 + 900*eo(f); x += 45) ctx.lineTo(x, 892 + (r()-.5)*40);
+    ctx.stroke(); ctx.restore();
+  }
+}
+
+/* ============ 场景 2 · 享乐适应 (6–22s) ============ */
+const S2 = {x0:150, x1:930, base:1000, top:620, T0:7.4, span:10.4,
+  ev:[[1.4,380,'加薪'],[4.6,440,'买新车'],[7.8,500,'换大房']]};
+function hap(tau){ let h = 0; for (const [te,a] of S2.ev){ if (tau > te){ const d = tau-te; h += a*(1-Math.exp(-d*7))*Math.exp(-d); } } return h; }
+function pill(label, x, y, e){
+  if (e <= 0) return;
+  ctx.save(); ctx.translate(x, y); ctx.scale(e, e); al(clamp(e));
+  ctx.font = `700 34px ${FONT}`;
+  const w = ctx.measureText(label).width + 48;
+  rr(-w/2, -32, w, 64, 32); ctx.fillStyle = 'rgba(255,179,107,.16)'; ctx.fill();
+  ctx.strokeStyle = C.warm; ctx.lineWidth = 2.5; ctx.stroke();
+  ctx.fillStyle = C.gold; ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.fillText(label, 0, 1);
+  ctx.restore();
+}
+function s2(t){
+  rise('误区 ①', W/2, 290, t, 6.2, {size:40, weight:600, color:C.warm});
+  rise('得到了，就会一直快乐？', W/2, 370, t, 6.4, {size:68, weight:800});
+  const ax = eo(p(t, 6.8, 7.6)), {x0,x1,base,top} = S2;
+  ctx.save(); al(ax*.7); ctx.strokeStyle = C.dim; ctx.lineWidth = 3;
+  ctx.beginPath(); ctx.moveTo(x0, top); ctx.lineTo(x0, base+60); ctx.lineTo(x0 + (x1-x0)*ax, base+60); ctx.stroke();
+  al(ax*.55); ctx.setLineDash([12,12]); ctx.strokeStyle = C.muted;
+  ctx.beginPath(); ctx.moveTo(x0, base); ctx.lineTo(x1, base); ctx.stroke(); ctx.restore();
+  txt('快乐感', x0+16, top-6, {size:32, weight:500, color:C.muted, align:'left', alpha:ax});
+  txt('时间 →', x1, base+100, {size:32, weight:500, color:C.muted, align:'right', alpha:ax});
+  txt('原来的水平', x1, base+28, {size:28, weight:500, color:C.muted, align:'right', alpha:ax*.9});
+
+  const tn = clamp(t - S2.T0, 0, S2.span);
+  if (tn > 0){
+    const X = tau => x0 + tau/S2.span*(x1-x0), Y = tau => base - hap(tau);
+    ctx.save(); al(1); ctx.strokeStyle = C.warm; ctx.lineWidth = 7; ctx.lineJoin = 'round'; ctx.lineCap = 'round';
+    ctx.shadowColor = C.warm; ctx.shadowBlur = 24; ctx.beginPath();
+    for (let s = 0; s <= tn; s += .02){ const x = X(s), y = Y(s); s ? ctx.lineTo(x,y) : ctx.moveTo(x,y); }
+    ctx.lineTo(X(tn), Y(tn)); ctx.stroke();
+    ctx.fillStyle = C.gold; ctx.beginPath(); ctx.arc(X(tn), Y(tn), 13, 0, 6.283); ctx.fill(); ctx.restore();
+    for (const [te,,label] of S2.ev){
+      const lt = S2.T0 + te + .3;
+      if (t > lt) pill(label, X(te+.3), Y(te+.3) - 66, eback(p(t, lt, lt+.5)));
+    }
+  }
+  rise('心理学叫它「享乐适应」', W/2, 1200, t, 17.4, {size:58, weight:800});
+  rise('再好的东西，快乐都会慢慢回到原点', W/2, 1275, t, 17.9, {size:38, weight:500, color:C.muted});
+
+  const tr = eo(p(t, 18.3, 19));               // 跑步机
+  if (tr > 0){
+    const cx = W/2, by = 1440;
+    ctx.save(); al(tr);
+    rr(cx-230, by, 460, 30, 15); ctx.fillStyle = 'rgba(255,255,255,.07)'; ctx.fill();
+    ctx.strokeStyle = C.dim; ctx.lineWidth = 3; ctx.stroke();
+    ctx.save(); rr(cx-230, by, 460, 30, 15); ctx.clip();
+    ctx.strokeStyle = 'rgba(255,255,255,.28)'; ctx.lineWidth = 4;
+    for (let x = cx-240 - (t*260) % 40; x < cx+260; x += 40){ ctx.beginPath(); ctx.moveTo(x, by+6); ctx.lineTo(x-10, by+24); ctx.stroke(); }
+    ctx.restore();
+    ctx.fillStyle = C.dim; for (const ex of [cx-230, cx+230]){ ctx.beginPath(); ctx.arc(ex, by+15, 20, 0, 6.283); ctx.fill(); }
+    const b = Math.abs(Math.sin(t*7)), bx = cx, byy = by - 32 - b*70;
+    ctx.strokeStyle = 'rgba(255,179,107,.45)'; ctx.lineWidth = 4; ctx.lineCap = 'round';
+    for (let i = 0; i < 3; i++){ const ly = byy - 14 + i*14; ctx.beginPath(); ctx.moveTo(bx-52 - i*8, ly); ctx.lineTo(bx-100 - i*14, ly); ctx.stroke(); }
+    ctx.fillStyle = C.warm; ctx.shadowColor = C.warm; ctx.shadowBlur = 30;
+    ctx.beginPath(); ctx.ellipse(bx, byy, 30 + (1-b)*4, 30 - (1-b)*4, 0, 0, 6.283); ctx.fill();
+    ctx.restore();
+  }
+  rise('跑得再快，还在原地', W/2, 1560, t, 18.9, {size:46, weight:700, color:C.gold});
+}
+
+/* ============ 场景 3 · 哈佛研究 (22–39s) ============ */
+const NET = (() => {
+  const r = rnd(42), n = []; let tries = 0;
+  while (n.length < 26 && tries < 4000){
+    tries++; const x = 150 + r()*780, y = 1170 + r()*270;
+    if (n.every(q => Math.hypot(q.x-x, q.y-y) > 100)) n.push({x, y, r:8 + r()*7});
+  }
+  const iso = new Set([2, 9, 15, 21].filter(i => i < n.length)), E = [];
+  for (let i = 0; i < n.length; i++) for (let j = i+1; j < n.length; j++){
+    if (iso.has(i) || iso.has(j)) continue;
+    if (Math.hypot(n[i].x-n[j].x, n[i].y-n[j].y) < 200) E.push([i,j]);
+  }
+  return {n, iso, E};
+})();
+function s3(t){
+  rise('一项追踪了 80 多年的研究', W/2, 290, t, 22.2, {size:40, weight:600, color:C.warm});
+  rise('哈佛成人发展研究', W/2, 370, t, 22.4, {size:68, weight:800});
+  const yr = Math.round(lerp(1938, 2026, eio(p(t, 23.2, 25.2))));
+  txt(String(yr), W/2, 540, {size:140, weight:900, color:C.gold, glow:30, alpha:eo(p(t,22.9,23.3))});
+  rise('从 1938 年起，跟踪一群人的一生', W/2, 645, t, 23.4, {size:38, weight:500, color:C.muted});
+  rise('什么最能预测一个人幸福？', W/2, 780, t, 25.6, {size:50, weight:700});
+
+  ['财富','名气','成就'].forEach((w,i) => {
+    const x = 270 + i*270, st = 28 + i*.35, sk = eo(p(t, st, st+.35));
+    rise(w, x, 900, t, 26.4 + i*.3, {size:56, weight:700, color:C.text, alpha:1 - .6*sk});
+    if (sk > 0){ ctx.save(); al(1); ctx.strokeStyle = C.rose; ctx.lineWidth = 6; ctx.lineCap = 'round';
+      ctx.beginPath(); ctx.moveTo(x-75, 902); ctx.lineTo(x-75 + 150*sk, 902); ctx.stroke(); ctx.restore(); }
+  });
+  const kb = p(t, 29, 29.6);
+  if (kb > 0) txt('是 关 系', W/2, 1040, {size:120, weight:900, color:C.warm, glow:40, alpha:clamp(kb*2), scale:eback(kb)});
+
+  const {n, iso, E} = NET, dimK = p(t, 32.6, 34), glowK = p(t, 31, 33);
+  ctx.save(); ctx.lineCap = 'round';
+  E.forEach(([a,b], idx) => {
+    const st = 30.4 + idx*.04, e = eo(p(t, st, st+.4)); if (e <= 0) return;
+    al(.5); ctx.strokeStyle = C.warm; ctx.lineWidth = 3;
+    ctx.beginPath(); ctx.moveTo(n[a].x, n[a].y); ctx.lineTo(lerp(n[a].x, n[b].x, e), lerp(n[a].y, n[b].y, e)); ctx.stroke();
+  });
+  n.forEach((q,i) => {
+    const e = eback(p(t, 29.8 + i*.03, 30.2 + i*.03)); if (e <= 0) return;
+    if (iso.has(i)){ al(1 - .7*dimK); ctx.fillStyle = C.muted; ctx.shadowBlur = 0; }
+    else { al(1); ctx.fillStyle = C.gold; ctx.shadowColor = C.gold; ctx.shadowBlur = 24*glowK; }
+    ctx.beginPath(); ctx.arc(q.x, q.y, q.r*Math.max(e,0), 0, 6.283); ctx.fill();
+  });
+  ctx.restore();
+  rise('关系越好的人，越快乐，也越健康', W/2, 1545, t, 33.8, {size:46, weight:700});
+  rise('孤独的人，健康也更早走下坡路', W/2, 1615, t, 35.2, {size:36, weight:500, color:C.muted});
+}
+
+/* ============ 场景 4 · 心流 (39–53s) ============ */
+const S4 = {x0:220, y0:560, s:640};
+function s4(t){
+  rise('误区 ②', W/2, 290, t, 39.2, {size:40, weight:600, color:C.warm});
+  rise('幸福是一个要去追的终点？', W/2, 370, t, 39.4, {size:64, weight:800});
+  rise('其实，它更像一个副产品', W/2, 455, t, 40.4, {size:46, weight:700, color:C.warm});
+  const {x0, y0, s} = S4, ap = eo(p(t, 41, 41.8));
+  if (ap > 0){
+    ctx.save(); al(ap*.75); ctx.strokeStyle = C.dim; ctx.lineWidth = 3;
+    ctx.beginPath(); ctx.moveTo(x0, y0); ctx.lineTo(x0, y0+s); ctx.lineTo(x0+s, y0+s); ctx.stroke();
+    ctx.beginPath(); ctx.rect(x0, y0, s, s); ctx.clip();
+    const hw = 80/Math.SQRT2;                  // 心流带
+    const g = ctx.createLinearGradient(x0, y0+s, x0+s, y0);
+    g.addColorStop(0,'rgba(255,179,107,.10)'); g.addColorStop(1,'rgba(255,211,138,.30)');
+    al(ap); ctx.fillStyle = g; ctx.beginPath();
+    ctx.moveTo(x0-hw*2, y0+s-0); ctx.lineTo(x0, y0+s+hw*2); ctx.lineTo(x0+s+hw*2, y0); ctx.lineTo(x0+s, y0-hw*2); ctx.closePath(); ctx.fill();
+    ctx.restore();
+    txt('技能 →', x0+s, y0+s+48, {size:32, weight:500, color:C.muted, align:'right', alpha:ap});
+    txt('挑战 ↑', x0, y0-36, {size:32, weight:500, color:C.muted, align:'left', alpha:ap});
+    ctx.save(); ctx.translate(x0+s*.27+30, y0+s*.73+30); ctx.rotate(-Math.PI/4);
+    txt('心 流', 0, 0, {size:44, weight:800, color:C.gold, alpha:ap, glow:20}); ctx.restore();
+  }
+  const kp = [[42.0, x0+s-130, y0+s-120], [43.6, x0+140, y0+130], [45.2, x0+s/2, y0+s/2], [47.0, x0+s*.68, y0+s*.32]];
+  const hiBore = p(t,42,42.4) - p(t,43.2,43.6), hiAnx = p(t,43.4,43.8) - p(t,44.8,45.2);
+  txt('焦虑', x0+150, y0+150, {size:44, weight:700, color:hiAnx > .1 ? C.rose : C.muted, alpha:ap*(.55 + .45*hiAnx)});
+  txt('无聊', x0+s-150, y0+s-150, {size:44, weight:700, color:hiBore > .1 ? '#8fb6ff' : C.muted, alpha:ap*(.55 + .45*hiBore)});
+  const de = eo(p(t, 41.6, 42.0));
+  if (de > 0){
+    let px = kp[0][1], py = kp[0][2];
+    for (let i = 1; i < kp.length; i++){ const k = eio(p(t, kp[i-1][0], kp[i][0])); if (k > 0){ px = lerp(kp[i-1][1], kp[i][1], k); py = lerp(kp[i-1][2], kp[i][2], k); } }
+    const inFlow = p(t, 44.8, 45.4);
+    ctx.save();
+    if (t > 45.2){ for (let i = 0; i < 4; i++){ const ph = ((t - 45.2) / 1.2 + i/4) % 1;
+      al((1-ph)*.6*inFlow); ctx.strokeStyle = C.gold; ctx.lineWidth = 3; ctx.beginPath(); ctx.arc(px, py, 22 + ph*120, 0, 6.283); ctx.stroke(); } }
+    al(de); ctx.fillStyle = inFlow > .5 ? C.gold : C.text; ctx.shadowColor = C.gold; ctx.shadowBlur = 10 + 40*inFlow;
+    ctx.beginPath(); ctx.arc(px, py, 20 + 6*inFlow, 0, 6.283); ctx.fill(); ctx.restore();
+  }
+  rise('全情投入时，你会忘了自己', W/2, 1335, t, 47.0, {size:52, weight:800});
+  rise('心理学家契克森米哈伊称之为「心流」', W/2, 1408, t, 47.8, {size:36, weight:500, color:C.muted});
+  rise('幸福，常在这时悄悄发生', W/2, 1500, t, 49.0, {size:50, weight:800, color:C.gold, glow:16});
+}
+
+/* ============ 场景 5 · 三件小事 (53–66s) ============ */
+const TIPS = [['01','联系一个人','给很久没聊的朋友发条消息'],['02','写下一件好事','睡前记下今天值得感谢的小事'],['03','做件忘记时间的事','画画、跑步、写代码，都算']];
+function s5(t){
+  rise('今晚就能做的 3 件事', W/2, 360, t, 53.3, {size:66, weight:900});
+  TIPS.forEach(([no, main, sub], i) => {
+    const st = 54.2 + i*2.2, e = eback(p(t, st, st+.7)); if (e <= 0) return;
+    const y = 500 + i*290, dx = (1-e)*W*.6;
+    ctx.save(); ctx.translate(dx, 0); al(clamp(p(t,st,st+.4)));
+    rr(100, y, 880, 240, 32); ctx.fillStyle = 'rgba(255,255,255,.05)'; ctx.fill();
+    ctx.strokeStyle = 'rgba(255,179,107,.3)'; ctx.lineWidth = 2; ctx.stroke(); ctx.restore();
+    const a = clamp(p(t, st, st+.4));
+    txt(no, 205 + dx, y+120, {size:76, weight:900, color:C.gold, alpha:a, glow:18});
+    txt(main, 300 + dx, y+88, {size:54, weight:800, align:'left', alpha:a});
+    txt(sub, 300 + dx, y+160, {size:34, weight:500, color:C.muted, align:'left', alpha:a});
+  });
+  rise('小事，但都有研究支持', W/2, 1440, t, 61.2, {size:40, weight:500, color:C.muted});
+}
+
+/* ============ 场景 6 · 收尾 (66–72s) ============ */
+const RING = (() => { const r = rnd(99); return Array.from({length:36}, () => ({sx:r()*W, sy:r()*H})); })();
+function s6(t){
+  const k = eio(p(t, 66.1, 67.9)), cx = W/2, cy = 720, R = 180;
+  const pts = RING.map((q,i) => { const a = i/RING.length*6.283 + t*.15;
+    return [lerp(q.sx, cx + Math.cos(a)*R, k), lerp(q.sy, cy + Math.sin(a)*R, k)]; });
+  ctx.save();
+  const rg = ctx.createRadialGradient(cx, cy, 0, cx, cy, 300);
+  rg.addColorStop(0, `rgba(255,190,120,${.35*k})`); rg.addColorStop(1, 'rgba(255,190,120,0)');
+  al(1); ctx.fillStyle = rg; ctx.fillRect(cx-300, cy-300, 600, 600);
+  al(.55*k); ctx.strokeStyle = C.warm; ctx.lineWidth = 3; ctx.beginPath();
+  pts.forEach(([x,y],i) => i ? ctx.lineTo(x,y) : ctx.moveTo(x,y)); ctx.closePath(); ctx.stroke();
+  for (let i = 0; i < pts.length; i += 3){ const j = (i + 12) % pts.length;
+    al(.18*k); ctx.beginPath(); ctx.moveTo(...pts[i]); ctx.lineTo(...pts[j]); ctx.stroke(); }
+  al(1); ctx.fillStyle = C.gold; ctx.shadowColor = C.gold; ctx.shadowBlur = 18;
+  for (const [x,y] of pts){ ctx.beginPath(); ctx.arc(x, y, 7, 0, 6.283); ctx.fill(); }
+  ctx.restore();
+  rise('幸福不是终点', W/2, 1040, t, 67.0, {size:78, weight:900});
+  rise('是你和世界连接的方式', W/2, 1135, t, 67.7, {size:56, weight:800, color:C.warm, glow:20});
+  rise('关注我，一起把日子过亮一点', W/2, 1330, t, 69.0, {size:38, weight:500, color:C.muted});
+}
+
+/* ============ 总调度 ============ */
+const SCENES = [[s1,-1,6],[s2,6,22],[s3,22,39],[s4,39,53],[s5,53,66],[s6,66,72]];
+function draw(t){
+  t = clamp(t, 0, DUR);
+  ctx.save(); ctx.globalAlpha = 1; ctx.clearRect(0,0,W,H); background(t);
+  for (const [fn,a,b] of SCENES){
+    if (t < a || t > b) continue;
+    SA = sceneA(t, a, b, b === DUR ? .8 : .5);
+    if (SA > 0){ ctx.save(); fn(t); ctx.restore(); }
+  }
+  SA = 1; vignette();
+  const fo = p(t, 71.2, 72);
+  if (fo > 0){ ctx.globalAlpha = fo; ctx.fillStyle = '#000'; ctx.fillRect(0,0,W,H); }
+  ctx.restore();
+}
+
+/* ============ 播放器 / 逐帧渲染接口 ============ */
+const isRender = new URLSearchParams(location.search).has('render');
+window.DURATION = DUR;
+window.renderFrame = t => draw(t);          // 供 Playwright 逐帧截图
+const btn = document.getElementById('btn'), seek = document.getElementById('seek'), timeEl = document.getElementById('time');
+const fmt = s => `${Math.floor(s/60)}:${String(Math.floor(s%60)).padStart(2,'0')}`;
+function fit(){
+  if (isRender){ cv.style.width = W+'px'; cv.style.height = H+'px'; return; }
+  const h = Math.min(innerHeight - 84, (innerWidth - 32)*16/9);
+  cv.style.height = h + 'px'; cv.style.width = h*9/16 + 'px';
+}
+addEventListener('resize', fit); fit();
+
+let cur = 0, playing = !isRender, last = null;
+function toggle(){ if (cur >= DUR) cur = 0; playing = !playing; }
+btn.onclick = toggle; cv.onclick = toggle;
+addEventListener('keydown', e => { if (e.code === 'Space'){ e.preventDefault(); toggle(); } });
+seek.oninput = () => { cur = +seek.value; draw(cur); };
+function loop(ts){
+  if (playing && last != null){ cur += (ts - last)/1000; if (cur >= DUR){ cur = DUR; playing = false; } }
+  last = ts; draw(cur);
+  seek.value = cur; timeEl.textContent = `${fmt(cur)} / ${fmt(DUR)}`;
+  btn.textContent = playing ? '❚❚' : (cur >= DUR ? '↺' : '▶');
+  requestAnimationFrame(loop);
+}
+document.fonts.ready.then(() => {
+  window.ready = true;
+  if (isRender) draw(0); else requestAnimationFrame(loop);
+});
+</script>
+</body>
+</html>

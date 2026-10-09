@@ -1,0 +1,326 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>人生的意义</title>
+<style>
+  :root{--bg:#07080f;--fg:#f4ede4;--muted:#9a93a8;--blue:#9cc3ff}
+  html,body{margin:0;height:100%;background:var(--bg);color:var(--fg);
+    font-family:-apple-system,"PingFang SC","Noto Sans SC","Noto Sans CJK SC","Microsoft YaHei",sans-serif}
+  body{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;overflow:hidden}
+  #stage{display:block;background:#07080f;border-radius:12px;box-shadow:0 20px 60px rgba(0,0,0,.55);cursor:pointer}
+  #bar{display:flex;align-items:center;gap:12px;width:min(calc(100vw - 32px),640px)}
+  #btn{width:40px;height:40px;border-radius:50%;border:1px solid rgba(156,195,255,.5);background:transparent;
+    color:var(--blue);font-size:16px;cursor:pointer;flex:none}
+  #seek{flex:1;accent-color:var(--blue)}
+  #time{font-variant-numeric:tabular-nums;font-size:13px;color:var(--muted);min-width:84px;text-align:right}
+  body.render{display:block}
+  body.render #bar{display:none}
+  body.render #stage{border-radius:0;box-shadow:none}
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="bar">
+  <button id="btn" aria-label="播放/暂停">❚❚</button>
+  <input id="seek" type="range" min="0" max="72" step="0.01" value="0">
+  <span id="time">0:00 / 1:12</span>
+</div>
+<script>
+/* ============ 基础设置（横屏 1920×1080） ============ */
+const W = 1920, H = 1080, DUR = 72;
+const cv = document.getElementById('stage'), ctx = cv.getContext('2d');
+cv.width = W; cv.height = H;
+const FONT = '"PingFang SC","Noto Sans SC","Noto Sans CJK SC","Source Han Sans SC","Microsoft YaHei",sans-serif';
+const C = {blue:'#9cc3ff', ice:'#d6e6ff', gold:'#ffd38a', warm:'#ffb36b', rose:'#ff8a8a', text:'#f4ede4', muted:'#9a93a8', dim:'#4a4558'};
+
+const clamp = (x,a=0,b=1) => Math.max(a, Math.min(b, x));
+const lerp = (a,b,t) => a + (b-a)*t;
+const p = (t,a,b) => clamp((t-a)/(b-a));
+const eo = x => 1 - Math.pow(1-x, 3);
+const eio = x => x < .5 ? 4*x*x*x : 1 - Math.pow(-2*x+2, 3)/2;
+const eback = x => { const c1=1.70158, c3=c1+1; return 1 + c3*Math.pow(x-1,3) + c1*Math.pow(x-1,2); };
+function rnd(seed){ let s = seed>>>0; return () => { s = (s*1664525 + 1013904223)>>>0; return s/4294967296; }; }
+
+let SA = 1;
+const al = a => { ctx.globalAlpha = clamp(SA*a); };
+const sceneA = (t,a,b,f=.5) => Math.min(p(t,a,a+f), 1 - p(t,b-f,b));
+
+function txt(s, x, y, o = {}){
+  const {size=64, weight=700, color=C.text, alpha=1, align='center', glow=0, scale=1} = o;
+  if (alpha <= 0) return;
+  ctx.save(); al(alpha);
+  ctx.font = `${weight} ${size}px ${FONT}`;
+  ctx.textAlign = align; ctx.textBaseline = 'middle'; ctx.fillStyle = color;
+  if (glow){ ctx.shadowColor = color; ctx.shadowBlur = glow; }
+  if (scale !== 1){ ctx.translate(x, y); ctx.scale(scale, scale); ctx.fillText(s, 0, 0); }
+  else ctx.fillText(s, x, y);
+  ctx.restore();
+}
+function rise(s, x, y, t, t0, o = {}, d = .7){
+  const e = eo(p(t, t0, t0+d));
+  if (e <= 0) return;
+  txt(s, x, y + (1-e)*36, {...o, alpha:(o.alpha ?? 1)*e});
+}
+function rr(x,y,w,h,r){ ctx.beginPath(); ctx.roundRect(x,y,w,h,r); }
+function star(x, y, r, color, glow){
+  ctx.save(); ctx.translate(x, y); ctx.fillStyle = color; ctx.shadowColor = color; ctx.shadowBlur = glow;
+  ctx.beginPath();
+  for (let i = 0; i < 8; i++){ const a = i*Math.PI/4 - Math.PI/2, rad = i % 2 ? r*.28 : r; ctx.lineTo(Math.cos(a)*rad, Math.sin(a)*rad); }
+  ctx.closePath(); ctx.fill(); ctx.restore();
+}
+
+/* ============ 背景 ============ */
+const PARTS = (() => { const r = rnd(17); return Array.from({length:120}, () => ({
+  x:r()*W, y:r()*H, s:r()*2.3+.5, v:r()*10+4, ph:r()*6.283, warm:r()<.2})); })();
+
+function background(t){
+  const g = ctx.createLinearGradient(0,0,W,H);
+  g.addColorStop(0,'#080a17'); g.addColorStop(.55,'#0f1024'); g.addColorStop(1,'#16122a');
+  ctx.globalAlpha = 1; ctx.fillStyle = g; ctx.fillRect(0,0,W,H);
+  const gx = W*.5 + Math.sin(t*.25)*140;
+  const rg = ctx.createRadialGradient(gx, H*.4, 0, gx, H*.4, 950);
+  rg.addColorStop(0,'rgba(140,170,255,0.10)'); rg.addColorStop(1,'rgba(140,170,255,0)');
+  ctx.fillStyle = rg; ctx.fillRect(0,0,W,H);
+  for (const q of PARTS){
+    const y = ((q.y - t*q.v) % H + H) % H, x = q.x + Math.sin(t*.35 + q.ph)*12;
+    ctx.globalAlpha = .2 + .32*(.5 + .5*Math.sin(t*1.2 + q.ph));
+    ctx.fillStyle = q.warm ? C.gold : '#c9d8ff';
+    ctx.beginPath(); ctx.arc(x, y, q.s, 0, 6.283); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+}
+function vignette(){
+  const v = ctx.createRadialGradient(W/2, H/2, W*.28, W/2, H/2, W*.62);
+  v.addColorStop(0,'rgba(0,0,0,0)'); v.addColorStop(1,'rgba(0,0,0,.55)');
+  ctx.globalAlpha = 1; ctx.fillStyle = v; ctx.fillRect(0,0,W,H);
+}
+
+/* ============ 场景 1 · 钩子 (0–6s) ============ */
+function s1(t){
+  rise('人 生 的 意 义', W/2, 240, t, .2, {size:38, weight:500, color:C.muted});
+  // 逐字打出
+  const q = '人生到底有什么意义', n = Math.floor(clamp((t - .5)/1.6)*q.length + .0001);
+  const out = 1 - p(t, 4.6, 5.4);
+  ctx.save(); al(out);
+  ctx.font = `900 120px ${FONT}`; ctx.textBaseline = 'middle'; ctx.fillStyle = C.text;
+  const full = ctx.measureText(q + '？').width, x0 = W/2 - full/2, shown = q.slice(0, n);
+  ctx.textAlign = 'left'; ctx.fillText(shown, x0, 470);
+  const qx = x0 + ctx.measureText(q).width;
+  if (n >= q.length){                          // 问号放大 + 发光
+    const k = eback(p(t, 2.2, 2.8)), pulse = 1 + .06*Math.sin(t*5);
+    ctx.save(); ctx.translate(qx + ctx.measureText('？').width/2, 470); ctx.scale(k*pulse, k*pulse);
+    ctx.textAlign = 'center'; ctx.fillStyle = C.blue; ctx.shadowColor = C.blue; ctx.shadowBlur = 40;
+    ctx.fillText('？', 0, 0); ctx.restore();
+  } else if (Math.floor(t*2.5) % 2 === 0){     // 光标
+    ctx.fillStyle = C.blue; ctx.fillRect(x0 + ctx.measureText(shown).width + 8, 410, 8, 120);
+  }
+  ctx.restore();
+  rise('也许，这个问题问反了', W/2, 640, t, 3.1, {size:58, weight:800, color:C.blue, glow:20, alpha:out});
+}
+
+/* ============ 场景 2 · 弗兰克尔 (6–22s) ============ */
+const FIELD = (() => {
+  const r = rnd(31), d = [];
+  for (let i = 0; i < 10; i++) for (let j = 0; j < 6; j++)
+    d.push({x: 1110 + i*72 + (r()-.5)*36, y: 450 + j*68 + (r()-.5)*30, m: r() < .17, ph: r()*6.28});
+  return d;
+})();
+const STAR = {x:1440, y:240};
+function s2(t){
+  const L = 560;
+  rise('一个真实的故事', L, 220, t, 6.2, {size:36, weight:600, color:C.blue});
+  rise('1942 年，他被关进了集中营', L, 300, t, 6.4, {size:54, weight:800});
+  rise('维也纳精神科医生 · 维克多·弗兰克尔', L, 375, t, 7.3, {size:32, weight:500, color:C.muted});
+  rise('他观察到：心里有一个「为什么」的人', L, 500, t, 13.4, {size:40, weight:700});
+  rise('往往更撑得下去', L, 560, t, 14.0, {size:40, weight:700});
+  rise('知道为什么而活的人', L, 700, t, 16.4, {size:54, weight:900, color:C.gold, glow:16});
+  rise('几乎能承受任何一种活法', L, 775, t, 17.2, {size:54, weight:900, color:C.gold, glow:16});
+  rise('—— 尼采，弗兰克尔常引用这句话', L, 860, t, 18.4, {size:30, weight:500, color:C.muted});
+
+  const sa = eback(p(t, 10.8, 11.5));
+  if (sa > 0){ ctx.save(); al(clamp(sa)); star(STAR.x, STAR.y, 34*sa, C.gold, 40 + 10*Math.sin(t*3)); ctx.restore(); }
+  const dimK = p(t, 10, 12.6);
+  ctx.save(); ctx.lineCap = 'round';
+  FIELD.forEach((d, i) => {
+    if (!d.m) return;
+    const st = 11.2 + i*.02, e = eo(p(t, st, st + 1.2)); if (e <= 0) return;
+    al(.45); ctx.strokeStyle = C.gold; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(d.x, d.y); ctx.lineTo(lerp(d.x, STAR.x, e), lerp(d.y, STAR.y, e)); ctx.stroke();
+  });
+  FIELD.forEach((d, i) => {
+    const e = eo(p(t, 8 + i*.015, 8.5 + i*.015)); if (e <= 0) return;
+    if (d.m){ al(e); ctx.fillStyle = dimK > .3 ? C.gold : C.ice; ctx.shadowColor = C.gold; ctx.shadowBlur = 22*dimK; }
+    else { al(e*(1 - .75*dimK)); ctx.fillStyle = C.ice; ctx.shadowBlur = 0; }
+    ctx.beginPath(); ctx.arc(d.x, d.y + Math.sin(t*1.4 + d.ph)*3, d.m ? 9 : 7, 0, 6.283); ctx.fill();
+  });
+  ctx.restore();
+}
+
+/* ============ 场景 3 · 意义的三个来源 (22–39s) ============ */
+const SRC = [['去创造', ['做一件事','完成一项工作']], ['去爱', ['爱一个人','体验一种美好']], ['去面对', ['在改变不了的困境里','选择自己的态度']]];
+function iconCreate(cx, cy, t, st){
+  for (let i = 0; i < 3; i++){
+    const e = eo(p(t, st + .3 + i*.25, st + .6 + i*.25)); if (e <= 0) continue;
+    const y = cy + 50 - i*48 - (1-e)*120;
+    ctx.save(); al(e); rr(cx - 40 + (i === 1 ? 10 : 0), y - 22, 80, 44, 8);
+    ctx.fillStyle = i === 2 ? C.gold : 'rgba(156,195,255,.35)'; ctx.shadowColor = C.gold; ctx.shadowBlur = i === 2 ? 20 : 0;
+    ctx.fill(); ctx.restore();
+  }
+}
+function iconLove(cx, cy, t){
+  const a = t*1.6, r = 38;
+  const ax = cx + Math.cos(a)*r, ay = cy + Math.sin(a)*r*.55, bx = cx - Math.cos(a)*r, by = cy - Math.sin(a)*r*.55;
+  ctx.save(); al(.35); ctx.strokeStyle = C.blue; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.ellipse(cx, cy, r, r*.55, 0, 0, 6.283); ctx.stroke();
+  al(.7); ctx.strokeStyle = C.gold; ctx.beginPath(); ctx.moveTo(ax, ay); ctx.lineTo(bx, by); ctx.stroke();
+  al(1); ctx.shadowBlur = 22;
+  ctx.fillStyle = C.gold; ctx.shadowColor = C.gold; ctx.beginPath(); ctx.arc(ax, ay, 15, 0, 6.283); ctx.fill();
+  ctx.fillStyle = C.blue; ctx.shadowColor = C.blue; ctx.beginPath(); ctx.arc(bx, by, 15, 0, 6.283); ctx.fill();
+  ctx.restore();
+}
+function iconFace(cx, cy, t){
+  ctx.save();
+  al(.35); ctx.strokeStyle = C.blue; ctx.lineWidth = 2; ctx.lineCap = 'round';   // 雨
+  for (let i = 0; i < 9; i++){
+    const x = cx - 110 + i*28, y = cy - 70 + ((t*160 + i*37) % 140);
+    if (Math.abs(x - cx) < 34) continue;
+    ctx.beginPath(); ctx.moveTo(x, y); ctx.lineTo(x - 8, y + 22); ctx.stroke();
+  }
+  const f = 1 + .08*Math.sin(t*9) + .05*Math.sin(t*13.7), sway = Math.sin(t*3)*4;   // 火苗
+  al(1); ctx.translate(cx, cy + 40); ctx.fillStyle = C.gold; ctx.shadowColor = C.warm; ctx.shadowBlur = 36;
+  ctx.beginPath(); ctx.moveTo(0, 0);
+  ctx.bezierCurveTo(30, -10, 26*f, -50*f, sway, -86*f);
+  ctx.bezierCurveTo(-26*f, -50*f, -30, -10, 0, 0); ctx.fill();
+  ctx.fillStyle = '#fff3d6'; ctx.shadowBlur = 0; ctx.beginPath(); ctx.ellipse(0, -20, 9, 18*f, 0, 0, 6.283); ctx.fill();
+  ctx.restore();
+}
+function s3(t){
+  rise('那意义从哪里来？', W/2, 165, t, 22.2, {size:60, weight:900});
+  rise('弗兰克尔给了三个答案', W/2, 240, t, 22.9, {size:34, weight:500, color:C.blue});
+  SRC.forEach(([main, sub], i) => {
+    const st = 24.2 + i*2.6, e = eback(p(t, st, st+.7)); if (e <= 0) return;
+    const x = 135 + i*570, y = 320, dy = (1-e)*320, cx = x + 270, a = clamp(p(t, st, st+.4));
+    ctx.save(); ctx.translate(0, dy); al(a);
+    rr(x, y, 540, 470, 32); ctx.fillStyle = 'rgba(255,255,255,.045)'; ctx.fill();
+    ctx.strokeStyle = 'rgba(156,195,255,.3)'; ctx.lineWidth = 2; ctx.stroke();
+    SA *= a;
+    if (i === 0) iconCreate(cx, y + 135, t, st); else if (i === 1) iconLove(cx, y + 135, t); else iconFace(cx, y + 125, t);
+    SA /= a || 1;
+    ctx.restore();
+    txt(main, cx, y + 275 + dy, {size:56, weight:900, alpha:a});
+    txt(sub[0], cx, y + 355 + dy, {size:32, weight:500, color:C.muted, alpha:a});
+    txt(sub[1], cx, y + 400 + dy, {size:32, weight:500, color:C.muted, alpha:a});
+  });
+  rise('意义不是被找到的，而是被活出来的', W/2, 900, t, 32.6, {size:48, weight:800, color:C.gold, glow:16});
+}
+
+/* ============ 场景 4 · 快乐 ≠ 意义 (39–53s) ============ */
+const ROWS = [['得到想要的', '为别人付出'], ['活在当下', '连接过去和未来'], ['压力会让它变少', '常常伴随压力和操心']];
+function s4(t){
+  rise('心理学家鲍迈斯特的研究发现', W/2, 150, t, 39.2, {size:34, weight:600, color:C.blue});
+  rise('快乐和意义，不是一回事', W/2, 230, t, 39.5, {size:60, weight:900});
+  const Lx = 620, Rx = 1300, hd = eo(p(t, 40.6, 41.2));
+  txt('快乐', Lx, 365, {size:66, weight:900, color:C.warm, glow:24, alpha:hd});
+  txt('意义', Rx, 365, {size:66, weight:900, color:C.blue, glow:24, alpha:hd});
+  ctx.save(); al(hd*.5); ctx.strokeStyle = C.dim; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(W/2 - 0, 330); ctx.lineTo(W/2, 330 + 440*hd); ctx.stroke(); ctx.restore();
+  ROWS.forEach(([a, b], i) => {
+    const st = 41.6 + i*1.6, e = eo(p(t, st, st+.6)), y = 490 + i*110;
+    if (e <= 0) return;
+    txt(a, Lx - (1-e)*120, y, {size:40, weight:700, alpha:e});
+    txt(b, Rx + (1-e)*120, y, {size:40, weight:700, alpha:e});
+    ctx.save(); al(e*.4); ctx.fillStyle = C.muted;
+    ctx.beginPath(); ctx.arc(W/2, y, 5, 0, 6.283); ctx.fill(); ctx.restore();
+  });
+  rise('最有意义的事，往往不是最轻松的', W/2, 880, t, 47.4, {size:48, weight:800, color:C.gold, glow:16});
+  rise('但回头看，它们最让人觉得「值得」', W/2, 950, t, 48.8, {size:34, weight:500, color:C.muted});
+}
+
+/* ============ 场景 5 · 三个问题 (53–66s) ============ */
+const QS = [['01', '最近一次忘了时间，', '是在做什么？'], ['02', '如果没人看见，', '你还愿意做什么？'], ['03', '谁的生活，', '会因为你变好一点？']];
+function s5(t){
+  rise('今晚，问自己 3 个问题', W/2, 170, t, 53.3, {size:64, weight:900});
+  QS.forEach(([no, l1, l2], i) => {
+    const st = 54.2 + i*2.2, e = eback(p(t, st, st+.7)); if (e <= 0) return;
+    const x = 135 + i*570, y = 320, dy = (1-e)*360, cx = x + 270, a = clamp(p(t, st, st+.4));
+    ctx.save(); ctx.translate(0, dy); al(a);
+    rr(x, y, 540, 440, 32); ctx.fillStyle = 'rgba(255,255,255,.05)'; ctx.fill();
+    ctx.strokeStyle = 'rgba(156,195,255,.3)'; ctx.lineWidth = 2; ctx.stroke(); ctx.restore();
+    txt(no, cx, y+115+dy, {size:88, weight:900, color:C.blue, alpha:a, glow:18});
+    txt(l1, cx, y+255+dy, {size:44, weight:800, alpha:a});
+    txt(l2, cx, y+325+dy, {size:44, weight:800, alpha:a});
+  });
+  rise('你的答案里，藏着你的意义', W/2, 900, t, 61.2, {size:40, weight:600, color:C.muted});
+}
+
+/* ============ 场景 6 · 收尾 (66–72s) ============ */
+function pathY(x){ return 360 + Math.sin(x/170)*55 + Math.sin(x/61)*14; }
+function s6(t){
+  const k = eio(p(t, 66.1, 68.6)), xs = 220, xe = 1700, xh = lerp(xs, xe, k);
+  ctx.save(); ctx.lineCap = 'round';
+  if (k > 0){
+    const g = ctx.createLinearGradient(xs, 0, xe, 0);
+    g.addColorStop(0, 'rgba(156,195,255,.15)'); g.addColorStop(1, C.gold);
+    al(1); ctx.strokeStyle = g; ctx.lineWidth = 5; ctx.shadowColor = C.gold; ctx.shadowBlur = 16;
+    ctx.beginPath(); for (let x = xs; x <= xh; x += 6) x === xs ? ctx.moveTo(x, pathY(x)) : ctx.lineTo(x, pathY(x)); ctx.stroke();
+    ctx.shadowBlur = 0;
+    for (let x = xs + 60; x < xh - 20; x += 110){ al(.6); ctx.fillStyle = C.ice; ctx.beginPath(); ctx.arc(x, pathY(x), 6, 0, 6.283); ctx.fill(); }
+    al(1); ctx.fillStyle = C.gold; ctx.shadowColor = C.gold; ctx.shadowBlur = 36;
+    ctx.beginPath(); ctx.arc(xh, pathY(xh), 16, 0, 6.283); ctx.fill();
+  }
+  ctx.restore();
+  rise('意义不是一个答案', W/2, 640, t, 67.0, {size:80, weight:900});
+  rise('是你每天走出来的路', W/2, 745, t, 67.8, {size:58, weight:800, color:C.blue, glow:20});
+  rise('关注我，一起认真生活', W/2, 900, t, 69.0, {size:36, weight:500, color:C.muted});
+}
+
+/* ============ 总调度 ============ */
+const SCENES = [[s1,-1,6],[s2,6,22],[s3,22,39],[s4,39,53],[s5,53,66],[s6,66,72]];
+function draw(t){
+  t = clamp(t, 0, DUR);
+  ctx.save(); ctx.globalAlpha = 1; ctx.clearRect(0,0,W,H); background(t);
+  for (const [fn,a,b] of SCENES){
+    if (t < a || t > b) continue;
+    SA = sceneA(t, a, b, b === DUR ? .8 : .5);
+    if (SA > 0){ ctx.save(); fn(t); ctx.restore(); }
+  }
+  SA = 1; vignette();
+  const fo = p(t, 71.2, 72);
+  if (fo > 0){ ctx.globalAlpha = fo; ctx.fillStyle = '#000'; ctx.fillRect(0,0,W,H); }
+  ctx.restore();
+}
+
+/* ============ 播放器 / 逐帧渲染接口 ============ */
+const isRender = new URLSearchParams(location.search).has('render');
+window.DURATION = DUR;
+window.renderFrame = t => draw(t);
+const btn = document.getElementById('btn'), seek = document.getElementById('seek'), timeEl = document.getElementById('time');
+const fmt = s => `${Math.floor(s/60)}:${String(Math.floor(s%60)).padStart(2,'0')}`;
+function fit(){
+  if (isRender){ cv.style.width = W+'px'; cv.style.height = H+'px'; return; }
+  const w = Math.min(innerWidth - 32, (innerHeight - 84)*16/9);
+  cv.style.width = w + 'px'; cv.style.height = w*9/16 + 'px';
+}
+addEventListener('resize', fit); fit();
+
+let cur = 0, playing = !isRender, last = null;
+function toggle(){ if (cur >= DUR) cur = 0; playing = !playing; }
+btn.onclick = toggle; cv.onclick = toggle;
+addEventListener('keydown', e => { if (e.code === 'Space'){ e.preventDefault(); toggle(); } });
+seek.oninput = () => { cur = +seek.value; draw(cur); };
+function loop(ts){
+  if (playing && last != null){ cur += (ts - last)/1000; if (cur >= DUR){ cur = DUR; playing = false; } }
+  last = ts; draw(cur);
+  seek.value = cur; timeEl.textContent = `${fmt(cur)} / ${fmt(DUR)}`;
+  btn.textContent = playing ? '❚❚' : (cur >= DUR ? '↺' : '▶');
+  requestAnimationFrame(loop);
+}
+document.fonts.ready.then(() => {
+  window.ready = true;
+  if (isRender) draw(0); else requestAnimationFrame(loop);
+});
+</script>
+</body>
+</html>
