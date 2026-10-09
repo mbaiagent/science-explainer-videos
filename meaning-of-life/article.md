@@ -74,19 +74,21 @@ color: #9cc3ff
 这里有一个很重要的前提：**只有当苦难无法避免时，才谈得上在苦难中寻找意义。** 如果痛苦是可以消除的，比如一份伤害你的工作、一段可以离开的关系，那么正确的做法是去改变它，而不是硬扛。弗兰克尔本人也明确说过，不必要的受苦并不高尚。
 
 <figure>
-<svg viewBox="0 0 720 260" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="意义的三个来源示意图">
-  <rect width="720" height="260" fill="#0f0e1c"/>
-  <g font-family="PingFang SC, Noto Sans SC, sans-serif" text-anchor="middle">
-    <circle cx="140" cy="120" r="78" fill="rgba(156,195,255,.10)" stroke="#9cc3ff" stroke-width="2"/>
-    <text x="140" y="112" fill="#f4ede4" font-size="26" font-weight="800">去创造</text>
-    <text x="140" y="146" fill="#9a93a8" font-size="15">工作 · 创作 · 贡献</text>
-    <circle cx="360" cy="120" r="78" fill="rgba(255,211,138,.10)" stroke="#ffd38a" stroke-width="2"/>
-    <text x="360" y="112" fill="#f4ede4" font-size="26" font-weight="800">去爱</text>
-    <text x="360" y="146" fill="#9a93a8" font-size="15">体验美 · 爱一个人</text>
-    <circle cx="580" cy="120" r="78" fill="rgba(255,138,138,.10)" stroke="#ff8a8a" stroke-width="2"/>
-    <text x="580" y="112" fill="#f4ede4" font-size="26" font-weight="800">去面对</text>
-    <text x="580" y="146" fill="#9a93a8" font-size="15">无法改变时的态度</text>
-    <text x="360" y="236" fill="#9cc3ff" font-size="17" font-weight="700">对应：你给世界什么 · 你从世界接受什么 · 你如何面对命运</text>
+<svg viewBox="0 0 440 330" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="意义的三个来源示意图">
+  <rect width="440" height="330" fill="#0f0e1c"/>
+  <g font-family="PingFang SC, Noto Sans SC, sans-serif">
+    <circle cx="70" cy="62" r="44" fill="rgba(156,195,255,.12)" stroke="#9cc3ff" stroke-width="2"/>
+    <text x="70" y="70" fill="#f4ede4" font-size="21" font-weight="900" text-anchor="middle">创造</text>
+    <text x="134" y="54" fill="#9cc3ff" font-size="19" font-weight="800">你给世界什么</text>
+    <text x="134" y="82" fill="#9a93a8" font-size="16">工作、创作、做出贡献</text>
+    <circle cx="70" cy="165" r="44" fill="rgba(255,211,138,.12)" stroke="#ffd38a" stroke-width="2"/>
+    <text x="70" y="173" fill="#f4ede4" font-size="21" font-weight="900" text-anchor="middle">爱</text>
+    <text x="134" y="157" fill="#ffd38a" font-size="19" font-weight="800">你从世界接受什么</text>
+    <text x="134" y="185" fill="#9a93a8" font-size="16">体验美好、爱一个人</text>
+    <circle cx="70" cy="268" r="44" fill="rgba(255,138,138,.12)" stroke="#ff8a8a" stroke-width="2"/>
+    <text x="70" y="276" fill="#f4ede4" font-size="21" font-weight="900" text-anchor="middle">面对</text>
+    <text x="134" y="260" fill="#ff8a8a" font-size="19" font-weight="800">你如何面对命运</text>
+    <text x="134" y="288" fill="#9a93a8" font-size="16">无法改变时，选择态度</text>
   </g>
 </svg>
 <figcaption>弗兰克尔的意义三来源，可以理解为三种和世界相处的方式</figcaption>

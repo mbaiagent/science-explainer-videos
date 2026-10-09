@@ -1,0 +1,376 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>线程池是什么：从银行柜台到 ThreadPoolExecutor 源码 · 图文详解</title>
+<meta name="description" content="为什么需要线程池、任务进来后的四步流转、7 个参数、4 种拒绝策略、线程数怎么定，以及生产环境里最常见的坑">
+<link rel="stylesheet" href="../assets/article.css">
+<style>:root{--acc:#a3e36b}</style>
+</head>
+<body>
+<div class="wrap">
+  <nav class="top"><a href="../index.html">← 全部视频</a><a class="watch" href="landscape.html">▶ 看视频</a></nav>
+  <header class="hero">
+    <div class="tag">计算机 · AI · 图文详解</div>
+    <h1>线程池是什么：从银行柜台到 ThreadPoolExecutor 源码</h1>
+    <p>为什么需要线程池、任务进来后的四步流转、7 个参数、4 种拒绝策略、线程数怎么定，以及生产环境里最常见的坑</p>
+    <div class="meta">约 12 分钟读完 · 配套视频 1:20</div>
+  </header>
+  <nav class="toc">
+<ul>
+<li><a href="#_1">为什么需要线程池</a></li>
+<li><a href="#_2">一个比喻：银行柜台</a></li>
+<li><a href="#_3">一个任务进来，会经历什么</a></li>
+<li><a href="#7">7 个参数逐个讲透</a></li>
+<li><a href="#4">4 种拒绝策略</a></li>
+<li><a href="#_5">生产环境的三个忠告</a></li>
+<li><a href="#_6">其他实用知识</a></li>
+<li><a href="#_11">总结</a></li>
+</ul>
+</nav>
+
+  <article>
+<figure><img src="img/f-6.jpg" alt="来一个请求就新建一个线程？服务器很快扛不住" loading="lazy"><figcaption>来一个请求就新建一个线程？服务器很快扛不住</figcaption></figure>
+<h2 id="_1">为什么需要线程池</h2>
+<p>假设你写了一个 Web 服务，每来一个请求就 <code>new Thread()</code> 处理。流量小的时候没问题，流量一大，麻烦就来了：</p>
+<ol>
+<li><strong>创建和销毁线程有成本</strong>。Java 的平台线程对应一个操作系统线程，创建时要向系统申请资源、分配线程栈（64 位 Linux 上默认每个线程栈约 1MB），用完还要回收。</li>
+<li><strong>线程太多会拖垮机器</strong>。几千个线程同时存在，光是栈就要占用大量内存；CPU 在它们之间来回切换（上下文切换），真正干活的时间反而变少了。</li>
+<li><strong>没有上限就没有保护</strong>。流量突增时，线程数无限增长，最终可能导致内存溢出，整个服务宕机。</li>
+</ol>
+<p><strong>线程池</strong>的思路很简单：提前创建好一批线程，任务来了就交给空闲的线程执行，执行完线程不销毁，接着等下一个任务。同时给线程数和排队数都设上限，超出能力范围的任务，按事先定好的策略处理。</p>
+<h2 id="_2">一个比喻：银行柜台</h2>
+<figure><img src="img/f-17.jpg" alt="线程池就像银行柜台" loading="lazy"><figcaption>线程池就像银行柜台</figcaption></figure>
+<table>
+<thead>
+<tr>
+<th>银行</th>
+<th>线程池</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>顾客</td>
+<td>任务（Runnable / Callable）</td>
+</tr>
+<tr>
+<td>常驻柜员，一直在岗</td>
+<td><strong>核心线程</strong>（corePoolSize）</td>
+</tr>
+<tr>
+<td>等候区的椅子</td>
+<td><strong>任务队列</strong>（workQueue）</td>
+</tr>
+<tr>
+<td>忙不过来时加开的临时窗口</td>
+<td><strong>非核心线程</strong>（maximumPoolSize − corePoolSize）</td>
+</tr>
+<tr>
+<td>临时柜员闲下来一段时间就下班</td>
+<td><strong>空闲存活时间</strong>（keepAliveTime）</td>
+</tr>
+<tr>
+<td>门口保安：满了就劝退</td>
+<td><strong>拒绝策略</strong>（RejectedExecutionHandler）</td>
+</tr>
+</tbody>
+</table>
+<h2 id="_3">一个任务进来，会经历什么</h2>
+<figure><img src="img/f-38.jpg" alt="任务流转的四个步骤" loading="lazy"><figcaption>任务流转的四个步骤</figcaption></figure>
+<p>调用 <code>execute(task)</code> 提交任务后，线程池按顺序做这几个判断：</p>
+<ol>
+<li><strong>当前线程数 &lt; 核心线程数？</strong> 新建一个核心线程来执行这个任务（即使其他核心线程正闲着）。</li>
+<li><strong>核心线程满了？</strong> 尝试把任务放进队列排队。</li>
+<li><strong>队列也满了？</strong> 如果线程数还没到最大线程数，新建一个非核心线程来执行它。</li>
+<li><strong>线程数也到上限了？</strong> 执行拒绝策略。</li>
+</ol>
+<p>视频里的例子：核心线程 2 个、最大线程 4 个、队列容量 4。连续提交 9 个任务：</p>
+<table>
+<thead>
+<tr>
+<th>任务</th>
+<th>去向</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>#1、#2</td>
+<td>新建 2 个核心线程执行</td>
+</tr>
+<tr>
+<td>#3 ~ #6</td>
+<td>核心线程都忙，进入队列排队</td>
+</tr>
+<tr>
+<td>#7、#8</td>
+<td>队列满了，新建 2 个非核心线程执行</td>
+</tr>
+<tr>
+<td>#9</td>
+<td>线程数已达 4，队列也满，被拒绝</td>
+</tr>
+</tbody>
+</table>
+<blockquote>
+<p><strong>最容易误解的一点</strong>：很多人以为核心线程满了就会加线程。实际上是<strong>先排队，队列满了才加线程</strong>。如果用的是一个很大的队列，非核心线程几乎永远不会被创建，<code>maximumPoolSize</code> 形同虚设。</p>
+</blockquote>
+<h3 id="_4">看一眼源码</h3>
+<p>JDK 中 <code>ThreadPoolExecutor.execute</code> 的核心逻辑（略有简化）：</p>
+<pre><code class="language-java">public void execute(Runnable command) {
+    int c = ctl.get();
+    // 1. 线程数小于核心线程数：创建核心线程
+    if (workerCountOf(c) &lt; corePoolSize) {
+        if (addWorker(command, true)) return;
+        c = ctl.get();
+    }
+    // 2. 线程池在运行，且成功放入队列
+    if (isRunning(c) &amp;&amp; workQueue.offer(command)) {
+        int recheck = ctl.get();
+        if (!isRunning(recheck) &amp;&amp; remove(command))
+            reject(command);                 // 放进去之后线程池被关了：拒绝
+        else if (workerCountOf(recheck) == 0)
+            addWorker(null, false);          // 一个线程都没有了：补一个
+    }
+    // 3. 入队失败：尝试创建非核心线程；4. 也失败：拒绝
+    else if (!addWorker(command, false))
+        reject(command);
+}
+</code></pre>
+<p><code>ctl</code> 是一个 <code>AtomicInteger</code>，高 3 位存线程池的运行状态，低 29 位存线程数量，用一个变量同时记录两件事，方便原子地更新。</p>
+<p>每个线程（源码中叫 <code>Worker</code>）执行完手头的任务后，会不断从队列里取下一个任务；队列空了就阻塞等待。非核心线程等待超过 <code>keepAliveTime</code> 还没拿到任务，就会退出。</p>
+<h2 id="7">7 个参数逐个讲透</h2>
+<figure><img src="img/f-51.jpg" alt="ThreadPoolExecutor 的 7 个参数" loading="lazy"><figcaption>ThreadPoolExecutor 的 7 个参数</figcaption></figure>
+<pre><code class="language-java">new ThreadPoolExecutor(
+    corePoolSize,      // 核心线程数
+    maximumPoolSize,   // 最大线程数
+    keepAliveTime,     // 非核心线程的空闲存活时间
+    unit,              // 时间单位
+    workQueue,         // 任务队列
+    threadFactory,     // 线程工厂
+    handler            // 拒绝策略
+);
+</code></pre>
+<h3 id="1-corepoolsize">1. corePoolSize：核心线程数</h3>
+<p>线程池长期保持的线程数。默认情况下，核心线程即使空闲也不会被回收；调用 <code>allowCoreThreadTimeOut(true)</code> 后，核心线程空闲超时也会退出。核心线程默认不会预先创建，如果想在启动时就创建好，可以调用 <code>prestartAllCoreThreads()</code>。</p>
+<h3 id="2-maximumpoolsize">2. maximumPoolSize：最大线程数</h3>
+<p>线程总数的上限，包括核心线程和非核心线程。只有当队列满了以后，才会创建核心线程之外的线程。</p>
+<h3 id="34-keepalivetime-unit">3、4. keepAliveTime + unit：空闲存活时间</h3>
+<p>超过核心线程数的那部分线程，空闲多久后被回收。</p>
+<h3 id="5-workqueue">5. workQueue：任务队列</h3>
+<table>
+<thead>
+<tr>
+<th>队列</th>
+<th>特点</th>
+<th>适用场景</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>ArrayBlockingQueue</code></td>
+<td>基于数组，<strong>有界</strong>，必须指定容量</td>
+<td>大多数业务场景，推荐</td>
+</tr>
+<tr>
+<td><code>LinkedBlockingQueue</code></td>
+<td>基于链表，不指定容量时上限为 <code>Integer.MAX_VALUE</code>，相当于<strong>无界</strong></td>
+<td>指定容量后也可用</td>
+</tr>
+<tr>
+<td><code>SynchronousQueue</code></td>
+<td><strong>不存储任务</strong>，每次放入都要等一个线程来取</td>
+<td>希望任务直接交给线程、不排队</td>
+</tr>
+<tr>
+<td><code>PriorityBlockingQueue</code></td>
+<td>按优先级排序，无界</td>
+<td>需要优先级调度</td>
+</tr>
+</tbody>
+</table>
+<h3 id="6-threadfactory">6. threadFactory：线程工厂</h3>
+<p>用来创建线程。最重要的用途是<strong>给线程起一个有意义的名字</strong>，比如 <code>order-pool-3</code>。线上排查问题时，<code>jstack</code> 打印出的线程名能让你一眼看出是哪个业务的线程池出了问题。</p>
+<h3 id="7-handler">7. handler：拒绝策略</h3>
+<p>线程和队列都满了以后，新任务怎么处理，下一节详细讲。</p>
+<h2 id="4">4 种拒绝策略</h2>
+<figure><img src="img/f-61.jpg" alt="全满了怎么办？4 种拒绝策略" loading="lazy"><figcaption>全满了怎么办？4 种拒绝策略</figcaption></figure>
+<table>
+<thead>
+<tr>
+<th>策略</th>
+<th>行为</th>
+<th>适用场景</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>AbortPolicy</code>（默认）</td>
+<td>抛出 <code>RejectedExecutionException</code></td>
+<td>调用方需要明确知道任务被拒绝</td>
+</tr>
+<tr>
+<td><code>CallerRunsPolicy</code></td>
+<td>由提交任务的线程自己执行这个任务</td>
+<td>不希望丢任务；同时让提交方变慢，形成自然的「背压」</td>
+</tr>
+<tr>
+<td><code>DiscardPolicy</code></td>
+<td>直接丢弃，不报错</td>
+<td>任务可以丢失，比如非关键的统计上报</td>
+</tr>
+<tr>
+<td><code>DiscardOldestPolicy</code></td>
+<td>丢弃队列里最老的任务，再尝试提交当前任务</td>
+<td>只关心最新数据的场景</td>
+</tr>
+</tbody>
+</table>
+<p>也可以实现 <code>RejectedExecutionHandler</code> 接口自定义，比如记录日志、发告警，或者把任务持久化到消息队列，稍后重试：</p>
+<pre><code class="language-java">RejectedExecutionHandler handler = (task, executor) -&gt; {
+    log.warn(&quot;线程池已满，任务被拒绝: active={}, queue={}&quot;,
+             executor.getActiveCount(), executor.getQueue().size());
+    retryQueue.offer(task);   // 存起来稍后重试
+};
+</code></pre>
+<blockquote>
+<p>重要的业务任务千万别用 <code>DiscardPolicy</code>，任务被悄悄丢掉，排查起来非常痛苦。</p>
+</blockquote>
+<h2 id="_5">生产环境的三个忠告</h2>
+<figure><img src="img/f-71.jpg" alt="生产环境的三个忠告" loading="lazy"><figcaption>生产环境的三个忠告</figcaption></figure>
+<h3 id="1-executors">1. 别用 Executors 的快捷方法</h3>
+<p><code>Executors</code> 提供了几个创建线程池的快捷方法，用起来方便，却隐藏着风险：</p>
+<table>
+<thead>
+<tr>
+<th>方法</th>
+<th>内部实现</th>
+<th>风险</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>newFixedThreadPool(n)</code></td>
+<td>核心 = 最大 = n，<code>LinkedBlockingQueue</code> 无界队列</td>
+<td>任务堆积时队列无限增长，可能 OOM</td>
+</tr>
+<tr>
+<td><code>newSingleThreadExecutor()</code></td>
+<td>单线程 + 无界队列</td>
+<td>同上</td>
+</tr>
+<tr>
+<td><code>newCachedThreadPool()</code></td>
+<td>核心 0，最大 <code>Integer.MAX_VALUE</code>，<code>SynchronousQueue</code></td>
+<td>流量突增时线程数暴涨</td>
+</tr>
+<tr>
+<td><code>newScheduledThreadPool(n)</code></td>
+<td>延迟队列无界</td>
+<td>任务堆积时可能 OOM</td>
+</tr>
+</tbody>
+</table>
+<p>阿里巴巴《Java 开发手册》明确规定：线程池不允许使用 <code>Executors</code> 创建，而是通过 <code>ThreadPoolExecutor</code> 手动创建，让写代码的人对参数心里有数。</p>
+<h3 id="2">2. 线程数靠估算 + 压测来定</h3>
+<p>一个常用的估算起点：</p>
+<ul>
+<li><strong>CPU 密集型</strong>（计算、加解密、压缩）：线程数 ≈ CPU 核数 + 1。线程再多也只是增加切换开销。</li>
+<li><strong>IO 密集型</strong>（调接口、查数据库、读文件）：线程大部分时间在等待，可以多开。《Java 并发编程实战》给出的公式是：</li>
+</ul>
+<pre><code class="language-text">线程数 = CPU 核数 × 目标 CPU 利用率 × (1 + 等待时间 / 计算时间)
+</code></pre>
+<p>比如 8 核机器，任务等待 IO 的时间是计算时间的 4 倍，希望 CPU 跑满，那么大约是 8 × 1 × (1 + 4) = 40 个线程。</p>
+<p>但这只是起点，真实的最佳值一定要通过<strong>压测</strong>得出，并在上线后持续观察。</p>
+<h3 id="3">3. 不同业务用不同的线程池</h3>
+<p>如果所有业务共用一个线程池，一个慢接口就能把线程全部占满，拖垮其他所有业务。按业务隔离线程池，可以把故障限制在局部。</p>
+<h2 id="_6">其他实用知识</h2>
+<h3 id="execute-submit">execute 和 submit 的区别</h3>
+<ul>
+<li><code>execute(Runnable)</code>：没有返回值；任务抛出的异常会导致执行它的线程终止，并由线程的未捕获异常处理器打印出来。</li>
+<li><code>submit(...)</code>：返回 <code>Future</code>；任务抛出的异常会被<strong>包装在 Future 里</strong>，只有调用 <code>future.get()</code> 时才会抛出。如果你从不调用 <code>get()</code>，异常就被「吞」了，日志里什么也看不到。</li>
+</ul>
+<h3 id="_7">优雅关闭</h3>
+<pre><code class="language-java">pool.shutdown();                                   // 不再接收新任务，已提交的继续执行
+if (!pool.awaitTermination(30, TimeUnit.SECONDS)) { // 最多等 30 秒
+    pool.shutdownNow();                            // 还没完成：中断正在执行的任务
+}
+</code></pre>
+<p><code>shutdown()</code> 是温和的关闭；<code>shutdownNow()</code> 会尝试中断所有正在执行的任务，并返回队列中还没开始的任务。</p>
+<h3 id="_8">监控线程池</h3>
+<p><code>ThreadPoolExecutor</code> 提供了不少可以直接读取的指标：</p>
+<table>
+<thead>
+<tr>
+<th>方法</th>
+<th>含义</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>getPoolSize()</code></td>
+<td>当前线程数</td>
+</tr>
+<tr>
+<td><code>getActiveCount()</code></td>
+<td>正在执行任务的线程数（近似值）</td>
+</tr>
+<tr>
+<td><code>getQueue().size()</code></td>
+<td>队列中等待的任务数</td>
+</tr>
+<tr>
+<td><code>getCompletedTaskCount()</code></td>
+<td>已完成的任务数</td>
+</tr>
+<tr>
+<td><code>getLargestPoolSize()</code></td>
+<td>历史最大线程数</td>
+</tr>
+</tbody>
+</table>
+<p>把这些指标定时上报到监控系统，队列持续增长、活跃线程长期打满时及时告警。<code>setCorePoolSize()</code> 和 <code>setMaximumPoolSize()</code> 还支持运行时动态调整，很多公司的「动态线程池」就是基于这一点做的。</p>
+<h3 id="_9">一个完整的推荐写法</h3>
+<pre><code class="language-java">ThreadFactory factory = new ThreadFactory() {
+    private final AtomicInteger n = new AtomicInteger(1);
+    public Thread newThread(Runnable r) {
+        return new Thread(r, &quot;order-pool-&quot; + n.getAndIncrement());
+    }
+};
+
+ThreadPoolExecutor pool = new ThreadPoolExecutor(
+    8, 16,
+    60, TimeUnit.SECONDS,
+    new ArrayBlockingQueue&lt;&gt;(1000),
+    factory,
+    new ThreadPoolExecutor.CallerRunsPolicy()
+);
+</code></pre>
+<h3 id="_10">新变化：虚拟线程</h3>
+<p>JDK 21 正式引入了<strong>虚拟线程</strong>（Virtual Threads）。它由 JVM 调度，创建成本极低，可以轻松创建上百万个。对于大量 IO 等待的场景，可以直接「每个任务一个虚拟线程」：</p>
+<pre><code class="language-java">try (ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor()) {
+    executor.submit(() -&gt; callRemoteService());
+}
+</code></pre>
+<p>虚拟线程不需要池化，但这不代表线程池过时了：CPU 密集型任务、需要限制并发数的场景（比如保护下游数据库），依然需要线程池或信号量等手段来控制。</p>
+<h2 id="_11">总结</h2>
+<figure><img src="img/f-77.jpg" alt="复用线程、排队缓冲、兜底拒绝" loading="lazy"><figcaption>复用线程、排队缓冲、兜底拒绝</figcaption></figure>
+<ul>
+<li>线程池的价值：<strong>复用线程</strong>省掉创建开销，<strong>排队缓冲</strong>扛住突发流量，<strong>兜底拒绝</strong>保护系统不被压垮。</li>
+<li>任务流转顺序：<strong>核心线程 → 队列 → 非核心线程 → 拒绝策略</strong>，注意是先排队再加线程。</li>
+<li>生产环境：手动创建 <code>ThreadPoolExecutor</code>，用<strong>有界队列</strong>，给线程<strong>起名字</strong>，<strong>按业务隔离</strong>，并<strong>监控</strong>关键指标。</li>
+</ul>
+<div class="refs">
+<h3 id="_12">参考资料</h3>
+<ul>
+<li>Oracle. Java SE API 文档：<code>java.util.concurrent.ThreadPoolExecutor</code>.</li>
+<li>Goetz, B., et al. (2006). <em>Java Concurrency in Practice</em>.（中译本：《Java 并发编程实战》）</li>
+<li>阿里巴巴.《Java 开发手册》并发处理章节.</li>
+<li>JEP 444: Virtual Threads (JDK 21).</li>
+</ul>
+</div>
+  </article>
+  <div class="foot"><a href="../index.html">← 返回首页</a><a href="landscape.html">▶ 看配套视频</a></div>
+</div>
+</body>
+</html>
