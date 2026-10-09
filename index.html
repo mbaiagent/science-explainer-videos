@@ -47,7 +47,8 @@
 </main>
 <script>
 const CATS = [
-  {id:'cs', name:'计算机 · AI', desc:'技术概念'},
+  {id:'ai', name:'AI 与大模型', desc:'大模型原理与应用'},
+  {id:'cs', name:'计算机与后端', desc:'计算机基础与后端技术'},
   {id:'psy', name:'心理学 · 人生', desc:'心理与成长'}
 ];
 // 新增视频只需在这里加一行
@@ -57,11 +58,12 @@ const VIDEOS = [
   {cat:'cs',  title:'JVM 是什么',            desc:'字节码、内存区域、垃圾回收、JIT',      path:'jvm/landscape.html',             dur:72, color:'#b39dff'},
   {cat:'psy', title:'幸福的科学',            desc:'享乐适应、哈佛成人发展研究、心流',      path:'happiness/landscape.html',       dur:72, color:'#ffb36b'},
   {cat:'psy', title:'人生的意义',            desc:'弗兰克尔、意义的三个来源、快乐≠意义',  path:'meaning-of-life/landscape.html', dur:72, color:'#9cc3ff'},
-  {cat:'cs', title:"RAG 是什么", desc:"开卷考试、向量检索、拼提示词再生成", path:'rag/landscape.html', dur:72, color:'#7cc7ff'},
+  {cat:'ai', title:"RAG 是什么", desc:"开卷考试、向量检索、拼提示词再生成", path:'rag/landscape.html', dur:72, color:'#7cc7ff'},
   {cat:'cs', title:"线程池是什么", desc:"银行柜台比喻、任务流转、7 个参数、拒绝策略", path:'thread-pool/landscape.html', dur:80, color:'#a3e36b'},
   {cat:'psy', title:"积极心理学", desc:"从修补问题到培养优势、PERMA、品格优势、3 个练习", path:'positive-psychology/landscape.html', dur:72, color:'#ff8fb1'},
-  {cat:'cs', title:"Opus 5.5 是怎么做出视频的", desc:"不生成像素，而是写代码；draw(t)、逐帧截图、自我检查", path:'opus-video/landscape.html', dur:76, color:'#ffcc66'},
-  {cat:'cs', title:"MySQL 的 MVCC", desc:"隐藏列、undo 版本链、ReadView、RC 与 RR", path:'mysql-mvcc/landscape.html', dur:80, color:'#4dd0e1'}
+  {cat:'ai', title:"Opus 5.5 是怎么做出视频的", desc:"不生成像素，而是写代码；draw(t)、逐帧截图、自我检查", path:'opus-video/landscape.html', dur:76, color:'#ffcc66'},
+  {cat:'cs', title:"MySQL 的 MVCC", desc:"隐藏列、undo 版本链、ReadView、RC 与 RR", path:'mysql-mvcc/landscape.html', dur:80, color:'#4dd0e1'},
+  {cat:'cs', title:"按下回车后发生了什么", desc:"DNS、TCP 与 TLS 握手、HTTP 请求响应、浏览器渲染", path:'http-request/landscape.html', dur:80, color:'#e879f9'}
 ];
 const fmt = s => `${Math.floor(s/60)}:${String(s%60).padStart(2,'0')}`;
 const esc = s => s.replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));

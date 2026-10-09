@@ -17,6 +17,7 @@
 | 积极心理学 | `positive-psychology/landscape.html` | 横屏 1920×1080 | 72s |
 | Opus 5.5 是怎么做出视频的 | `opus-video/landscape.html` | 横屏 1920×1080 | 76s |
 | MySQL 的 MVCC | `mysql-mvcc/landscape.html` | 横屏 1920×1080 | 80s |
+| 按下回车后发生了什么 | `http-request/landscape.html` | 横屏 1920×1080 | 80s |
 
 ### 幸福的科学
 钩子 → 享乐适应（快乐曲线 + 跑步机）→ 哈佛成人发展研究（关系网络）→ 心流（挑战 × 技能坐标图）→ 今晚就能做的 3 件事 → 收尾
@@ -48,11 +49,14 @@
 ### MySQL 的 MVCC
 加锁导致读写互等 → 一行多版本 → 隐藏列与 undo 版本链 → ReadView 可见性规则与沿链查找 → RC 与 RR 的区别 → 快照读与当前读、长事务 → 收尾
 
+### 按下回车后发生了什么
+按下回车 → DNS 逐级查询 → TCP 三次握手与 TLS 握手 → HTTP 请求与响应、服务器内部 → 浏览器渲染流程 → 耗时分布与优化 → 收尾
+
 ## 预览
 
 在线播放：https://mbwjs.github.io/science-explainer-videos/（需仓库开启 GitHub Pages）
 
-首页按「计算机 · AI」「心理学 · 人生」分类，只列横屏版；竖屏版文件仍保留在 `happiness/vertical.html`。新增视频时在 `index.html` 的 `VIDEOS` 数组里加一行即可。
+首页按「AI 与大模型」「计算机与后端」「心理学 · 人生」分类，只列横屏版；竖屏版文件仍保留在 `happiness/vertical.html`。新增视频时在 `index.html` 的 `VIDEOS` 数组里加一行即可。
 
 也可以用浏览器直接打开任意 HTML 文件。点击画面或按空格键暂停，底部进度条可以拖动。
 

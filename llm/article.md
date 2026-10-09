@@ -1,6 +1,6 @@
 title: 什么是 LLM：一台读遍人类文字、特别会「接话」的机器
 subtitle: 从「猜下一个词」讲起，把 token、训练、注意力机制、幻觉这些概念一次讲清楚
-tag: 计算机 · AI
+tag: AI 与大模型
 color: #6ee7c8
 
 ![ChatGPT、Claude、DeepSeek 背后，都是 LLM](img/f-6.jpg)

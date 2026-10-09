@@ -1,0 +1,353 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>HTTP 请求的一生</title>
+<style>
+  :root{--bg:#07080f;--fg:#f4ede4;--muted:#9a93a8;--acc:#e879f9}
+  html,body{margin:0;height:100%;background:var(--bg);color:var(--fg);
+    font-family:-apple-system,"PingFang SC","Noto Sans SC","Noto Sans CJK SC","Microsoft YaHei",sans-serif}
+  body{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;overflow:hidden}
+  #stage{display:block;background:#07080f;border-radius:12px;box-shadow:0 20px 60px rgba(0,0,0,.55);cursor:pointer}
+  #bar{display:flex;align-items:center;gap:12px;width:min(calc(100vw - 32px),640px)}
+  #btn{width:40px;height:40px;border-radius:50%;border:1px solid rgba(232,121,249,.5);background:transparent;
+    color:var(--acc);font-size:16px;cursor:pointer;flex:none}
+  #seek{flex:1;accent-color:var(--acc)}
+  #time{font-variant-numeric:tabular-nums;font-size:13px;color:var(--muted);min-width:84px;text-align:right}
+  body.render{display:block}
+  body.render #bar{display:none}
+  body.render #stage{border-radius:0;box-shadow:none}
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="bar">
+  <button id="btn" aria-label="播放/暂停">❚❚</button>
+  <input id="seek" type="range" min="0" max="80" step="0.01" value="0">
+  <span id="time">0:00 / 1:20</span>
+</div>
+<script>
+/* ============ 基础设置（横屏 1920×1080） ============ */
+const W = 1920, H = 1080, DUR = 80;
+const cv = document.getElementById('stage'), ctx = cv.getContext('2d');
+cv.width = W; cv.height = H;
+const FONT = '"PingFang SC","Noto Sans SC","Noto Sans CJK SC","Source Han Sans SC","Microsoft YaHei",sans-serif';
+const MONO = '"JetBrains Mono","SF Mono",Menlo,Consolas,"DejaVu Sans Mono","Noto Sans Mono CJK SC","PingFang SC","Microsoft YaHei",monospace';
+const C = {acc:'#e879f9', mint:'#6ee7c8', gold:'#ffd38a', coral:'#ff9e7a', rose:'#ff8a8a', blue:'#9cc3ff', text:'#f4ede4', muted:'#9a93a8', dim:'#4a4558', panel:'#0f0e1f'};
+
+const clamp = (x,a=0,b=1) => Math.max(a, Math.min(b, x));
+const lerp = (a,b,t) => a + (b-a)*t;
+const p = (t,a,b) => clamp((t-a)/(b-a));
+const eo = x => 1 - Math.pow(1-x, 3);
+const eio = x => x < .5 ? 4*x*x*x : 1 - Math.pow(-2*x+2, 3)/2;
+const eback = x => { const c1=1.70158, c3=c1+1; return 1 + c3*Math.pow(x-1,3) + c1*Math.pow(x-1,2); };
+function rnd(seed){ let s = seed>>>0; return () => { s = (s*1664525 + 1013904223)>>>0; return s/4294967296; }; }
+
+let SA = 1;
+const al = a => { ctx.globalAlpha = clamp(SA*a); };
+const sceneA = (t,a,b,f=.5) => Math.min(p(t,a,a+f), 1 - p(t,b-f,b));
+
+function txt(s, x, y, o = {}){
+  const {size=64, weight=700, color=C.text, alpha=1, align='center', glow=0, scale=1, font=FONT} = o;
+  if (alpha <= 0) return;
+  ctx.save(); al(alpha);
+  ctx.font = `${weight} ${size}px ${font}`;
+  ctx.textAlign = align; ctx.textBaseline = 'middle'; ctx.fillStyle = color;
+  if (glow){ ctx.shadowColor = color; ctx.shadowBlur = glow; }
+  if (scale !== 1){ ctx.translate(x, y); ctx.scale(scale, scale); ctx.fillText(s, 0, 0); }
+  else ctx.fillText(s, x, y);
+  ctx.restore();
+}
+function rise(s, x, y, t, t0, o = {}, d = .7){
+  const e = eo(p(t, t0, t0+d));
+  if (e <= 0) return;
+  txt(s, x, y + (1-e)*36, {...o, alpha:(o.alpha ?? 1)*e});
+}
+function rr(x,y,w,h,r){ ctx.beginPath(); ctx.roundRect(x,y,w,h,r); }
+function box(x, y, w, h, a, o = {}){
+  const {fill='rgba(255,255,255,.05)', stroke='rgba(232,121,249,.35)', lw=2, glow=0, r=18, dash=null} = o;
+  if (a <= 0) return;
+  ctx.save(); al(a); rr(x, y, w, h, r); ctx.fillStyle = fill; ctx.fill();
+  if (dash) ctx.setLineDash(dash);
+  ctx.strokeStyle = stroke; ctx.lineWidth = lw; if (glow){ ctx.shadowColor = stroke; ctx.shadowBlur = glow; } ctx.stroke(); ctx.restore();
+}
+function arrow(x1, y1, x2, y2, e, a, color = C.acc, lw = 3){
+  if (e <= 0 || a <= 0) return;
+  const x = lerp(x1, x2, e), y = lerp(y1, y2, e), ang = Math.atan2(y2 - y1, x2 - x1);
+  ctx.save(); al(a); ctx.strokeStyle = color; ctx.fillStyle = color; ctx.lineWidth = lw; ctx.lineCap = 'round';
+  ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x, y); ctx.stroke();
+  if (e > .85){ ctx.translate(x, y); ctx.rotate(ang); ctx.beginPath(); ctx.moveTo(4, 0); ctx.lineTo(-14, -9); ctx.lineTo(-14, 9); ctx.closePath(); ctx.fill(); }
+  ctx.restore();
+}
+function panel(x, y, w, h, title, a){
+  box(x, y, w, h, a, {fill:C.panel, stroke:'rgba(255,255,255,.1)', r:20});
+  if (a <= 0) return;
+  ctx.save(); al(a); ctx.strokeStyle = 'rgba(255,255,255,.07)'; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(x, y + 52); ctx.lineTo(x + w, y + 52); ctx.stroke();
+  ['#ff6b6b','#ffd166','#6ee7a0'].forEach((c, i) => { ctx.fillStyle = c; ctx.globalAlpha = clamp(SA*a*.8); ctx.beginPath(); ctx.arc(x + 30 + i*24, y + 26, 7, 0, 6.283); ctx.fill(); });
+  ctx.restore();
+  txt(title, x + w/2, y + 27, {size:22, weight:500, color:C.muted, font:MONO, alpha:a});
+}
+
+/* ============ 背景 ============ */
+const PARTS = (() => { const r = rnd(113); return Array.from({length:100}, () => ({
+  x:r()*W, y:r()*H, s:r()*2.2+.5, v:r()*12+4, ph:r()*6.283, c:r()<.25})); })();
+function background(t){
+  const g = ctx.createLinearGradient(0,0,W,H);
+  g.addColorStop(0,'#0a0916'); g.addColorStop(.55,'#110f24'); g.addColorStop(1,'#18122c');
+  ctx.globalAlpha = 1; ctx.fillStyle = g; ctx.fillRect(0,0,W,H);
+  const gx = W*.5 + Math.sin(t*.27)*140;
+  const rg = ctx.createRadialGradient(gx, H*.45, 0, gx, H*.45, 950);
+  rg.addColorStop(0,'rgba(232,121,249,0.09)'); rg.addColorStop(1,'rgba(232,121,249,0)');
+  ctx.fillStyle = rg; ctx.fillRect(0,0,W,H);
+  ctx.fillStyle = C.acc;
+  for (let x = 40; x < W; x += 80) for (let y = 40; y < H; y += 80){ ctx.globalAlpha = .06; ctx.fillRect(x, y, 2, 2); }
+  for (const q of PARTS){
+    const y = ((q.y - t*q.v) % H + H) % H, x = q.x + Math.sin(t*.35 + q.ph)*12;
+    ctx.globalAlpha = .2 + .3*(.5 + .5*Math.sin(t*1.2 + q.ph));
+    ctx.fillStyle = q.c ? C.acc : '#d8d0ff';
+    ctx.beginPath(); ctx.arc(x, y, q.s, 0, 6.283); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+}
+function vignette(){
+  const v = ctx.createRadialGradient(W/2, H/2, W*.28, W/2, H/2, W*.62);
+  v.addColorStop(0,'rgba(0,0,0,0)'); v.addColorStop(1,'rgba(0,0,0,.55)');
+  ctx.globalAlpha = 1; ctx.fillStyle = v; ctx.fillRect(0,0,W,H);
+}
+function codeLine(s, x, y, size, a, kw = /\b(public|class|static|void|new|return)\b/){
+  const parts = s.split(/("[^"]*"|\b(?:public|class|static|void|new|return|getstatic|ldc|invokevirtual)\b)/g);
+  ctx.save(); al(a); ctx.font = `500 ${size}px ${MONO}`; ctx.textBaseline = 'middle'; ctx.textAlign = 'left';
+  let xx = x;
+  for (const seg of parts){ if (!seg) continue;
+    ctx.fillStyle = seg.startsWith('"') ? C.mint : /^(public|class|static|void|new|return|getstatic|ldc|invokevirtual)$/.test(seg) ? C.acc : C.text;
+    ctx.fillText(seg, xx, y); xx += ctx.measureText(seg).width; }
+  ctx.restore();
+}
+
+function pill(s, x, y, a, o = {}){
+  const {size=30, color=C.text, stroke='rgba(255,255,255,.2)', fill='rgba(255,255,255,.05)', font=FONT, weight=700} = o;
+  if (a <= 0) return;
+  ctx.save(); ctx.font = `${weight} ${size}px ${font}`; const w = ctx.measureText(s).width + 52; ctx.restore();
+  box(x - w/2, y - size*.9, w, size*1.8, a, {fill, stroke, r:size*.9});
+  txt(s, x, y, {size, weight, color, font, alpha:a});
+}
+function node(s, sub, x, y, w, h, a, o = {}){
+  box(x - w/2, y - h/2, w, h, a, o);
+  txt(s, x, sub ? y - 16 : y, {size:o.size || 30, weight:800, color:o.tc || C.text, alpha:a});
+  if (sub) txt(sub, x, y + 22, {size:22, weight:500, color:C.muted, alpha:a});
+}
+function dot(x, y, a, c = C.gold){ ctx.save(); al(a); ctx.fillStyle = c; ctx.shadowColor = c; ctx.shadowBlur = 24; ctx.beginPath(); ctx.arc(x, y, 11, 0, 6.283); ctx.fill(); ctx.restore(); }
+
+/* ============ 场景 1 · 钩子 (0–7s) ============ */
+function s1(t){
+  const a = eo(p(t, 0, .4));
+  box(360, 130, 1200, 520, a, {fill:'#0f0e1c', stroke:'rgba(255,255,255,.15)', r:20});
+  ['#ff6b6b','#ffd166','#6ee7a0'].forEach((c, i) => { ctx.save(); al(a*.8); ctx.fillStyle = c; ctx.beginPath(); ctx.arc(395 + i*26, 162, 7, 0, 6.283); ctx.fill(); ctx.restore(); });
+  box(420, 195, 1080, 56, a, {fill:'rgba(255,255,255,.06)', stroke:'rgba(255,255,255,.15)', r:28});
+  const url = 'https://example.com', n = Math.floor(p(t, .3, 1.6)*url.length + .001);
+  txt('🔒', 450, 223, {size:22, alpha:a, align:'left'});
+  txt(url.slice(0, n), 490, 224, {size:28, weight:600, font:MONO, align:'left', alpha:a});
+  if (t < 1.9 && Math.floor(t*3) % 2 === 0){ ctx.save(); al(a); ctx.fillStyle = C.acc; ctx.fillRect(496 + n*16.8, 206, 3, 36); ctx.restore(); }
+  pill('Enter ↵', 1400, 223, Math.min(eback(p(t, 1.8, 2.1)), 1 - p(t, 2.5, 2.8)), {size:22, color:C.acc, stroke:C.acc});
+  const pr = eio(p(t, 2.3, 3.2));
+  if (pr > 0 && pr < 1){ ctx.save(); al(1); ctx.fillStyle = C.acc; ctx.fillRect(360, 265, 1200*pr, 4); ctx.restore(); }
+  const pg = eo(p(t, 3.1, 3.6));
+  box(440, 300, 520, 46, pg, {fill:'rgba(232,121,249,.25)', stroke:'rgba(0,0,0,0)', r:8});
+  [0,1,2,3].forEach(i => box(440, 370 + i*42, [1020, 960, 1000, 640][i], 20, pg*.8, {fill:'rgba(255,255,255,.12)', stroke:'rgba(0,0,0,0)', r:6}));
+  box(440, 550, 300, 70, pg, {fill:'rgba(255,255,255,.08)', stroke:'rgba(0,0,0,0)', r:10});
+  rise('按下回车，不到一秒，页面就出来了', W/2, 740, t, 3.8, {size:48, weight:900});
+  rise('这中间，到底发生了什么？', W/2, 860, t, 4.8, {size:56, weight:900, color:C.acc, glow:22});
+}
+
+/* ============ 场景 2 · DNS (7–20s) ============ */
+const SRV = [['根域名服务器', '「去问 .com 的服务器」', 300], ['.com 顶级域服务器', '「去问 example.com 的权威服务器」', 480], ['example.com 权威服务器', '「IP 是 203.0.113.10」', 660]];
+function s2(t){
+  rise('第 1 步：DNS——把域名翻译成 IP 地址', W/2, 105, t, 7.2, {size:54, weight:900});
+  const L = 400;
+  pill('example.com 的 IP 是多少？', L, 210, eo(p(t, 7.8, 8.3)), {size:28, color:C.acc, stroke:C.acc});
+  [['浏览器缓存', 8.6], ['操作系统缓存 / hosts 文件', 9.2]].forEach(([s, ts], i) => {
+    const e = eo(p(t, ts, ts + .4)), y = 300 + i*90;
+    node(s, '', L, y, 460, 70, e, {size:28});
+    txt('没有', L + 260, y, {size:24, weight:800, color:C.rose, align:'left', alpha:eo(p(t, ts + .4, ts + .7))});
+  });
+  const la = eo(p(t, 10.0, 10.5));
+  node('本地 DNS 服务器', '运营商或公司提供，负责「跑腿」查询', L, 540, 460, 110, la, {fill:'rgba(232,121,249,.12)', stroke:C.acc, tc:C.acc});
+  SRV.forEach(([s, reply, y], i) => {
+    const e = eo(p(t, 10.4 + i*.2, 10.9 + i*.2));
+    node(s, '', 1350, y, 520, 90, e, {size:30});
+    arrow(640, 540, 1080, y, e, e*.35, C.muted, 2);
+    const ts = 11.2 + i*1.3;
+    const go = p(t, ts, ts + .5), back = p(t, ts + .6, ts + 1.1);
+    if (go > 0 && back < 1){ const k = back > 0 ? 1 - eio(back) : eio(go); dot(lerp(640, 1085, k), lerp(540, y, k), 1); }
+    txt(reply, 1350, y + 62, {size:22, weight:700, color:i === 2 ? C.gold : C.muted, alpha:eo(p(t, ts + .5, ts + .8))});
+  });
+  pill('example.com → 203.0.113.10', L, 680, eback(p(t, 15.2, 15.7)), {size:28, font:MONO, color:C.gold, stroke:C.gold});
+  rise('查到的结果会被缓存，在过期（TTL）之前，下次直接用', W/2, 880, t, 16.0, {size:40, weight:800});
+  rise('示例中的 IP 属于文档专用地址段', W/2, 950, t, 17.2, {size:26, weight:500, color:C.muted});
+}
+
+/* ============ 场景 3 · TCP + TLS (20–33s) ============ */
+const MSG = [['SYN', 1, 21.4, 250], ['SYN + ACK', -1, 22.4, 330], ['ACK', 1, 23.4, 410], ['ClientHello', 1, 25.2, 540], ['ServerHello + 证书', -1, 26.2, 620], ['Finished（密钥协商完成）', 1, 27.2, 700]];
+function s3(t){
+  rise('第 2 步：建立连接——TCP 握手 + TLS 加密', W/2, 105, t, 20.2, {size:54, weight:900});
+  const la = eo(p(t, 20.6, 21.1)), cx = 760, sx = 1400;
+  [[cx, '浏览器'], [sx, '服务器 :443']].forEach(([x, s]) => {
+    pill(s, x, 190, la, {size:28, color:C.acc, stroke:C.acc});
+    ctx.save(); al(la*.5); ctx.strokeStyle = 'rgba(255,255,255,.4)'; ctx.lineWidth = 2; ctx.setLineDash([6, 8]);
+    ctx.beginPath(); ctx.moveTo(x, 225); ctx.lineTo(x, 790); ctx.stroke(); ctx.restore();
+  });
+  MSG.forEach(([s, dir, ts, y], i) => {
+    const e = eo(p(t, ts, ts + .7)), x1 = dir > 0 ? cx : sx, x2 = dir > 0 ? sx : cx, tls = i >= 3;
+    arrow(x1, y, x2, y + 50, e, 1, tls ? C.gold : C.acc, 3);
+    txt(s, (cx + sx)/2, y - 6, {size:24, weight:800, font:i < 3 ? MONO : FONT, color:tls ? C.gold : C.text, alpha:eo(p(t, ts + .3, ts + .7))});
+  });
+  const ba = eo(p(t, 24.0, 24.5)), bb = eo(p(t, 28.0, 28.5));
+  box(120, 235, 520, 230, ba, {fill:'rgba(232,121,249,.07)', stroke:'rgba(232,121,249,.5)', dash:[8, 6]});
+  txt('TCP 三次握手', 380, 300, {size:34, weight:900, color:C.acc, alpha:ba});
+  txt('确认双方都能发、也都能收', 380, 360, {size:26, weight:600, alpha:ba});
+  txt('建立一条可靠的连接', 380, 405, {size:26, weight:600, color:C.muted, alpha:ba});
+  box(120, 520, 520, 250, bb, {fill:'rgba(255,211,138,.06)', stroke:'rgba(255,211,138,.5)', dash:[8, 6]});
+  txt('TLS 握手', 380, 585, {size:34, weight:900, color:C.gold, alpha:bb});
+  txt('验证证书：确认对方真是 example.com', 380, 645, {size:24, weight:600, alpha:bb});
+  txt('协商出只有双方知道的密钥', 380, 690, {size:24, weight:600, color:C.muted, alpha:bb});
+  txt('（TLS 1.3 示意）', 380, 735, {size:20, weight:500, color:C.muted, alpha:bb});
+  rise('握手完成后，接下来所有数据都加密传输', W/2, 880, t, 29.4, {size:42, weight:900});
+  rise('这就是网址前面 https 的那个 s', W/2, 950, t, 30.6, {size:30, weight:600, color:C.muted});
+}
+
+/* ============ 场景 4 · HTTP 请求与响应 (33–47s) ============ */
+const REQ = [['GET / HTTP/1.1', C.acc], ['Host: example.com', C.text], ['User-Agent: Mozilla/5.0 …', C.text], ['Accept: text/html', C.text], ['Accept-Encoding: gzip, br', C.text]];
+const RES = [['HTTP/1.1 200 OK', C.mint], ['Content-Type: text/html; charset=UTF-8', C.text], ['Content-Encoding: gzip', C.text], ['Cache-Control: max-age=600', C.text], ['', C.text], ['<!doctype html>', C.gold], ['<html> … </html>', C.gold]];
+function s4(t){
+  rise('第 3 步：发送 HTTP 请求，拿到响应', W/2, 105, t, 33.2, {size:54, weight:900});
+  panel(110, 180, 780, 380, '请求 Request', eo(p(t, 33.8, 34.3)));
+  REQ.forEach(([s, c], i) => txt(s, 140, 270 + i*52, {size:26, weight:600, font:MONO, color:c, align:'left', alpha:eo(p(t, 34.2 + i*.25, 34.6 + i*.25))}));
+  arrow(900, 370, 1010, 370, eo(p(t, 35.8, 36.3)), 1, C.acc, 4);
+  panel(1020, 180, 790, 460, '响应 Response', eo(p(t, 39.4, 39.9)));
+  RES.forEach(([s, c], i) => { if (s) txt(s, 1050, 270 + i*50, {size:26, weight:600, font:MONO, color:c, align:'left', alpha:eo(p(t, 39.8 + i*.25, 40.2 + i*.25))}); });
+  [['负载均衡', 36.6], ['Web 服务器', 37.1], ['应用程序', 37.6], ['数据库', 38.1]].forEach(([s, ts], i) => {
+    const x = 260 + i*330, e = eo(p(t, ts, ts + .4));
+    pill(s, x, 720, e, {size:28, stroke:'rgba(232,121,249,.5)'});
+    if (i > 0) arrow(x - 250, 720, x - 95, 720, e, e, C.acc, 3);
+  });
+  txt('服务器内部（示意）', 110, 650, {size:22, weight:600, color:C.muted, align:'left', alpha:eo(p(t, 36.6, 37))});
+  rise('状态码 200 代表成功，常见的还有 301 重定向、404 找不到、500 服务器出错', W/2, 860, t, 42.4, {size:36, weight:800});
+  rise('（为便于阅读，这里用 HTTP/1.1 的文本格式示意，实际可能是 HTTP/2 或 HTTP/3）', W/2, 930, t, 43.8, {size:26, weight:500, color:C.muted});
+}
+
+/* ============ 场景 5 · 渲染 (47–62s) ============ */
+function miniTree(cx, cy, a, color){
+  const pts = [[0, -60], [-70, 0], [70, 0], [-100, 60], [-40, 60], [70, 60]], E = [[0,1],[0,2],[1,3],[1,4],[2,5]];
+  ctx.save(); al(a); ctx.strokeStyle = color; ctx.lineWidth = 2;
+  E.forEach(([i, j]) => { ctx.beginPath(); ctx.moveTo(cx + pts[i][0], cy + pts[i][1]); ctx.lineTo(cx + pts[j][0], cy + pts[j][1]); ctx.stroke(); });
+  ctx.fillStyle = color; pts.forEach(([x, y]) => { ctx.beginPath(); ctx.arc(cx + x, cy + y, 10, 0, 6.283); ctx.fill(); }); ctx.restore();
+}
+function s5(t){
+  rise('第 4 步：浏览器把 HTML 变成画面', W/2, 105, t, 47.2, {size:54, weight:900});
+  const a1 = eo(p(t, 47.8, 48.3)), a2 = eo(p(t, 48.6, 49.1));
+  node('HTML', '', 220, 300, 200, 90, a1, {size:34, tc:C.acc}); arrow(330, 300, 410, 300, a1, a1, C.acc, 3);
+  miniTree(530, 300, a1, C.acc); txt('DOM 树', 530, 400, {size:26, weight:800, alpha:a1});
+  node('CSS', '', 220, 540, 200, 90, a2, {size:34, tc:C.gold}); arrow(330, 540, 410, 540, a2, a2, C.gold, 3);
+  miniTree(530, 540, a2, C.gold); txt('CSSOM', 530, 640, {size:26, weight:800, alpha:a2});
+  const st = [['渲染树', '只包含要显示的元素', 49.6], ['布局', '算出每个元素的位置和大小', 50.6], ['绘制', '把文字、颜色、边框画成像素', 51.6], ['合成', '把各个图层叠在一起显示', 52.6]];
+  arrow(660, 320, 760, 410, eo(p(t, 49.2, 49.7)), 1, C.acc, 3); arrow(660, 520, 760, 440, eo(p(t, 49.2, 49.7)), 1, C.gold, 3);
+  st.forEach(([s, d, ts], i) => {
+    const x = 880 + i*270, e = eback(p(t, ts, ts + .5));
+    if (e > 0){ ctx.save(); ctx.translate(x, 425); ctx.scale(e, e); ctx.translate(-x, -425);
+      box(x - 110, 380, 220, 90, clamp(e), {fill:'rgba(232,121,249,.10)', stroke:C.acc}); ctx.restore(); }
+    txt(s, x, 425, {size:34, weight:900, alpha:clamp(e)});
+    const w = d.length > 10 ? [d.slice(0, Math.ceil(d.length/2)), d.slice(Math.ceil(d.length/2))] : [d];
+    w.forEach((l, k) => txt(l, x, 515 + k*34, {size:22, weight:500, color:C.muted, alpha:eo(p(t, ts + .3, ts + .7))}));
+    if (i > 0) arrow(x - 155, 425, x - 115, 425, e, clamp(e), C.acc, 3);
+  });
+  rise('遇到 CSS、JS、图片，浏览器还会并行发出更多请求', W/2, 720, t, 54.4, {size:36, weight:800});
+  rise('改宽高会触发「重新布局」，代价最大；只改颜色，只需「重绘」', W/2, 860, t, 56.6, {size:38, weight:900, color:C.gold});
+  rise('这也是前端性能优化的关键之一', W/2, 930, t, 58.0, {size:28, weight:500, color:C.muted});
+}
+
+/* ============ 场景 6 · 时间花在哪 (62–74s) ============ */
+const SEG = [['DNS', 20, '#e879f9'], ['TCP', 30, '#c084fc'], ['TLS', 30, '#a78bfa'], ['等待服务器', 80, '#ffd38a'], ['下载', 40, '#6ee7c8'], ['渲染', 100, '#7cc7ff']];
+const TIPS = [['缓存', 'DNS、浏览器缓存，直接跳过整步'], ['CDN', '把内容放到离用户最近的节点'], ['HTTP/2、HTTP/3', '一条连接同时跑多个请求'], ['压缩与精简', 'gzip / Brotli，压缩图片、合并资源']];
+function s6(t){
+  rise('一次访问，时间都花在哪？（示意）', W/2, 110, t, 62.2, {size:54, weight:900});
+  const tot = SEG.reduce((s, [, v]) => s + v, 0); let x = 160;
+  SEG.forEach(([s, v, c], i) => {
+    const w = 1600*v/tot, e = eo(p(t, 62.8 + i*.25, 63.2 + i*.25));
+    if (e > 0){ ctx.save(); al(e); ctx.fillStyle = c; rr(x + 2, 220, (w - 4)*e, 70, 10); ctx.fill(); ctx.restore(); }
+    txt(s, x + w/2, 320, {size:24, weight:800, alpha:e}); txt(v + ' ms', x + w/2, 352, {size:20, weight:600, font:MONO, color:C.muted, alpha:e});
+    x += w;
+  });
+  TIPS.forEach(([h, d], i) => {
+    const st = 65.4 + i*.6, e = eback(p(t, st, st + .5)); if (e <= 0) return;
+    const bx = 210 + (i % 2)*780, by = 440 + Math.floor(i/2)*180, a = clamp(e);
+    ctx.save(); ctx.translate(bx + 360, by + 70); ctx.scale(e, e); ctx.translate(-(bx + 360), -(by + 70));
+    box(bx, by, 720, 140, a, {fill:'rgba(255,255,255,.05)', stroke:'rgba(232,121,249,.4)', r:22}); ctx.restore();
+    txt(h, bx + 40, by + 48, {size:34, weight:900, color:C.acc, align:'left', alpha:a});
+    txt(d, bx + 40, by + 98, {size:26, weight:600, color:C.muted, align:'left', alpha:a});
+  });
+  rise('优化的思路：能不走的步骤就不走，必须走的就走得近一点、快一点', W/2, 860, t, 68.6, {size:36, weight:800, color:C.gold});
+}
+
+/* ============ 场景 7 · 收尾 (74–80s) ============ */
+function s7(t){
+  ['DNS 查询', '建立连接', 'HTTP 请求', '渲染页面'].forEach((s, i) => {
+    const e = eback(p(t, 74.2 + i*.35, 74.7 + i*.35)), x = 420 + i*360;
+    if (e > 0){ ctx.save(); ctx.translate(x, 380); ctx.scale(e, e); ctx.translate(-x, -380);
+      box(x - 150, 320, 300, 120, clamp(e), {fill:'rgba(232,121,249,.10)', stroke:C.acc, r:24}); ctx.restore(); }
+    txt(s, x, 380, {size:38, weight:900, alpha:clamp(e)});
+    if (i > 0) arrow(x - 205, 380, x - 158, 380, e, clamp(e), C.acc, 4);
+  });
+  rise('这就是按下回车后的旅程', W/2, 580, t, 75.8, {size:80, weight:900, glow:24});
+  rise('关注我，一起搞懂计算机', W/2, 740, t, 76.8, {size:36, weight:500, color:C.muted});
+}
+
+/* ============ 总调度 ============ */
+const SCENES = [[s1,-1,7],[s2,7,20],[s3,20,33],[s4,33,47],[s5,47,62],[s6,62,74],[s7,74,80]];
+function draw(t){
+  t = clamp(t, 0, DUR);
+  ctx.save(); ctx.globalAlpha = 1; ctx.clearRect(0,0,W,H); background(t);
+  for (const [fn,a,b] of SCENES){
+    if (t < a || t > b) continue;
+    SA = sceneA(t, a, b, b === DUR ? .8 : .5);
+    if (SA > 0){ ctx.save(); fn(t); ctx.restore(); }
+  }
+  SA = 1; vignette();
+  const fo = p(t, DUR - .8, DUR);
+  if (fo > 0){ ctx.globalAlpha = fo; ctx.fillStyle = '#000'; ctx.fillRect(0,0,W,H); }
+  ctx.restore();
+}
+
+/* ============ 播放器 / 逐帧渲染接口 ============ */
+const isRender = new URLSearchParams(location.search).has('render');
+window.DURATION = DUR;
+window.renderFrame = t => draw(t);
+const btn = document.getElementById('btn'), seek = document.getElementById('seek'), timeEl = document.getElementById('time');
+const fmt = s => `${Math.floor(s/60)}:${String(Math.floor(s%60)).padStart(2,'0')}`;
+function fit(){
+  if (isRender){ cv.style.width = W+'px'; cv.style.height = H+'px'; return; }
+  const w = Math.min(innerWidth - 32, (innerHeight - 84)*16/9);
+  cv.style.width = w + 'px'; cv.style.height = w*9/16 + 'px';
+}
+addEventListener('resize', fit); fit();
+
+let cur = 0, playing = !isRender, last = null;
+function toggle(){ if (cur >= DUR) cur = 0; playing = !playing; }
+btn.onclick = toggle; cv.onclick = toggle;
+addEventListener('keydown', e => { if (e.code === 'Space'){ e.preventDefault(); toggle(); } });
+seek.oninput = () => { cur = +seek.value; draw(cur); };
+function loop(ts){
+  if (playing && last != null){ cur += (ts - last)/1000; if (cur >= DUR){ cur = DUR; playing = false; } }
+  last = ts; draw(cur);
+  seek.value = cur; timeEl.textContent = `${fmt(cur)} / ${fmt(DUR)}`;
+  btn.textContent = playing ? '❚❚' : (cur >= DUR ? '↺' : '▶');
+  requestAnimationFrame(loop);
+}
+document.fonts.ready.then(() => {
+  window.ready = true;
+  if (isRender) draw(0); else requestAnimationFrame(loop);
+});
+</script>
+</body>
+</html>

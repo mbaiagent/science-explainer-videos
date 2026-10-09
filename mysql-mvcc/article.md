@@ -1,6 +1,6 @@
 title: MySQL 的 MVCC：让读和写互不阻塞
 subtitle: 隐藏列、undo log 版本链、ReadView 可见性规则，RC 和 RR 的真正区别，以及快照读、当前读、幻读和长事务问题
-tag: 计算机 · AI
+tag: 计算机与后端
 color: #4dd0e1
 
 ![传统加锁：读和写互相等待](img/f-6.jpg)

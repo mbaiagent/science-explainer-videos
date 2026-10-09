@@ -1,6 +1,6 @@
 title: 从零做一个 Claude Code：编程 Agent 的核心原理与完整代码
 subtitle: 大模型 + 工具 + 循环。从原理讲到一份 70 行就能跑起来的 Python 实现，再讲怎样把它从「能用」做到「好用」
-tag: 计算机 · AI
+tag: AI 与大模型
 color: #ff9e7a
 
 ![一句「帮我修复登录页的 bug」，它自己读文件、搜索、改代码、跑测试](img/f-6.5.jpg)
