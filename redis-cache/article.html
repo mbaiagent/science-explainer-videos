@@ -1,0 +1,337 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Redis 缓存：为什么快，怎么用，有哪些坑 · 图文详解</title>
+<meta name="description" content="单线程与 IO 多路复用、五种数据类型、旁路缓存模式与一致性、过期与淘汰、穿透击穿雪崩，以及持久化和高可用">
+<link rel="stylesheet" href="../assets/article.css">
+<style>:root{--acc:#ef5350}</style>
+</head>
+<body>
+<div class="wrap">
+  <nav class="top"><a href="../index.html">← 全部视频</a><a class="watch" href="landscape.html">▶ 看视频</a></nav>
+  <header class="hero">
+    <div class="tag">计算机与后端 · 图文详解</div>
+    <h1>Redis 缓存：为什么快，怎么用，有哪些坑</h1>
+    <p>单线程与 IO 多路复用、五种数据类型、旁路缓存模式与一致性、过期与淘汰、穿透击穿雪崩，以及持久化和高可用</p>
+    <div class="meta">约 10 分钟读完 · 配套视频 1:20</div>
+  </header>
+  <nav class="toc">
+<ul>
+<li><a href="#_1">为什么需要缓存</a></li>
+<li><a href="#redis">Redis 为什么这么快</a></li>
+<li><a href="#_2">五种常用数据类型</a></li>
+<li><a href="#cache-aside">最常用的模式：旁路缓存（Cache-Aside）</a></li>
+<li><a href="#_7">过期与淘汰</a></li>
+<li><a href="#_10">缓存的三大经典问题</a></li>
+<li><a href="#_14">其他需要注意的问题</a></li>
+<li><a href="#_15">持久化与高可用</a></li>
+<li><a href="#_18">高频面试题速答</a></li>
+<li><a href="#_19">总结</a></li>
+</ul>
+</nav>
+
+  <article>
+<figure><img src="img/f-6.jpg" alt="每个请求都去查数据库，流量一大就扛不住" loading="lazy"><figcaption>每个请求都去查数据库，流量一大就扛不住</figcaption></figure>
+<h2 id="_1">为什么需要缓存</h2>
+<p>数据库的数据存放在磁盘上，一次查询往往需要毫秒级的时间。当流量变大时，数据库的 CPU、连接数和磁盘 IO 都会成为瓶颈。</p>
+<p>但大多数业务有一个特点：<strong>少量数据被反复读取</strong>（热点数据）。比如首页商品、热门文章、用户的基本信息。把这些数据放到<strong>内存</strong>里，读请求先查内存，查不到再去数据库，就能大幅减轻数据库的压力，同时让响应快得多。</p>
+<p><strong>Redis</strong> 就是最常用的内存缓存。衡量缓存效果最重要的指标是<strong>命中率</strong>：请求中能直接在缓存里找到数据的比例。</p>
+<h2 id="redis">Redis 为什么这么快</h2>
+<figure><img src="img/f-15.jpg" alt="Redis 快的四个原因" loading="lazy"><figcaption>Redis 快的四个原因</figcaption></figure>
+<h3 id="1">1. 数据在内存里</h3>
+<p>内存的访问延迟大约在百纳秒级别，而固态硬盘的随机读取大约在百微秒级别，相差上千倍。这是 Redis 快的根本原因。</p>
+<h3 id="2">2. 单线程执行命令</h3>
+<p>Redis 用<strong>一个主线程</strong>按顺序执行所有命令。这听起来像是缺点，实际上却是优点：</p>
+<ul>
+<li>不需要加锁，没有锁竞争；</li>
+<li>没有多线程之间的上下文切换开销；</li>
+<li>每条命令天然是原子执行的。</li>
+</ul>
+<p>因为瓶颈主要在内存和网络，而不在 CPU，单线程已经足够快。</p>
+<h3 id="3-io">3. IO 多路复用</h3>
+<p>一个线程怎么同时服务成千上万个客户端连接？靠的是操作系统提供的 <strong>IO 多路复用</strong>（Linux 上是 epoll）：线程不去逐个等待每个连接，而是让内核告诉它「哪些连接有数据可读写了」，然后只处理这些连接。</p>
+<p>Redis 6.0 起引入了多线程来处理<strong>网络数据的读写</strong>，但<strong>命令的执行仍然是单线程</strong>，所以原子性等特性不受影响。</p>
+<h3 id="4">4. 精心设计的数据结构</h3>
+<p>每种数据类型在底层都会根据数据量自动选择更合适的编码。比如数据少时用紧凑的连续内存结构（listpack 等），节省空间；数据多时换成哈希表、跳表等，保证操作效率。</p>
+<h2 id="_2">五种常用数据类型</h2>
+<figure><img src="img/f-28.jpg" alt="五种常用数据类型" loading="lazy"><figcaption>五种常用数据类型</figcaption></figure>
+<table>
+<thead>
+<tr>
+<th>类型</th>
+<th>适合的场景</th>
+<th>常用命令</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>String</strong></td>
+<td>缓存对象（JSON）、计数器、分布式锁</td>
+<td><code>SET</code> <code>GET</code> <code>INCR</code> <code>SETNX</code></td>
+</tr>
+<tr>
+<td><strong>Hash</strong></td>
+<td>存储对象的各个字段，可单独修改某个字段</td>
+<td><code>HSET</code> <code>HGET</code> <code>HGETALL</code></td>
+</tr>
+<tr>
+<td><strong>List</strong></td>
+<td>最新动态列表、简单队列</td>
+<td><code>LPUSH</code> <code>RPOP</code> <code>LRANGE</code></td>
+</tr>
+<tr>
+<td><strong>Set</strong></td>
+<td>去重、标签、共同好友（交集）</td>
+<td><code>SADD</code> <code>SISMEMBER</code> <code>SINTER</code></td>
+</tr>
+<tr>
+<td><strong>Sorted Set</strong></td>
+<td>排行榜、按分数或时间排序的列表</td>
+<td><code>ZADD</code> <code>ZINCRBY</code> <code>ZREVRANGE</code></td>
+</tr>
+</tbody>
+</table>
+<p>几个典型用法：</p>
+<pre><code class="language-bash"># 计数器：文章阅读量 +1，原子操作，不会并发出错
+INCR article:1001:views
+
+# 排行榜：给张三加 10 分，再取前 10 名
+ZINCRBY rank 10 &quot;张三&quot;
+ZREVRANGE rank 0 9 WITHSCORES
+
+# 分布式锁：键不存在时才设置，30 秒后自动过期
+SET lock:order:1001 &lt;随机唯一值&gt; NX PX 30000
+</code></pre>
+<p>分布式锁的值要用随机的唯一值，释放锁时先确认值是自己的再删除（通常用 Lua 脚本保证原子性），避免误删别人的锁。</p>
+<p>此外还有 Bitmap（签到、在线状态）、HyperLogLog（海量去重计数）、GEO（附近的人）、Stream（消息流）等类型，适合更特定的场景。</p>
+<h2 id="cache-aside">最常用的模式：旁路缓存（Cache-Aside）</h2>
+<figure><img src="img/f-44.5.jpg" alt="旁路缓存的读写流程" loading="lazy"><figcaption>旁路缓存的读写流程</figcaption></figure>
+<h3 id="_3">读</h3>
+<ol>
+<li>先查缓存，命中就直接返回；</li>
+<li>没命中，查数据库；</li>
+<li>把查到的结果写入缓存，并<strong>设置过期时间</strong>，再返回。</li>
+</ol>
+<h3 id="_4">写</h3>
+<ol>
+<li>先<strong>更新数据库</strong>；</li>
+<li>再<strong>删除缓存</strong>。</li>
+</ol>
+<p>用伪代码表示：</p>
+<pre><code class="language-python">def get_user(user_id):
+    key = f&quot;user:{user_id}&quot;
+    data = redis.get(key)
+    if data is not None:
+        return json.loads(data)                       # 命中
+    user = db.query(&quot;SELECT * FROM user WHERE id = %s&quot;, user_id)
+    redis.set(key, json.dumps(user), ex=600 + random.randint(0, 120))  # 写回，过期时间加随机值
+    return user
+
+def update_user(user_id, fields):
+    db.execute(&quot;UPDATE user SET ... WHERE id = %s&quot;, user_id)
+    redis.delete(f&quot;user:{user_id}&quot;)                   # 删除缓存，下次读时再加载
+</code></pre>
+<h3 id="_5">为什么是「删除」缓存，而不是「更新」缓存</h3>
+<ul>
+<li><strong>避免并发写入导致脏数据</strong>：两个请求同时更新同一条数据，更新数据库和更新缓存的顺序可能交错，最终缓存里留下的是旧值；</li>
+<li><strong>避免无用功</strong>：有些数据写得多、读得少，每次都更新缓存是浪费，删除后等真正需要时再加载更划算；</li>
+<li><strong>缓存的值可能需要复杂计算</strong>：比如需要关联多张表，每次写入都重新计算代价很高。</li>
+</ul>
+<h3 id="_6">为什么先更新数据库，再删除缓存</h3>
+<p>如果反过来先删缓存，在你更新数据库之前，另一个读请求可能发现缓存为空，去数据库读到<strong>旧值</strong>并写回缓存，于是缓存中长期留着旧数据。</p>
+<p>先更新数据库再删缓存，出现不一致的窗口要小得多，但仍然存在极端情况。常见的补充手段：</p>
+<ul>
+<li><strong>一定要设置过期时间</strong>，作为最后的兜底；</li>
+<li><strong>延迟双删</strong>：更新数据库、删除缓存后，隔一小段时间再删一次；</li>
+<li><strong>订阅数据库的变更日志</strong>（如通过 Canal 监听 MySQL binlog），由专门的程序负责删除缓存，并在失败时重试。</li>
+</ul>
+<blockquote>
+<p>缓存和数据库之间只能做到<strong>最终一致</strong>。如果业务要求强一致（比如账户余额），就不要依赖缓存的数据做决定。</p>
+</blockquote>
+<h2 id="_7">过期与淘汰</h2>
+<h3 id="_8">过期键怎么删</h3>
+<p>Redis 结合两种策略：</p>
+<ul>
+<li><strong>惰性删除</strong>：访问一个键时，发现它已过期，就删除；</li>
+<li><strong>定期删除</strong>：后台定时随机抽查一批设置了过期时间的键，删除其中已过期的。</li>
+</ul>
+<h3 id="_9">内存满了怎么办</h3>
+<p>通过 <code>maxmemory</code> 设置内存上限，<code>maxmemory-policy</code> 决定内存满了以后怎么办：</p>
+<table>
+<thead>
+<tr>
+<th>策略</th>
+<th>行为</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>noeviction</code>（默认）</td>
+<td>不淘汰，写入时直接报错</td>
+</tr>
+<tr>
+<td><code>allkeys-lru</code></td>
+<td>在所有键中淘汰最近最少使用的</td>
+</tr>
+<tr>
+<td><code>allkeys-lfu</code></td>
+<td>在所有键中淘汰使用频率最低的</td>
+</tr>
+<tr>
+<td><code>volatile-lru</code> / <code>volatile-lfu</code></td>
+<td>只在设置了过期时间的键中淘汰</td>
+</tr>
+<tr>
+<td><code>volatile-ttl</code></td>
+<td>优先淘汰快要过期的键</td>
+</tr>
+<tr>
+<td><code>allkeys-random</code> / <code>volatile-random</code></td>
+<td>随机淘汰</td>
+</tr>
+</tbody>
+</table>
+<p>纯缓存场景，通常选择 <code>allkeys-lru</code> 或 <code>allkeys-lfu</code>。</p>
+<h2 id="_10">缓存的三大经典问题</h2>
+<figure><img src="img/f-62.jpg" alt="穿透、击穿、雪崩" loading="lazy"><figcaption>穿透、击穿、雪崩</figcaption></figure>
+<h3 id="_11">缓存穿透：查不存在的数据</h3>
+<p><strong>现象</strong>：请求的数据在数据库里根本不存在，缓存自然也没有，于是每次请求都会打到数据库。如果有人恶意用大量不存在的 ID 来请求，数据库就会被压垮。</p>
+<p><strong>解决</strong>：</p>
+<ul>
+<li><strong>缓存空值</strong>：数据库查不到时，也在缓存里存一个「空」标记，设置较短的过期时间；</li>
+<li><strong>布隆过滤器</strong>：把所有存在的 ID 放进布隆过滤器，请求先经过它判断，「一定不存在」的直接拦截；</li>
+<li><strong>参数校验</strong>：明显不合法的 ID（如负数）在入口就拒绝。</li>
+</ul>
+<h3 id="key">缓存击穿：热点 key 突然过期</h3>
+<p><strong>现象</strong>：某个访问量极高的 key 恰好过期，瞬间大量请求同时发现缓存为空，一起涌向数据库。</p>
+<p><strong>解决</strong>：</p>
+<ul>
+<li><strong>互斥锁重建</strong>：只允许一个请求去查数据库并重建缓存，其他请求等待或短暂重试；</li>
+<li><strong>逻辑过期 / 热点不过期</strong>：不给热点 key 设置真实的过期时间，而是在值里记录一个逻辑过期时间，发现过期后由后台线程异步刷新，期间先返回旧值。</li>
+</ul>
+<p>互斥锁的核心逻辑：</p>
+<pre><code class="language-python">def get_hot(key):
+    data = redis.get(key)
+    if data is not None:
+        return data
+    if redis.set(f&quot;lock:{key}&quot;, &quot;1&quot;, nx=True, ex=10):   # 抢到锁的请求负责重建
+        try:
+            data = load_from_db(key)
+            redis.set(key, data, ex=600)
+        finally:
+            redis.delete(f&quot;lock:{key}&quot;)
+        return data
+    time.sleep(0.05)                                    # 没抢到锁：稍等再查缓存
+    return get_hot(key)
+</code></pre>
+<h3 id="_12">缓存雪崩：大面积失效</h3>
+<p><strong>现象</strong>：大量 key 在同一时间过期（比如都在系统启动时写入、过期时间相同），或者 Redis 本身宕机，请求全部落到数据库上。</p>
+<p><strong>解决</strong>：</p>
+<ul>
+<li><strong>过期时间加随机值</strong>，让 key 的过期时间分散开；</li>
+<li><strong>Redis 高可用</strong>：主从 + 哨兵或集群部署，避免单点故障；</li>
+<li><strong>限流、降级、熔断</strong>：保护数据库，必要时返回默认数据或提示稍后重试；</li>
+<li><strong>多级缓存</strong>：在应用本地再加一层缓存（如 Caffeine）。</li>
+</ul>
+<h3 id="_13">一句话区分</h3>
+<table>
+<thead>
+<tr>
+<th>问题</th>
+<th>关键词</th>
+<th>核心解法</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>穿透</td>
+<td>数据<strong>不存在</strong></td>
+<td>缓存空值、布隆过滤器</td>
+</tr>
+<tr>
+<td>击穿</td>
+<td><strong>一个</strong>热点 key 过期</td>
+<td>互斥锁、逻辑过期</td>
+</tr>
+<tr>
+<td>雪崩</td>
+<td><strong>大量</strong> key 同时失效或 Redis 宕机</td>
+<td>随机过期时间、高可用、限流降级</td>
+</tr>
+</tbody>
+</table>
+<h2 id="_14">其他需要注意的问题</h2>
+<ul>
+<li><strong>大 key</strong>：单个 key 的值特别大（如几 MB 的字符串，或几十万个元素的集合），读写和删除都可能阻塞主线程。应该拆分，删除时使用 <code>UNLINK</code> 异步删除。</li>
+<li><strong>热 key</strong>：单个 key 的访问量过高，集群中某个节点压力过大。可以使用本地缓存，或者把一个 key 复制成多份分散访问。</li>
+<li><strong>慎用 <code>KEYS *</code></strong>：它会遍历所有键，阻塞主线程，生产环境应该用 <code>SCAN</code> 渐进式遍历。</li>
+</ul>
+<h2 id="_15">持久化与高可用</h2>
+<figure><img src="img/f-72.jpg" alt="持久化与高可用" loading="lazy"><figcaption>持久化与高可用</figcaption></figure>
+<h3 id="_16">持久化</h3>
+<table>
+<thead>
+<tr>
+<th>方式</th>
+<th>原理</th>
+<th>优点</th>
+<th>缺点</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>RDB</strong></td>
+<td>定期把内存数据生成一个快照文件</td>
+<td>文件紧凑，恢复快</td>
+<td>两次快照之间的数据可能丢失</td>
+</tr>
+<tr>
+<td><strong>AOF</strong></td>
+<td>把每条写命令追加到日志文件</td>
+<td>数据更安全</td>
+<td>文件更大，恢复较慢</td>
+</tr>
+</tbody>
+</table>
+<p>AOF 的刷盘策略由 <code>appendfsync</code> 控制：<code>always</code>（每条命令都刷盘，最安全最慢）、<code>everysec</code>（每秒一次，默认，最多丢约 1 秒数据）、<code>no</code>（交给操作系统）。Redis 4.0 起还支持 <strong>RDB + AOF 混合持久化</strong>，兼顾恢复速度和数据安全。</p>
+<h3 id="_17">高可用</h3>
+<ul>
+<li><strong>主从复制</strong>：从节点复制主节点的数据，分担读请求，并作为备份；</li>
+<li><strong>哨兵（Sentinel）</strong>：监控主节点，主节点故障时自动把一个从节点提升为新的主节点；</li>
+<li><strong>集群（Cluster）</strong>：把数据按 key 分到 <strong>16384 个哈希槽</strong>中，分散到多个主节点上，实现水平扩展，每个主节点还可以有自己的从节点。</li>
+</ul>
+<blockquote>
+<p>无论怎样配置，缓存都只是<strong>加速层</strong>。数据库里永远要有一份权威数据，缓存丢了可以重建。</p>
+</blockquote>
+<h2 id="_18">高频面试题速答</h2>
+<p><strong>Q：Redis 是单线程的，为什么还这么快？</strong>
+数据在内存中；单线程避免了锁和上下文切换；使用 IO 多路复用处理大量连接；底层数据结构高效。</p>
+<p><strong>Q：如何保证缓存和数据库的一致性？</strong>
+常用旁路缓存：先更新数据库，再删除缓存，并设置过期时间兜底；要求更高时，可以延迟双删或基于 binlog 异步删除缓存。只能做到最终一致。</p>
+<p><strong>Q：缓存穿透、击穿、雪崩的区别？</strong>
+穿透是查不存在的数据；击穿是单个热点 key 过期；雪崩是大量 key 同时失效或缓存服务宕机。</p>
+<p><strong>Q：RDB 和 AOF 怎么选？</strong>
+能接受分钟级数据丢失、追求恢复速度，用 RDB；更看重数据安全，用 AOF（everysec）；实际中常两者结合。</p>
+<h2 id="_19">总结</h2>
+<figure><img src="img/f-77.jpg" alt="快、用对、防坑" loading="lazy"><figcaption>快、用对、防坑</figcaption></figure>
+<ul>
+<li><strong>快</strong>：内存 + 单线程 + IO 多路复用 + 高效数据结构；</li>
+<li><strong>用对</strong>：选对数据类型；旁路缓存「先更新数据库，再删除缓存」，并设置过期时间；</li>
+<li><strong>防坑</strong>：穿透、击穿、雪崩各有对策；注意大 key 和热 key；</li>
+<li><strong>稳</strong>：持久化保证重启后数据还在，主从、哨兵、集群保证高可用。</li>
+</ul>
+<div class="refs">
+<h3 id="_20">参考资料</h3>
+<ul>
+<li>Redis 官方文档：Data types；Key eviction；Persistence；Replication；High availability with Redis Sentinel；Scale with Redis Cluster；Distributed Locks with Redis.</li>
+<li>Facebook (2013). Scaling Memcache at Facebook. <em>NSDI</em>.（关于缓存失效与一致性的经典实践）</li>
+<li>黄健宏.《Redis 设计与实现》.</li>
+</ul>
+</div>
+  </article>
+  <div class="foot"><a href="../index.html">← 返回首页</a><a href="landscape.html">▶ 看配套视频</a></div>
+</div>
+</body>
+</html>

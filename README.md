@@ -21,6 +21,7 @@
 | TCP 三次握手 | `tcp-handshake/landscape.html` | 横屏 1920×1080 | 80s |
 | 数据库索引：为什么是 B+ 树 | `bplus-tree/landscape.html` | 横屏 1920×1080 | 80s |
 | 事务与 ACID | `transaction-acid/landscape.html` | 横屏 1920×1080 | 80s |
+| Redis 缓存 | `redis-cache/landscape.html` | 横屏 1920×1080 | 80s |
 
 ### 幸福的科学
 钩子 → 享乐适应（快乐曲线 + 跑步机）→ 哈佛成人发展研究（关系网络）→ 心流（挑战 × 技能坐标图）→ 今晚就能做的 3 件事 → 收尾
@@ -63,6 +64,9 @@
 
 ### 事务与 ACID
 转账崩溃 → ACID 总览 → 原子性与 undo log → 持久性与 redo log、WAL → 隔离级别 → 一致性 → 写代码时的 3 个提醒 → 收尾
+
+### Redis 缓存
+数据库扛不住 → Redis 为什么快 → 五种数据类型 → 旁路缓存的读写流程 → 穿透、击穿、雪崩 → 持久化与高可用 → 收尾
 
 ## 预览
 
