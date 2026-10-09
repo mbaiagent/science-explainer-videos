@@ -94,6 +94,9 @@ public class FixedWindowLimiter {
 **滑动日志**：记录每个被放行请求的时间戳，每次请求时删掉 1 秒以前的记录，再看剩下的数量。结果精确，但请求多时占用内存较大。
 
 ```java
+import java.util.ArrayDeque;
+import java.util.Deque;
+
 public class SlidingLogLimiter {
     private final int limit;
     private final long windowMillis;

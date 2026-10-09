@@ -120,7 +120,10 @@
 <p>在同样的请求序列下，第一波 5 个请求放行后，第二波 5 个请求到来时，「过去 1 秒」内已经有 5 个了，于是全部被拒绝，突刺问题解决了。</p>
 <h3 id="_6">两种实现方式</h3>
 <p><strong>滑动日志</strong>：记录每个被放行请求的时间戳，每次请求时删掉 1 秒以前的记录，再看剩下的数量。结果精确，但请求多时占用内存较大。</p>
-<pre><code class="language-java">public class SlidingLogLimiter {
+<pre><code class="language-java">import java.util.ArrayDeque;
+import java.util.Deque;
+
+public class SlidingLogLimiter {
     private final int limit;
     private final long windowMillis;
     private final Deque&lt;Long&gt; log = new ArrayDeque&lt;&gt;();
