@@ -1,0 +1,286 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>积极心理学</title>
+<style>
+  :root{--bg:#07080f;--fg:#f4ede4;--muted:#9a93a8;--acc:#ff8fb1}
+  html,body{margin:0;height:100%;background:var(--bg);color:var(--fg);
+    font-family:-apple-system,"PingFang SC","Noto Sans SC","Noto Sans CJK SC","Microsoft YaHei",sans-serif}
+  body{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;overflow:hidden}
+  #stage{display:block;background:#07080f;border-radius:12px;box-shadow:0 20px 60px rgba(0,0,0,.55);cursor:pointer}
+  #bar{display:flex;align-items:center;gap:12px;width:min(calc(100vw - 32px),640px)}
+  #btn{width:40px;height:40px;border-radius:50%;border:1px solid rgba(255,143,177,.5);background:transparent;
+    color:var(--acc);font-size:16px;cursor:pointer;flex:none}
+  #seek{flex:1;accent-color:var(--acc)}
+  #time{font-variant-numeric:tabular-nums;font-size:13px;color:var(--muted);min-width:84px;text-align:right}
+  body.render{display:block}
+  body.render #bar{display:none}
+  body.render #stage{border-radius:0;box-shadow:none}
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="bar">
+  <button id="btn" aria-label="播放/暂停">❚❚</button>
+  <input id="seek" type="range" min="0" max="72" step="0.01" value="0">
+  <span id="time">0:00 / 1:12</span>
+</div>
+<script>
+/* ============ 基础设置（横屏 1920×1080） ============ */
+const W = 1920, H = 1080, DUR = 72;
+const cv = document.getElementById('stage'), ctx = cv.getContext('2d');
+cv.width = W; cv.height = H;
+const FONT = '"PingFang SC","Noto Sans SC","Noto Sans CJK SC","Source Han Sans SC","Microsoft YaHei",sans-serif';
+const MONO = '"JetBrains Mono","SF Mono",Menlo,Consolas,"DejaVu Sans Mono","Noto Sans Mono CJK SC","PingFang SC","Microsoft YaHei",monospace';
+const C = {acc:'#ff8fb1', mint:'#6ee7c8', gold:'#ffd38a', coral:'#ff9e7a', rose:'#ff8a8a', blue:'#9cc3ff', text:'#f4ede4', muted:'#9a93a8', dim:'#4a4558', panel:'#0f0e1f'};
+
+const clamp = (x,a=0,b=1) => Math.max(a, Math.min(b, x));
+const lerp = (a,b,t) => a + (b-a)*t;
+const p = (t,a,b) => clamp((t-a)/(b-a));
+const eo = x => 1 - Math.pow(1-x, 3);
+const eio = x => x < .5 ? 4*x*x*x : 1 - Math.pow(-2*x+2, 3)/2;
+const eback = x => { const c1=1.70158, c3=c1+1; return 1 + c3*Math.pow(x-1,3) + c1*Math.pow(x-1,2); };
+function rnd(seed){ let s = seed>>>0; return () => { s = (s*1664525 + 1013904223)>>>0; return s/4294967296; }; }
+
+let SA = 1;
+const al = a => { ctx.globalAlpha = clamp(SA*a); };
+const sceneA = (t,a,b,f=.5) => Math.min(p(t,a,a+f), 1 - p(t,b-f,b));
+
+function txt(s, x, y, o = {}){
+  const {size=64, weight=700, color=C.text, alpha=1, align='center', glow=0, scale=1, font=FONT} = o;
+  if (alpha <= 0) return;
+  ctx.save(); al(alpha);
+  ctx.font = `${weight} ${size}px ${font}`;
+  ctx.textAlign = align; ctx.textBaseline = 'middle'; ctx.fillStyle = color;
+  if (glow){ ctx.shadowColor = color; ctx.shadowBlur = glow; }
+  if (scale !== 1){ ctx.translate(x, y); ctx.scale(scale, scale); ctx.fillText(s, 0, 0); }
+  else ctx.fillText(s, x, y);
+  ctx.restore();
+}
+function rise(s, x, y, t, t0, o = {}, d = .7){
+  const e = eo(p(t, t0, t0+d));
+  if (e <= 0) return;
+  txt(s, x, y + (1-e)*36, {...o, alpha:(o.alpha ?? 1)*e});
+}
+function rr(x,y,w,h,r){ ctx.beginPath(); ctx.roundRect(x,y,w,h,r); }
+function box(x, y, w, h, a, o = {}){
+  const {fill='rgba(255,255,255,.05)', stroke='rgba(255,143,177,.35)', lw=2, glow=0, r=18, dash=null} = o;
+  if (a <= 0) return;
+  ctx.save(); al(a); rr(x, y, w, h, r); ctx.fillStyle = fill; ctx.fill();
+  if (dash) ctx.setLineDash(dash);
+  ctx.strokeStyle = stroke; ctx.lineWidth = lw; if (glow){ ctx.shadowColor = stroke; ctx.shadowBlur = glow; } ctx.stroke(); ctx.restore();
+}
+function arrow(x1, y1, x2, y2, e, a, color = C.acc, lw = 3){
+  if (e <= 0 || a <= 0) return;
+  const x = lerp(x1, x2, e), y = lerp(y1, y2, e), ang = Math.atan2(y2 - y1, x2 - x1);
+  ctx.save(); al(a); ctx.strokeStyle = color; ctx.fillStyle = color; ctx.lineWidth = lw; ctx.lineCap = 'round';
+  ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x, y); ctx.stroke();
+  if (e > .85){ ctx.translate(x, y); ctx.rotate(ang); ctx.beginPath(); ctx.moveTo(4, 0); ctx.lineTo(-14, -9); ctx.lineTo(-14, 9); ctx.closePath(); ctx.fill(); }
+  ctx.restore();
+}
+function panel(x, y, w, h, title, a){
+  box(x, y, w, h, a, {fill:C.panel, stroke:'rgba(255,255,255,.1)', r:20});
+  if (a <= 0) return;
+  ctx.save(); al(a); ctx.strokeStyle = 'rgba(255,255,255,.07)'; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(x, y + 52); ctx.lineTo(x + w, y + 52); ctx.stroke();
+  ['#ff6b6b','#ffd166','#6ee7a0'].forEach((c, i) => { ctx.fillStyle = c; ctx.globalAlpha = clamp(SA*a*.8); ctx.beginPath(); ctx.arc(x + 30 + i*24, y + 26, 7, 0, 6.283); ctx.fill(); });
+  ctx.restore();
+  txt(title, x + w/2, y + 27, {size:22, weight:500, color:C.muted, font:MONO, alpha:a});
+}
+
+/* ============ 背景 ============ */
+const PARTS = (() => { const r = rnd(83); return Array.from({length:100}, () => ({
+  x:r()*W, y:r()*H, s:r()*2.2+.5, v:r()*12+4, ph:r()*6.283, c:r()<.25})); })();
+function background(t){
+  const g = ctx.createLinearGradient(0,0,W,H);
+  g.addColorStop(0,'#0a0916'); g.addColorStop(.55,'#110f24'); g.addColorStop(1,'#18122c');
+  ctx.globalAlpha = 1; ctx.fillStyle = g; ctx.fillRect(0,0,W,H);
+  const gx = W*.5 + Math.sin(t*.27)*140;
+  const rg = ctx.createRadialGradient(gx, H*.45, 0, gx, H*.45, 950);
+  rg.addColorStop(0,'rgba(255,143,177,0.09)'); rg.addColorStop(1,'rgba(255,143,177,0)');
+  ctx.fillStyle = rg; ctx.fillRect(0,0,W,H);
+  ctx.fillStyle = C.acc;
+  for (let x = 40; x < W; x += 80) for (let y = 40; y < H; y += 80){ ctx.globalAlpha = .06; ctx.fillRect(x, y, 2, 2); }
+  for (const q of PARTS){
+    const y = ((q.y - t*q.v) % H + H) % H, x = q.x + Math.sin(t*.35 + q.ph)*12;
+    ctx.globalAlpha = .2 + .3*(.5 + .5*Math.sin(t*1.2 + q.ph));
+    ctx.fillStyle = q.c ? C.acc : '#d8d0ff';
+    ctx.beginPath(); ctx.arc(x, y, q.s, 0, 6.283); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+}
+function vignette(){
+  const v = ctx.createRadialGradient(W/2, H/2, W*.28, W/2, H/2, W*.62);
+  v.addColorStop(0,'rgba(0,0,0,0)'); v.addColorStop(1,'rgba(0,0,0,.55)');
+  ctx.globalAlpha = 1; ctx.fillStyle = v; ctx.fillRect(0,0,W,H);
+}
+function codeLine(s, x, y, size, a, kw = /\b(public|class|static|void|new|return)\b/){
+  const parts = s.split(/("[^"]*"|\b(?:public|class|static|void|new|return|getstatic|ldc|invokevirtual)\b)/g);
+  ctx.save(); al(a); ctx.font = `500 ${size}px ${MONO}`; ctx.textBaseline = 'middle'; ctx.textAlign = 'left';
+  let xx = x;
+  for (const seg of parts){ if (!seg) continue;
+    ctx.fillStyle = seg.startsWith('"') ? C.mint : /^(public|class|static|void|new|return|getstatic|ldc|invokevirtual)$/.test(seg) ? C.acc : C.text;
+    ctx.fillText(seg, xx, y); xx += ctx.measureText(seg).width; }
+  ctx.restore();
+}
+
+/* ============ 场景 1 · 钩子 (0–7s) ============ */
+const ILLS = (() => { const r = rnd(9); return ['抑郁','焦虑','创伤','强迫','失眠','成瘾','恐惧','倦怠'].map((s, i) => ({s, x:300 + (i % 4)*440 + (r() - .5)*80, y:230 + Math.floor(i/4)*170 + (r() - .5)*40, ph:r()*6})); })();
+function s1(t){
+  rise('过去一百年，心理学大多在研究「病」', W/2, 120, t, .2, {size:52, weight:900});
+  ILLS.forEach((o, i) => { const e = eo(p(t, .6 + i*.12, 1.1 + i*.12));
+    txt(o.s, o.x, o.y + Math.sin(t*1.2 + o.ph)*6, {size:44, weight:700, color:C.muted, alpha:e*.6*(1 - p(t, 3.4, 4))}); });
+  rise('可是，没生病 ≠ 过得好', W/2, 560, t, 2.4, {size:56, weight:900, alpha:1 - p(t, 3.9, 4.3)});
+  const k = p(t, 4.2, 4.8);
+  if (k > 0) txt('积极心理学', W/2, 520, {size:120, weight:900, color:C.acc, glow:40, alpha:clamp(k*2), scale:eback(k)});
+  rise('研究人怎样才能过得更好', W/2, 680, t, 5.0, {size:44, weight:700, color:C.gold});
+}
+
+/* ============ 场景 2 · 从 -5 到 +5 (7–20s) ============ */
+function s2(t){
+  rise('从「修补问题」，到「培养优势」', W/2, 120, t, 7.2, {size:60, weight:900});
+  const x0 = 260, x1 = 1660, y = 470, X = v => lerp(x0, x1, (v + 10)/20), la = eo(p(t, 7.8, 8.6));
+  ctx.save(); al(la); ctx.strokeStyle = 'rgba(255,255,255,.35)'; ctx.lineWidth = 3;
+  ctx.beginPath(); ctx.moveTo(x0, y); ctx.lineTo(lerp(x0, x1, la), y); ctx.stroke();
+  for (let v = -10; v <= 10; v += 2){ ctx.beginPath(); ctx.moveTo(X(v), y - (v === 0 ? 18 : 10)); ctx.lineTo(X(v), y + (v === 0 ? 18 : 10)); ctx.stroke(); }
+  ctx.restore();
+  [-10, -5, 0, 5, 10].forEach(v => txt(String(v > 0 ? '+' + v : v), X(v), y + 50, {size:28, weight:700, font:MONO, color:v === 0 ? C.text : C.muted, alpha:la}));
+  txt('痛苦', X(-10), y - 50, {size:30, weight:800, color:C.blue, alpha:la}); txt('繁荣', X(10), y - 50, {size:30, weight:800, color:C.acc, alpha:la});
+  const ta = eo(p(t, 9.2, 10.4));
+  if (ta > 0){ ctx.save(); al(1); ctx.strokeStyle = C.blue; ctx.lineWidth = 10; ctx.lineCap = 'round'; ctx.beginPath(); ctx.moveTo(X(-5), y - 110); ctx.lineTo(lerp(X(-5), X(0), ta), y - 110); ctx.stroke(); ctx.restore();
+    arrow(X(-5), y - 110, X(0), y - 110, ta, 1, C.blue, 10); }
+  txt('传统心理学：从 -5 到 0', X(-2.5), y - 160, {size:30, weight:800, color:C.blue, alpha:eo(p(t, 9.6, 10.2))});
+  const pa = eo(p(t, 11.0, 12.2));
+  if (pa > 0) arrow(X(0), y - 110, X(5), y - 110, pa, 1, C.acc, 10);
+  txt('积极心理学：从 0 到 +5', X(2.5), y - 160, {size:30, weight:800, color:C.acc, alpha:eo(p(t, 11.4, 12))});
+  rise('不只是让人「不难受」，还要让人「过得好」', W/2, 670, t, 12.8, {size:44, weight:900});
+  rise('1998 年，马丁·塞利格曼在担任美国心理学会主席时正式倡导', W/2, 790, t, 14.6, {size:32, weight:600, color:C.muted});
+  rise('核心问题：什么让人生值得一过？', W/2, 860, t, 15.8, {size:40, weight:900, color:C.gold, glow:14});
+}
+
+/* ============ 场景 3 · PERMA (20–35s) ============ */
+const PERMA = [['P', '积极情绪', ['快乐、感激', '平静、希望']], ['E', '投入', ['全情投入', '忘了时间']], ['R', '关系', ['被人支持', '也支持别人']], ['M', '意义', ['属于比自己', '更大的东西']], ['A', '成就', ['为目标努力', '并且做到']]];
+function s3(t){
+  rise('PERMA：幸福的五根支柱', W/2, 115, t, 20.2, {size:60, weight:900});
+  ctx.save(); al(eo(p(t, 20.6, 21.2))); ctx.fillStyle = 'rgba(255,143,177,.25)'; rr(180, 760, 1560, 18, 9); ctx.fill(); ctx.restore();
+  PERMA.forEach(([l, zh, d], i) => {
+    const st = 21.2 + i*.8, e = eo(p(t, st, st + .8)); if (e <= 0) return;
+    const x = 200 + i*310, h = 520*e, top = 760 - h;
+    ctx.save(); al(1); rr(x, top, 280, h, 22); const g = ctx.createLinearGradient(0, top, 0, 760);
+    g.addColorStop(0, 'rgba(255,143,177,.28)'); g.addColorStop(1, 'rgba(255,143,177,.06)'); ctx.fillStyle = g; ctx.fill();
+    ctx.strokeStyle = 'rgba(255,143,177,.55)'; ctx.lineWidth = 2; ctx.stroke(); ctx.restore();
+    const a = p(t, st + .5, st + .9);
+    txt(l, x + 140, 330, {size:110, weight:900, color:C.acc, glow:24, alpha:a});
+    txt(zh, x + 140, 470, {size:44, weight:900, alpha:a});
+    txt(d[0], x + 140, 560, {size:28, weight:500, color:C.muted, alpha:a});
+    txt(d[1], x + 140, 605, {size:28, weight:500, color:C.muted, alpha:a});
+  });
+  rise('塞利格曼提出的幸福模型：五样都有，人才算「过得好」', W/2, 870, t, 26.4, {size:38, weight:800});
+  rise('它们彼此独立，也可以一项一项去练习', W/2, 940, t, 28.6, {size:32, weight:600, color:C.muted});
+}
+
+/* ============ 场景 4 · 品格优势 (35–50s) ============ */
+const VIR = [['智慧', '好奇心、好学'], ['勇气', '勇敢、坚持'], ['仁爱', '善良、爱'], ['正义', '团队精神、公平'], ['节制', '宽恕、自律'], ['超越', '感恩、幽默']];
+function s4(t){
+  rise('每个人都有自己的「优势」', W/2, 105, t, 35.2, {size:58, weight:900});
+  const cx = 640, cy = 580, R = 290, ca = eback(p(t, 35.8, 36.4));
+  if (ca > 0){ ctx.save(); ctx.translate(cx, cy); ctx.scale(ca, ca); ctx.translate(-cx, -cy);
+    ctx.globalAlpha = clamp(SA*ca); ctx.fillStyle = 'rgba(255,143,177,.2)'; ctx.strokeStyle = C.acc; ctx.lineWidth = 3; ctx.shadowColor = C.acc; ctx.shadowBlur = 30;
+    ctx.beginPath(); ctx.arc(cx, cy, 120, 0, 6.283); ctx.fill(); ctx.stroke(); ctx.restore();
+    txt('24 项', cx, cy - 22, {size:44, weight:900, color:C.acc, alpha:clamp(ca)}); txt('品格优势', cx, cy + 30, {size:30, weight:800, alpha:clamp(ca)}); }
+  VIR.forEach(([v, ex], i) => {
+    const st = 36.6 + i*.35, e = eback(p(t, st, st + .5)); if (e <= 0) return;
+    const ang = -Math.PI/2 + i*Math.PI/3 + Math.sin(t*.3)*.03, x = cx + Math.cos(ang)*R, y = cy + Math.sin(ang)*R*.95;
+    ctx.save(); al(clamp(e)*.5); ctx.strokeStyle = C.acc; ctx.lineWidth = 2; ctx.setLineDash([6, 8]);
+    ctx.beginPath(); ctx.moveTo(cx + Math.cos(ang)*125, cy + Math.sin(ang)*125); ctx.lineTo(x - Math.cos(ang)*90, y - Math.sin(ang)*90); ctx.stroke(); ctx.restore();
+    ctx.save(); ctx.translate(x, y); ctx.scale(e, e); ctx.globalAlpha = clamp(SA*e); ctx.fillStyle = '#1d1426'; ctx.strokeStyle = 'rgba(255,143,177,.6)'; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.arc(0, 0, 88, 0, 6.283); ctx.fill(); ctx.stroke(); ctx.restore();
+    txt(v, x, y - 16, {size:38, weight:900, alpha:clamp(e)}); txt(ex, x, y + 28, {size:20, weight:500, color:C.muted, alpha:clamp(e)});
+  });
+  rise('心理学家把人的美德归成 6 类、24 项优势', 1130, 330, t, 39.0, {size:34, weight:800, align:'left'});
+  rise('找出你最突出的那几项：', 1130, 440, t, 40.8, {size:34, weight:700, align:'left'});
+  rise('「标志性优势」', 1130, 500, t, 41.4, {size:52, weight:900, color:C.acc, glow:18, align:'left'});
+  rise('每天换一种新方式用它', 1130, 620, t, 43.4, {size:34, weight:700, align:'left'});
+  rise('研究发现，这能实实在在提升幸福感', 1130, 680, t, 44.4, {size:30, weight:600, color:C.gold, align:'left'});
+}
+
+/* ============ 场景 5 · 小练习 (50–64s) ============ */
+const EX = [['01', '三件好事', ['每晚写下 3 件顺利的事', '和它们为什么会发生'], '效果可持续约半年'], ['02', '感恩拜访', ['给帮过你的人写封信', '当面读给他听'], '幸福感明显上升，约维持一个月'], ['03', '用新方式发挥优势', ['每天用一种新方式', '运用你的标志性优势'], '效果同样可持续约半年']];
+function s5(t){
+  rise('研究验证过的 3 个小练习', W/2, 150, t, 50.2, {size:60, weight:900});
+  EX.forEach(([no, main, d, res], i) => {
+    const st = 51.0 + i*1.8, e = eback(p(t, st, st + .7)); if (e <= 0) return;
+    const x = 135 + i*570, y = 280, dy = (1 - e)*320, cx = x + 270, a = clamp(p(t, st, st + .4));
+    ctx.save(); ctx.translate(0, dy); al(a);
+    rr(x, y, 540, 490, 32); ctx.fillStyle = 'rgba(255,255,255,.05)'; ctx.fill();
+    ctx.strokeStyle = 'rgba(255,143,177,.4)'; ctx.lineWidth = 2; ctx.stroke(); ctx.restore();
+    txt(no, cx, y + 90 + dy, {size:76, weight:900, color:C.acc, font:MONO, alpha:a, glow:18});
+    txt(main, cx, y + 200 + dy, {size:44, weight:900, alpha:a});
+    txt(d[0], cx, y + 275 + dy, {size:28, weight:500, color:C.muted, alpha:a});
+    txt(d[1], cx, y + 318 + dy, {size:28, weight:500, color:C.muted, alpha:a});
+    box(x + 40, y + 375 + dy, 460, 70, eo(p(t, st + 1, st + 1.4)), {fill:'rgba(255,211,138,.10)', stroke:'rgba(255,211,138,.5)', r:35});
+    txt(res, cx, y + 410 + dy, {size:26, weight:800, color:C.gold, alpha:eo(p(t, st + 1, st + 1.4))});
+  });
+  rise('来源：塞利格曼等人 2005 年的随机对照实验', W/2, 870, t, 57.4, {size:30, weight:600, color:C.muted});
+  rise('今晚就能试试第一个', W/2, 945, t, 59.0, {size:40, weight:900, color:C.acc, glow:14});
+}
+
+/* ============ 场景 6 · 收尾 (64–72s) ============ */
+function s6(t){
+  const k = p(t, 64.2, 64.8);
+  if (k > 0) txt('积极心理学 ≠ 强颜欢笑', W/2, 300, {size:76, weight:900, alpha:clamp(k*2), scale:eback(k)});
+  rise('它不否认痛苦，而是在修补之外', W/2, 440, t, 65.2, {size:44, weight:700, color:C.muted});
+  rise('多问一句：怎样才能过得更好？', W/2, 520, t, 66.0, {size:52, weight:900, color:C.acc, glow:20});
+  rise('关注我，一起把日子过亮一点', W/2, 720, t, 67.6, {size:36, weight:500, color:C.muted});
+}
+
+/* ============ 总调度 ============ */
+const SCENES = [[s1,-1,7],[s2,7,20],[s3,20,35],[s4,35,50],[s5,50,64],[s6,64,72]];
+function draw(t){
+  t = clamp(t, 0, DUR);
+  ctx.save(); ctx.globalAlpha = 1; ctx.clearRect(0,0,W,H); background(t);
+  for (const [fn,a,b] of SCENES){
+    if (t < a || t > b) continue;
+    SA = sceneA(t, a, b, b === DUR ? .8 : .5);
+    if (SA > 0){ ctx.save(); fn(t); ctx.restore(); }
+  }
+  SA = 1; vignette();
+  const fo = p(t, DUR - .8, DUR);
+  if (fo > 0){ ctx.globalAlpha = fo; ctx.fillStyle = '#000'; ctx.fillRect(0,0,W,H); }
+  ctx.restore();
+}
+
+/* ============ 播放器 / 逐帧渲染接口 ============ */
+const isRender = new URLSearchParams(location.search).has('render');
+window.DURATION = DUR;
+window.renderFrame = t => draw(t);
+const btn = document.getElementById('btn'), seek = document.getElementById('seek'), timeEl = document.getElementById('time');
+const fmt = s => `${Math.floor(s/60)}:${String(Math.floor(s%60)).padStart(2,'0')}`;
+function fit(){
+  if (isRender){ cv.style.width = W+'px'; cv.style.height = H+'px'; return; }
+  const w = Math.min(innerWidth - 32, (innerHeight - 84)*16/9);
+  cv.style.width = w + 'px'; cv.style.height = w*9/16 + 'px';
+}
+addEventListener('resize', fit); fit();
+
+let cur = 0, playing = !isRender, last = null;
+function toggle(){ if (cur >= DUR) cur = 0; playing = !playing; }
+btn.onclick = toggle; cv.onclick = toggle;
+addEventListener('keydown', e => { if (e.code === 'Space'){ e.preventDefault(); toggle(); } });
+seek.oninput = () => { cur = +seek.value; draw(cur); };
+function loop(ts){
+  if (playing && last != null){ cur += (ts - last)/1000; if (cur >= DUR){ cur = DUR; playing = false; } }
+  last = ts; draw(cur);
+  seek.value = cur; timeEl.textContent = `${fmt(cur)} / ${fmt(DUR)}`;
+  btn.textContent = playing ? '❚❚' : (cur >= DUR ? '↺' : '▶');
+  requestAnimationFrame(loop);
+}
+document.fonts.ready.then(() => {
+  window.ready = true;
+  if (isRender) draw(0); else requestAnimationFrame(loop);
+});
+</script>
+</body>
+</html>
