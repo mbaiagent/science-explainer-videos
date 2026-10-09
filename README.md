@@ -16,6 +16,7 @@
 | 线程池是什么 | `thread-pool/landscape.html` | 横屏 1920×1080 | 80s |
 | 积极心理学 | `positive-psychology/landscape.html` | 横屏 1920×1080 | 72s |
 | Opus 5.5 是怎么做出视频的 | `opus-video/landscape.html` | 横屏 1920×1080 | 76s |
+| MySQL 的 MVCC | `mysql-mvcc/landscape.html` | 横屏 1920×1080 | 80s |
 
 ### 幸福的科学
 钩子 → 享乐适应（快乐曲线 + 跑步机）→ 哈佛成人发展研究（关系网络）→ 心流（挑战 × 技能坐标图）→ 今晚就能做的 3 件事 → 收尾
@@ -43,6 +44,9 @@
 
 ### Opus 5.5 是怎么做出视频的
 视频全是代码画的 → 和视频生成模型的区别 → 四步流水线（脚本、HTML 动画、逐帧截图、ffmpeg）→ 画面 = 时间的函数 draw(t) → 写、看、改的自我检查循环 → 适合与不适合
+
+### MySQL 的 MVCC
+加锁导致读写互等 → 一行多版本 → 隐藏列与 undo 版本链 → ReadView 可见性规则与沿链查找 → RC 与 RR 的区别 → 快照读与当前读、长事务 → 收尾
 
 ## 预览
 

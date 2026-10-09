@@ -1,0 +1,419 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>MySQL 的 MVCC：让读和写互不阻塞 · 图文详解</title>
+<meta name="description" content="隐藏列、undo log 版本链、ReadView 可见性规则，RC 和 RR 的真正区别，以及快照读、当前读、幻读和长事务问题">
+<link rel="stylesheet" href="../assets/article.css">
+<style>:root{--acc:#4dd0e1}</style>
+</head>
+<body>
+<div class="wrap">
+  <nav class="top"><a href="../index.html">← 全部视频</a><a class="watch" href="landscape.html">▶ 看视频</a></nav>
+  <header class="hero">
+    <div class="tag">计算机 · AI · 图文详解</div>
+    <h1>MySQL 的 MVCC：让读和写互不阻塞</h1>
+    <p>隐藏列、undo log 版本链、ReadView 可见性规则，RC 和 RR 的真正区别，以及快照读、当前读、幻读和长事务问题</p>
+    <div class="meta">约 12 分钟读完 · 配套视频 1:20</div>
+  </header>
+  <nav class="toc">
+<ul>
+<li><a href="#_1">从一个问题开始</a></li>
+<li><a href="#_2">先复习：并发事务的三种读问题与隔离级别</a></li>
+<li><a href="#_3">核心思路：一行数据，保存多个版本</a></li>
+<li><a href="#_4">第一样：隐藏列</a></li>
+<li><a href="#undo-log">第二样：undo log 版本链</a></li>
+<li><a href="#readview">第三样：ReadView，判断谁可见</a></li>
+<li><a href="#rc-rr-readview">RC 和 RR：差在 ReadView 什么时候生成</a></li>
+<li><a href="#_8">快照读和当前读</a></li>
+<li><a href="#rr">RR 能避免幻读吗</a></li>
+<li><a href="#purge">旧版本什么时候清理：purge 与长事务</a></li>
+<li><a href="#_11">高频面试题速答</a></li>
+<li><a href="#_12">总结</a></li>
+</ul>
+</nav>
+
+  <article>
+<figure><img src="img/f-6.jpg" alt="传统加锁：读和写互相等待" loading="lazy"><figcaption>传统加锁：读和写互相等待</figcaption></figure>
+<h2 id="_1">从一个问题开始</h2>
+<p>事务 A 正在修改一行数据，还没提交；这时事务 B 想读这一行。B 应该读到什么？</p>
+<ul>
+<li>读到 A 改了一半、还没提交的新值？如果 A 最后回滚了，B 就读到了一个「从未真正存在过」的数据，这叫<strong>脏读</strong>。</li>
+<li>那就让 B 等 A 提交以后再读？正确是正确了，但读和写互相阻塞，并发一高，性能就很差。</li>
+</ul>
+<p>数据库里读操作通常远多于写操作。有没有办法，<strong>既不让读者看到未提交的数据，又不让读者等待写者</strong>？</p>
+<p>InnoDB 的答案就是 <strong>MVCC（Multi-Version Concurrency Control，多版本并发控制）</strong>。</p>
+<h2 id="_2">先复习：并发事务的三种读问题与隔离级别</h2>
+<table>
+<thead>
+<tr>
+<th>问题</th>
+<th>描述</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>脏读</td>
+<td>读到了其他事务<strong>未提交</strong>的修改</td>
+</tr>
+<tr>
+<td>不可重复读</td>
+<td>同一个事务里两次读同一行，结果不一样（中间被别人修改并提交了）</td>
+</tr>
+<tr>
+<td>幻读</td>
+<td>同一个事务里两次按同一条件查询，第二次多出了（或少了）几行</td>
+</tr>
+</tbody>
+</table>
+<p>SQL 标准定义了四个隔离级别：</p>
+<table>
+<thead>
+<tr>
+<th>隔离级别</th>
+<th>脏读</th>
+<th>不可重复读</th>
+<th>幻读</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>读未提交（READ UNCOMMITTED）</td>
+<td>可能</td>
+<td>可能</td>
+<td>可能</td>
+</tr>
+<tr>
+<td>读已提交（READ COMMITTED，RC）</td>
+<td>避免</td>
+<td>可能</td>
+<td>可能</td>
+</tr>
+<tr>
+<td>可重复读（REPEATABLE READ，RR）</td>
+<td>避免</td>
+<td>避免</td>
+<td>标准中可能</td>
+</tr>
+<tr>
+<td>串行化（SERIALIZABLE）</td>
+<td>避免</td>
+<td>避免</td>
+<td>避免</td>
+</tr>
+</tbody>
+</table>
+<p>InnoDB 的默认隔离级别是 <strong>RR</strong>。RC 和 RR 这两个最常用的级别，都是靠 MVCC 实现的；而 InnoDB 的 RR 在 MVCC 和间隙锁的配合下，在很大程度上也避免了幻读（后面会细说）。</p>
+<h2 id="_3">核心思路：一行数据，保存多个版本</h2>
+<figure><img src="img/f-17.jpg" alt="每个事务，只看到自己「该看」的那个版本" loading="lazy"><figcaption>每个事务，只看到自己「该看」的那个版本</figcaption></figure>
+<p>MVCC 的想法很朴素：<strong>修改数据时不直接覆盖旧值，而是把旧版本保留下来。</strong> 于是同一行数据在某一时刻可能同时存在多个版本：</p>
+<ul>
+<li>已经提交了很久的版本 1；</li>
+<li>刚刚提交的版本 2；</li>
+<li>某个事务正在修改、还没提交的版本 3。</li>
+</ul>
+<p>每个事务读数据时，根据自己的「视角」，从这些版本里挑出它应该看到的那一个。读的人读旧版本，写的人写新版本，<strong>互不干扰，也就不需要用锁来协调普通的读写冲突</strong>。</p>
+<p>要实现这一点，InnoDB 需要三样东西：</p>
+<ol>
+<li><strong>隐藏列</strong>：记录每个版本是谁写的、上一个版本在哪；</li>
+<li><strong>undo log 版本链</strong>：把旧版本串起来保存；</li>
+<li><strong>ReadView</strong>：判断某个版本对当前事务是否可见的规则。</li>
+</ol>
+<h2 id="_4">第一样：隐藏列</h2>
+<figure><img src="img/f-33.jpg" alt="隐藏列与 undo log 版本链" loading="lazy"><figcaption>隐藏列与 undo log 版本链</figcaption></figure>
+<p>InnoDB 会在每一行记录上，自动加几个用户看不到的字段：</p>
+<table>
+<thead>
+<tr>
+<th>隐藏列</th>
+<th>大小</th>
+<th>含义</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>DB_TRX_ID</code></td>
+<td>6 字节</td>
+<td>最后一次插入或修改这行的<strong>事务 ID</strong></td>
+</tr>
+<tr>
+<td><code>DB_ROLL_PTR</code></td>
+<td>7 字节</td>
+<td><strong>回滚指针</strong>，指向 undo log 中这行的上一个版本</td>
+</tr>
+<tr>
+<td><code>DB_ROW_ID</code></td>
+<td>6 字节</td>
+<td>行 ID，只有表没有主键、也没有非空唯一键时，才会用它生成聚簇索引</td>
+</tr>
+</tbody>
+</table>
+<p>此外，每行记录头里还有一个<strong>删除标记</strong>。<code>DELETE</code> 时并不会立刻物理删除这一行，而是先打上标记，等确认没有事务再需要它时才真正清理。</p>
+<p>事务 ID 是全局递增分配的，越晚开始写数据的事务，ID 越大。（只读事务通常不会分配这样的事务 ID，只有在第一次修改数据时才会分配。）</p>
+<h2 id="undo-log">第二样：undo log 版本链</h2>
+<p>undo log 原本是为了<strong>回滚</strong>而存在的：事务修改数据前，先把旧值记下来，万一事务失败，就能用它把数据恢复原样。MVCC 顺便利用了它。</p>
+<p>以视频里的例子来看版本链是怎么形成的：</p>
+<ol>
+<li>事务 10 插入了一行：<code>id=1, 余额=100</code>，此时 <code>DB_TRX_ID=10</code>。</li>
+<li>事务 20 执行 <code>UPDATE ... SET 余额=200</code>：
+   - 把旧版本（余额 100，trx_id 10）写进 undo log；
+   - 修改行数据为余额 200，<code>DB_TRX_ID=20</code>；
+   - <code>DB_ROLL_PTR</code> 指向 undo log 里那条旧版本。</li>
+<li>事务 30 执行 <code>UPDATE ... SET 余额=300</code>：
+   - 把余额 200 的版本写进 undo log，它的回滚指针仍然指向余额 100 的版本；
+   - 行数据变成余额 300，<code>DB_TRX_ID=30</code>，回滚指针指向余额 200 的版本。</li>
+</ol>
+<p>于是形成了一条从新到旧的链：</p>
+<pre><code class="language-text">当前行: 余额 300 (trx 30)  →  undo: 余额 200 (trx 20)  →  undo: 余额 100 (trx 10)
+</code></pre>
+<p>这就是<strong>版本链</strong>。任何一个事务，都可以顺着回滚指针，找到这一行过去的任意一个版本。</p>
+<blockquote>
+<p>undo log 分两类：插入产生的 undo 在事务提交后就可以删掉（新插入的行没有「更旧的版本」可言）；更新和删除产生的 undo 可能还要服务于其他事务的快照读，必须等没人需要时才能清理。</p>
+</blockquote>
+<h2 id="readview">第三样：ReadView，判断谁可见</h2>
+<figure><img src="img/f-43.5.jpg" alt="ReadView 与可见性规则" loading="lazy"><figcaption>ReadView 与可见性规则</figcaption></figure>
+<h3 id="readview_1">ReadView 里有什么</h3>
+<p>事务在执行快照读时，会生成一个 <strong>ReadView</strong>（读视图），可以理解为「此刻数据库里各个事务状态的一张快照」。它包含四个关键信息：</p>
+<table>
+<thead>
+<tr>
+<th>字段</th>
+<th>含义</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>m_ids</code></td>
+<td>生成 ReadView 时，<strong>所有活跃（已开始、未提交）的读写事务</strong> ID 列表</td>
+</tr>
+<tr>
+<td><code>min_trx_id</code></td>
+<td><code>m_ids</code> 中最小的 ID</td>
+</tr>
+<tr>
+<td><code>max_trx_id</code></td>
+<td>生成 ReadView 时，系统<strong>下一个要分配</strong>的事务 ID</td>
+</tr>
+<tr>
+<td><code>creator_trx_id</code></td>
+<td>生成这个 ReadView 的事务自己的 ID</td>
+</tr>
+</tbody>
+</table>
+<blockquote>
+<p>在 InnoDB 源码里，这几个字段分别叫 <code>m_ids</code>、<code>m_up_limit_id</code>（即最小值）、<code>m_low_limit_id</code>（即「下一个要分配的 ID」）和 <code>m_creator_trx_id</code>。名字里的 up 和 low 和直觉正好相反，读源码时容易看反。</p>
+</blockquote>
+<h3 id="_5">四条可见性规则</h3>
+<p>拿版本链上某个版本的 <code>trx_id</code>，按顺序判断：</p>
+<ol>
+<li><strong><code>trx_id == creator_trx_id</code></strong>：这是我自己改的，<strong>可见</strong>。</li>
+<li><strong><code>trx_id &lt; min_trx_id</code></strong>：生成 ReadView 时，这个事务早就提交了，<strong>可见</strong>。</li>
+<li><strong><code>trx_id &gt;= max_trx_id</code></strong>：这个事务是在我生成 ReadView <strong>之后</strong>才开始的，<strong>不可见</strong>。</li>
+<li><strong><code>min_trx_id &lt;= trx_id &lt; max_trx_id</code></strong>：看它在不在 <code>m_ids</code> 里：
+   - 在：生成 ReadView 时它还没提交，<strong>不可见</strong>；
+   - 不在：生成 ReadView 时它已经提交了，<strong>可见</strong>。</li>
+</ol>
+<p>如果当前版本不可见，就顺着回滚指针找上一个版本，再用同样的规则判断，直到找到第一个可见的版本。如果一直找到链的末尾都没有可见版本，说明这行对当前事务来说「还不存在」，查询结果里就没有它。</p>
+<figure>
+<svg viewBox="0 0 440 520" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="可见性判断流程">
+  <rect width="440" height="520" fill="#0f0e1c"/>
+  <defs><marker id="m" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#4dd0e1"/></marker></defs>
+  <g font-family="PingFang SC, Noto Sans SC, sans-serif" font-size="17">
+    <rect x="70" y="16" width="300" height="50" rx="12" fill="rgba(77,208,225,.14)" stroke="#4dd0e1"/>
+    <text x="220" y="47" fill="#f4ede4" text-anchor="middle" font-weight="800">取版本链上的一个版本</text>
+    <g text-anchor="start">
+      <rect x="20" y="96" width="270" height="56" rx="10" fill="rgba(255,255,255,.04)" stroke="rgba(255,255,255,.25)"/>
+      <text x="36" y="130" fill="#f4ede4">trx_id = 自己？</text>
+      <rect x="20" y="176" width="270" height="56" rx="10" fill="rgba(255,255,255,.04)" stroke="rgba(255,255,255,.25)"/>
+      <text x="36" y="210" fill="#f4ede4">trx_id &lt; min_trx_id？</text>
+      <rect x="20" y="256" width="270" height="56" rx="10" fill="rgba(255,255,255,.04)" stroke="rgba(255,255,255,.25)"/>
+      <text x="36" y="290" fill="#f4ede4">trx_id ≥ max_trx_id？</text>
+      <rect x="20" y="336" width="270" height="56" rx="10" fill="rgba(255,255,255,.04)" stroke="rgba(255,255,255,.25)"/>
+      <text x="36" y="370" fill="#f4ede4">trx_id 在 m_ids 中？</text>
+    </g>
+    <g font-weight="800" text-anchor="middle">
+      <text x="372" y="130" fill="#6ee7c8">是 → 可见</text>
+      <text x="372" y="210" fill="#6ee7c8">是 → 可见</text>
+      <text x="372" y="290" fill="#ff8a8a">是 → 不可见</text>
+      <text x="372" y="370" fill="#ff8a8a">是 → 不可见</text>
+    </g>
+    <line x1="220" y1="66" x2="220" y2="92" stroke="#4dd0e1" stroke-width="2.5" marker-end="url(#m)"/>
+    <line x1="155" y1="152" x2="155" y2="172" stroke="#4dd0e1" stroke-width="2.5" marker-end="url(#m)"/>
+    <line x1="155" y1="232" x2="155" y2="252" stroke="#4dd0e1" stroke-width="2.5" marker-end="url(#m)"/>
+    <line x1="155" y1="312" x2="155" y2="332" stroke="#4dd0e1" stroke-width="2.5" marker-end="url(#m)"/>
+    <text x="168" y="166" fill="#9a93a8" font-size="14">否</text><text x="168" y="246" fill="#9a93a8" font-size="14">否</text><text x="168" y="326" fill="#9a93a8" font-size="14">否</text>
+    <line x1="155" y1="392" x2="155" y2="420" stroke="#4dd0e1" stroke-width="2.5" marker-end="url(#m)"/>
+    <text x="168" y="410" fill="#9a93a8" font-size="14">否</text>
+    <rect x="70" y="424" width="170" height="44" rx="10" fill="rgba(110,231,200,.12)" stroke="#6ee7c8"/>
+    <text x="155" y="452" fill="#6ee7c8" text-anchor="middle" font-weight="800">可见（已提交）</text>
+    <text x="220" y="502" fill="#ffd38a" text-anchor="middle" font-size="16" font-weight="700">不可见 → 顺着回滚指针取上一个版本，重新判断</text>
+  </g>
+</svg>
+<figcaption>可见性判断流程：不可见就沿版本链往回找</figcaption>
+</figure>
+
+<h3 id="_6">走一遍例子</h3>
+<p>假设事务 25 生成 ReadView 时，事务 20 和 30 都还没提交：</p>
+<pre><code class="language-text">m_ids = [20, 25, 30]    min_trx_id = 20    max_trx_id = 31    creator_trx_id = 25
+</code></pre>
+<figure><img src="img/f-50.jpg" alt="沿版本链查找，读到余额 100" loading="lazy"><figcaption>沿版本链查找，读到余额 100</figcaption></figure>
+<table>
+<thead>
+<tr>
+<th>版本</th>
+<th>trx_id</th>
+<th>判断</th>
+<th>结果</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>余额 300</td>
+<td>30</td>
+<td>介于 20 和 31 之间，且在 <code>m_ids</code> 里</td>
+<td>不可见，往回找</td>
+</tr>
+<tr>
+<td>余额 200</td>
+<td>20</td>
+<td>介于 20 和 31 之间，且在 <code>m_ids</code> 里</td>
+<td>不可见，往回找</td>
+</tr>
+<tr>
+<td>余额 100</td>
+<td>10</td>
+<td>小于 <code>min_trx_id</code></td>
+<td><strong>可见</strong></td>
+</tr>
+</tbody>
+</table>
+<p>所以事务 25 读到的余额是 <strong>100</strong>。尽管当前行上的最新值已经是 300，但对它来说，事务 20 和 30 的修改都「还没发生」。</p>
+<h2 id="rc-rr-readview">RC 和 RR：差在 ReadView 什么时候生成</h2>
+<figure><img src="img/f-66.jpg" alt="RC 每次读都新建 ReadView，RR 复用第一次的" loading="lazy"><figcaption>RC 每次读都新建 ReadView，RR 复用第一次的</figcaption></figure>
+<p>MVCC 的规则在 RC 和 RR 下完全一样，<strong>唯一的区别是 ReadView 的生成时机</strong>：</p>
+<ul>
+<li><strong>RC（读已提交）</strong>：事务里<strong>每一次</strong>快照读，都生成一个新的 ReadView。所以每次都能看到在那之前已经提交的修改。</li>
+<li><strong>RR（可重复读）</strong>：只在事务里<strong>第一次</strong>快照读时生成 ReadView，之后整个事务都复用它。所以不管别人中途提交了什么，这个事务看到的始终是同一个「快照」。</li>
+</ul>
+<h3 id="_7">用两个会话亲自验证</h3>
+<p>准备一张表：</p>
+<pre><code class="language-sql">CREATE TABLE account (id INT PRIMARY KEY, balance INT);
+INSERT INTO account VALUES (1, 100);
+</code></pre>
+<p>打开两个 MySQL 客户端，按顺序执行：</p>
+<pre><code class="language-sql">-- 会话 A
+SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+BEGIN;
+SELECT balance FROM account WHERE id = 1;   -- 100（此时生成 ReadView）
+
+-- 会话 B（自动提交）
+UPDATE account SET balance = 200 WHERE id = 1;
+
+-- 会话 A
+SELECT balance FROM account WHERE id = 1;   -- RR 下仍是 100；换成 RC 则是 200
+COMMIT;
+</code></pre>
+<p>把第一行的隔离级别改成 <code>READ COMMITTED</code> 再做一遍，就能看到区别。</p>
+<blockquote>
+<p>注意：<code>BEGIN</code> 或 <code>START TRANSACTION</code> 并不会立即生成 ReadView，第一次快照读时才会。如果希望事务一开始就生成，可以用 <code>START TRANSACTION WITH CONSISTENT SNAPSHOT</code>。</p>
+</blockquote>
+<h2 id="_8">快照读和当前读</h2>
+<figure><img src="img/f-74.jpg" alt="两个要分清的概念" loading="lazy"><figcaption>两个要分清的概念</figcaption></figure>
+<p>MVCC 只管一类读操作，这一点非常关键。</p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>快照读</th>
+<th>当前读</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>哪些语句</td>
+<td>普通的 <code>SELECT</code></td>
+<td><code>SELECT ... FOR UPDATE</code>、<code>SELECT ... FOR SHARE</code>（旧写法 <code>LOCK IN SHARE MODE</code>）、<code>INSERT</code>、<code>UPDATE</code>、<code>DELETE</code></td>
+</tr>
+<tr>
+<td>读哪个版本</td>
+<td>ReadView 可见的版本，可能是历史版本</td>
+<td>最新的已提交版本</td>
+</tr>
+<tr>
+<td>是否加锁</td>
+<td>不加锁</td>
+<td>加锁</td>
+</tr>
+</tbody>
+</table>
+<h3 id="update">为什么 UPDATE 一定是当前读</h3>
+<p>如果 <code>UPDATE</code> 也基于旧快照计算，就会出现「丢失更新」。接着上面 RR 的例子：</p>
+<pre><code class="language-sql">-- 会话 A（RR，快照里余额是 100；B 已经把余额改成 200 并提交）
+UPDATE account SET balance = balance + 1 WHERE id = 1;
+SELECT balance FROM account WHERE id = 1;   -- 201，而不是 101
+</code></pre>
+<p><code>UPDATE</code> 读的是最新值 200，所以结果是 201。更新之后，这一行最新版本的 <code>trx_id</code> 变成了 A 自己，按照规则 1，A 的下一次快照读就能看到它。所以 A 先读到 100，更新后又读到 201，这在 RR 下是正常现象，并不矛盾。</p>
+<h2 id="rr">RR 能避免幻读吗</h2>
+<ul>
+<li><strong>对快照读来说</strong>：ReadView 在第一次读时就固定了，别的事务后来插入并提交的新行，<code>trx_id</code> 一定不小于 <code>max_trx_id</code>，对当前事务不可见。所以同样的 <code>SELECT</code> 执行多次，不会多出行来。</li>
+<li><strong>对当前读来说</strong>：InnoDB 使用<strong>临键锁</strong>（next-key lock，即记录锁加间隙锁），把查询范围内的记录和记录之间的「间隙」都锁住，别的事务无法往这个范围里插入新行。</li>
+</ul>
+<p>但要注意一种边界情况：事务 A 先快照读，看到 3 行；事务 B 插入第 4 行并提交；A 再执行一次覆盖这个范围的 <code>UPDATE</code>（当前读），会把第 4 行也更新掉，于是第 4 行的 <code>trx_id</code> 变成了 A 自己。A 之后再快照读，就会「突然」看到第 4 行。所以准确地说，<strong>InnoDB 的 RR 在绝大多数情况下避免了幻读，但快照读和当前读混用时，仍可能出现类似幻读的现象。</strong> 如果业务逻辑依赖「这个范围里不会多出数据」，应该一开始就用当前读（如 <code>SELECT ... FOR UPDATE</code>）加锁。</p>
+<h2 id="purge">旧版本什么时候清理：purge 与长事务</h2>
+<p>undo log 中的旧版本不能一直保留。InnoDB 有后台的 <strong>purge 线程</strong>，会检查当前所有活跃的 ReadView：如果某个旧版本已经不可能再被任何事务读到，就把它清理掉，同时真正删除那些打了删除标记的行。</p>
+<p>问题出在<strong>长事务</strong>上：只要有一个很早开启、一直不提交的事务，它的 ReadView 就可能需要非常旧的版本，于是从那时起产生的所有 undo 都不能清理。结果是：</p>
+<ul>
+<li>undo 日志越积越多，占用大量存储空间；</li>
+<li>版本链变长，别的查询沿链查找的成本上升；</li>
+<li>长事务往往还持有锁，阻塞其他写操作。</li>
+</ul>
+<h3 id="_9">怎么发现长事务</h3>
+<pre><code class="language-sql">-- 运行时间最长的事务
+SELECT trx_id, trx_started, trx_mysql_thread_id, trx_query
+FROM information_schema.innodb_trx
+ORDER BY trx_started
+LIMIT 10;
+
+-- 查看 History list length：未清理的 undo 数量，持续变大说明清理跟不上
+SHOW ENGINE INNODB STATUS;
+</code></pre>
+<h3 id="_10">怎么避免</h3>
+<ul>
+<li>事务里不要做和数据库无关的耗时操作，比如调用外部接口、等待用户输入；</li>
+<li>批量处理大量数据时，分批提交；</li>
+<li>注意框架和连接池的自动提交设置，避免「开了事务忘了提交」；</li>
+<li>监控 <code>innodb_trx</code> 和 History list length，设置告警。</li>
+</ul>
+<h2 id="_11">高频面试题速答</h2>
+<p><strong>Q：MVCC 解决了什么问题？</strong>
+让读写不互相阻塞：普通 <code>SELECT</code> 读历史版本，不加锁，也不会被写操作阻塞，同时不会读到未提交的数据。</p>
+<p><strong>Q：MVCC 由哪几部分组成？</strong>
+隐藏列（<code>DB_TRX_ID</code>、<code>DB_ROLL_PTR</code>）、undo log 版本链、ReadView 可见性规则。</p>
+<p><strong>Q：RC 和 RR 在 MVCC 上的区别？</strong>
+RC 每次快照读都生成新的 ReadView；RR 只在第一次快照读时生成，之后复用。</p>
+<p><strong>Q：MVCC 能完全替代锁吗？</strong>
+不能。MVCC 只解决快照读的读写冲突；写和写之间的冲突，以及当前读，仍然要靠行锁、间隙锁、临键锁。</p>
+<p><strong>Q：为什么不建议使用长事务？</strong>
+长事务会阻止 undo log 清理，导致空间膨胀、版本链变长，而且往往长期持有锁。</p>
+<h2 id="_12">总结</h2>
+<ul>
+<li><strong>MVCC = 隐藏列 + undo 版本链 + ReadView</strong>；</li>
+<li>修改数据时保留旧版本，读的时候按 ReadView 规则沿版本链找到第一个可见的版本；</li>
+<li><strong>RC 和 RR 的唯一区别是 ReadView 的生成时机</strong>；</li>
+<li>MVCC 只作用于<strong>快照读</strong>；当前读读最新版本并加锁；</li>
+<li>避免长事务，否则旧版本无法清理。</li>
+</ul>
+<div class="refs">
+<h3 id="_13">参考资料</h3>
+<ul>
+<li>MySQL 8.0 Reference Manual: InnoDB Multi-Versioning；Consistent Nonlocking Reads；Phantom Rows；Transaction Isolation Levels.</li>
+<li>MySQL 源码：<code>storage/innobase/include/read0types.h</code>（ReadView 定义）.</li>
+<li>小孩子 4919.《MySQL 是怎样运行的：从根儿上理解 MySQL》.</li>
+</ul>
+</div>
+  </article>
+  <div class="foot"><a href="../index.html">← 返回首页</a><a href="landscape.html">▶ 看配套视频</a></div>
+</div>
+</body>
+</html>

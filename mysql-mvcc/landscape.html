@@ -1,0 +1,366 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>MySQL 的 MVCC</title>
+<style>
+  :root{--bg:#07080f;--fg:#f4ede4;--muted:#9a93a8;--acc:#4dd0e1}
+  html,body{margin:0;height:100%;background:var(--bg);color:var(--fg);
+    font-family:-apple-system,"PingFang SC","Noto Sans SC","Noto Sans CJK SC","Microsoft YaHei",sans-serif}
+  body{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;overflow:hidden}
+  #stage{display:block;background:#07080f;border-radius:12px;box-shadow:0 20px 60px rgba(0,0,0,.55);cursor:pointer}
+  #bar{display:flex;align-items:center;gap:12px;width:min(calc(100vw - 32px),640px)}
+  #btn{width:40px;height:40px;border-radius:50%;border:1px solid rgba(77,208,225,.5);background:transparent;
+    color:var(--acc);font-size:16px;cursor:pointer;flex:none}
+  #seek{flex:1;accent-color:var(--acc)}
+  #time{font-variant-numeric:tabular-nums;font-size:13px;color:var(--muted);min-width:84px;text-align:right}
+  body.render{display:block}
+  body.render #bar{display:none}
+  body.render #stage{border-radius:0;box-shadow:none}
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="bar">
+  <button id="btn" aria-label="播放/暂停">❚❚</button>
+  <input id="seek" type="range" min="0" max="80" step="0.01" value="0">
+  <span id="time">0:00 / 1:20</span>
+</div>
+<script>
+/* ============ 基础设置（横屏 1920×1080） ============ */
+const W = 1920, H = 1080, DUR = 80;
+const cv = document.getElementById('stage'), ctx = cv.getContext('2d');
+cv.width = W; cv.height = H;
+const FONT = '"PingFang SC","Noto Sans SC","Noto Sans CJK SC","Source Han Sans SC","Microsoft YaHei",sans-serif';
+const MONO = '"JetBrains Mono","SF Mono",Menlo,Consolas,"DejaVu Sans Mono","Noto Sans Mono CJK SC","PingFang SC","Microsoft YaHei",monospace';
+const C = {acc:'#4dd0e1', mint:'#6ee7c8', gold:'#ffd38a', coral:'#ff9e7a', rose:'#ff8a8a', blue:'#9cc3ff', text:'#f4ede4', muted:'#9a93a8', dim:'#4a4558', panel:'#0f0e1f'};
+
+const clamp = (x,a=0,b=1) => Math.max(a, Math.min(b, x));
+const lerp = (a,b,t) => a + (b-a)*t;
+const p = (t,a,b) => clamp((t-a)/(b-a));
+const eo = x => 1 - Math.pow(1-x, 3);
+const eio = x => x < .5 ? 4*x*x*x : 1 - Math.pow(-2*x+2, 3)/2;
+const eback = x => { const c1=1.70158, c3=c1+1; return 1 + c3*Math.pow(x-1,3) + c1*Math.pow(x-1,2); };
+function rnd(seed){ let s = seed>>>0; return () => { s = (s*1664525 + 1013904223)>>>0; return s/4294967296; }; }
+
+let SA = 1;
+const al = a => { ctx.globalAlpha = clamp(SA*a); };
+const sceneA = (t,a,b,f=.5) => Math.min(p(t,a,a+f), 1 - p(t,b-f,b));
+
+function txt(s, x, y, o = {}){
+  const {size=64, weight=700, color=C.text, alpha=1, align='center', glow=0, scale=1, font=FONT} = o;
+  if (alpha <= 0) return;
+  ctx.save(); al(alpha);
+  ctx.font = `${weight} ${size}px ${font}`;
+  ctx.textAlign = align; ctx.textBaseline = 'middle'; ctx.fillStyle = color;
+  if (glow){ ctx.shadowColor = color; ctx.shadowBlur = glow; }
+  if (scale !== 1){ ctx.translate(x, y); ctx.scale(scale, scale); ctx.fillText(s, 0, 0); }
+  else ctx.fillText(s, x, y);
+  ctx.restore();
+}
+function rise(s, x, y, t, t0, o = {}, d = .7){
+  const e = eo(p(t, t0, t0+d));
+  if (e <= 0) return;
+  txt(s, x, y + (1-e)*36, {...o, alpha:(o.alpha ?? 1)*e});
+}
+function rr(x,y,w,h,r){ ctx.beginPath(); ctx.roundRect(x,y,w,h,r); }
+function box(x, y, w, h, a, o = {}){
+  const {fill='rgba(255,255,255,.05)', stroke='rgba(77,208,225,.35)', lw=2, glow=0, r=18, dash=null} = o;
+  if (a <= 0) return;
+  ctx.save(); al(a); rr(x, y, w, h, r); ctx.fillStyle = fill; ctx.fill();
+  if (dash) ctx.setLineDash(dash);
+  ctx.strokeStyle = stroke; ctx.lineWidth = lw; if (glow){ ctx.shadowColor = stroke; ctx.shadowBlur = glow; } ctx.stroke(); ctx.restore();
+}
+function arrow(x1, y1, x2, y2, e, a, color = C.acc, lw = 3){
+  if (e <= 0 || a <= 0) return;
+  const x = lerp(x1, x2, e), y = lerp(y1, y2, e), ang = Math.atan2(y2 - y1, x2 - x1);
+  ctx.save(); al(a); ctx.strokeStyle = color; ctx.fillStyle = color; ctx.lineWidth = lw; ctx.lineCap = 'round';
+  ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x, y); ctx.stroke();
+  if (e > .85){ ctx.translate(x, y); ctx.rotate(ang); ctx.beginPath(); ctx.moveTo(4, 0); ctx.lineTo(-14, -9); ctx.lineTo(-14, 9); ctx.closePath(); ctx.fill(); }
+  ctx.restore();
+}
+function panel(x, y, w, h, title, a){
+  box(x, y, w, h, a, {fill:C.panel, stroke:'rgba(255,255,255,.1)', r:20});
+  if (a <= 0) return;
+  ctx.save(); al(a); ctx.strokeStyle = 'rgba(255,255,255,.07)'; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(x, y + 52); ctx.lineTo(x + w, y + 52); ctx.stroke();
+  ['#ff6b6b','#ffd166','#6ee7a0'].forEach((c, i) => { ctx.fillStyle = c; ctx.globalAlpha = clamp(SA*a*.8); ctx.beginPath(); ctx.arc(x + 30 + i*24, y + 26, 7, 0, 6.283); ctx.fill(); });
+  ctx.restore();
+  txt(title, x + w/2, y + 27, {size:22, weight:500, color:C.muted, font:MONO, alpha:a});
+}
+
+/* ============ 背景 ============ */
+const PARTS = (() => { const r = rnd(107); return Array.from({length:100}, () => ({
+  x:r()*W, y:r()*H, s:r()*2.2+.5, v:r()*12+4, ph:r()*6.283, c:r()<.25})); })();
+function background(t){
+  const g = ctx.createLinearGradient(0,0,W,H);
+  g.addColorStop(0,'#0a0916'); g.addColorStop(.55,'#110f24'); g.addColorStop(1,'#18122c');
+  ctx.globalAlpha = 1; ctx.fillStyle = g; ctx.fillRect(0,0,W,H);
+  const gx = W*.5 + Math.sin(t*.27)*140;
+  const rg = ctx.createRadialGradient(gx, H*.45, 0, gx, H*.45, 950);
+  rg.addColorStop(0,'rgba(77,208,225,0.09)'); rg.addColorStop(1,'rgba(77,208,225,0)');
+  ctx.fillStyle = rg; ctx.fillRect(0,0,W,H);
+  ctx.fillStyle = C.acc;
+  for (let x = 40; x < W; x += 80) for (let y = 40; y < H; y += 80){ ctx.globalAlpha = .06; ctx.fillRect(x, y, 2, 2); }
+  for (const q of PARTS){
+    const y = ((q.y - t*q.v) % H + H) % H, x = q.x + Math.sin(t*.35 + q.ph)*12;
+    ctx.globalAlpha = .2 + .3*(.5 + .5*Math.sin(t*1.2 + q.ph));
+    ctx.fillStyle = q.c ? C.acc : '#d8d0ff';
+    ctx.beginPath(); ctx.arc(x, y, q.s, 0, 6.283); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+}
+function vignette(){
+  const v = ctx.createRadialGradient(W/2, H/2, W*.28, W/2, H/2, W*.62);
+  v.addColorStop(0,'rgba(0,0,0,0)'); v.addColorStop(1,'rgba(0,0,0,.55)');
+  ctx.globalAlpha = 1; ctx.fillStyle = v; ctx.fillRect(0,0,W,H);
+}
+function codeLine(s, x, y, size, a, kw = /\b(public|class|static|void|new|return)\b/){
+  const parts = s.split(/("[^"]*"|\b(?:public|class|static|void|new|return|getstatic|ldc|invokevirtual)\b)/g);
+  ctx.save(); al(a); ctx.font = `500 ${size}px ${MONO}`; ctx.textBaseline = 'middle'; ctx.textAlign = 'left';
+  let xx = x;
+  for (const seg of parts){ if (!seg) continue;
+    ctx.fillStyle = seg.startsWith('"') ? C.mint : /^(public|class|static|void|new|return|getstatic|ldc|invokevirtual)$/.test(seg) ? C.acc : C.text;
+    ctx.fillText(seg, xx, y); xx += ctx.measureText(seg).width; }
+  ctx.restore();
+}
+
+function lock(x, y, s, a, color = C.rose){
+  if (a <= 0) return;
+  ctx.save(); al(a); ctx.translate(x, y); ctx.scale(s, s); ctx.strokeStyle = color; ctx.fillStyle = color; ctx.lineWidth = 6;
+  ctx.beginPath(); ctx.arc(0, -14, 16, Math.PI, 0); ctx.stroke(); rr(-24, -14, 48, 38, 8); ctx.fill();
+  ctx.fillStyle = '#140f1f'; ctx.beginPath(); ctx.arc(0, 2, 5, 0, 6.283); ctx.fill(); ctx.restore();
+}
+function pill(s, x, y, a, o = {}){
+  const {size=30, color=C.text, stroke='rgba(255,255,255,.2)', fill='rgba(255,255,255,.05)', font=FONT, weight=700} = o;
+  if (a <= 0) return;
+  ctx.save(); ctx.font = `${weight} ${size}px ${font}`; const w = ctx.measureText(s).width + 52; ctx.restore();
+  box(x - w/2, y - size*.9, w, size*1.8, a, {fill, stroke, r:size*.9});
+  txt(s, x, y, {size, weight, color, font, alpha:a});
+}
+
+/* ============ 场景 1 · 钩子 (0–7s) ============ */
+function s1(t){
+  const a = eo(p(t, 0, .4));
+  box(160, 330, 340, 170, a, {stroke:'rgba(255,138,138,.6)'}); txt('事务 A', 330, 385, {size:36, weight:900, alpha:a}); txt('要修改这行', 330, 440, {size:28, weight:600, color:C.rose, alpha:a});
+  box(1420, 330, 340, 170, a, {stroke:'rgba(77,208,225,.6)'}); txt('事务 B', 1590, 385, {size:36, weight:900, alpha:a}); txt('要读取这行', 1590, 440, {size:28, weight:600, color:C.acc, alpha:a});
+  box(660, 365, 600, 100, a, {fill:'rgba(255,255,255,.06)', stroke:'rgba(255,255,255,.3)'});
+  txt('id = 1   余额 = 100', 960, 415, {size:36, weight:800, font:MONO, alpha:a});
+  arrow(505, 415, 650, 415, eo(p(t, .8, 1.3)), 1, C.rose, 4);
+  lock(960, 320, 1, eback(p(t, 1.2, 1.7)));
+  const b = eo(p(t, 2.0, 2.6));
+  arrow(1415, 415, lerp(1415, 1300, b), 415, b, 1, C.acc, 4);
+  if (t > 2.6){ txt('等待…', 1590, 550, {size:30, weight:800, color:C.gold, alpha:eo(p(t, 2.6, 3))});
+    ctx.save(); al(.9); ctx.strokeStyle = C.gold; ctx.lineWidth = 4; ctx.lineCap = 'round'; ctx.beginPath(); ctx.arc(1680, 550, 16, t*5, t*5 + 4.5); ctx.stroke(); ctx.restore(); }
+  rise('传统做法：加锁，读和写互相等待', W/2, 640, t, 3.0, {size:46, weight:900});
+  const k = p(t, 4.3, 4.9);
+  if (k > 0) txt('MVCC', W/2, 800, {size:130, weight:900, color:C.acc, glow:40, font:MONO, alpha:clamp(k*2), scale:eback(k)});
+  rise('让读和写互不阻塞', W/2, 940, t, 5.1, {size:44, weight:800, color:C.gold});
+}
+
+/* ============ 场景 2 · 多版本 (7–19s) ============ */
+const VERS = [['版本 1', '余额 100', 'trx_id = 10 · 已提交', 1], ['版本 2', '余额 200', 'trx_id = 20 · 已提交', 1], ['版本 3', '余额 300', 'trx_id = 30 · 未提交', 0]];
+function s2(t){
+  rise('核心思路：一行数据，保存多个版本', W/2, 115, t, 7.2, {size:58, weight:900});
+  arrow(380, 240, 1540, 240, eo(p(t, 7.8, 8.6)), .6, C.muted, 3);
+  txt('时间', 1580, 240, {size:26, weight:600, color:C.muted, align:'left', alpha:eo(p(t, 8.2, 8.6))});
+  VERS.forEach(([v, val, meta, done], i) => {
+    const st = 8.4 + i*.8, e = eback(p(t, st, st + .6)); if (e <= 0) return;
+    const cx = 560 + i*400;
+    ctx.save(); ctx.translate(cx, 390); ctx.scale(e, e); ctx.translate(-cx, -390);
+    box(cx - 180, 300, 360, 180, clamp(e), done ? {fill:'rgba(77,208,225,.10)', stroke:C.acc} : {fill:'rgba(255,255,255,.03)', stroke:'rgba(255,211,138,.7)', dash:[8, 8]}); ctx.restore();
+    txt(v, cx, 335, {size:24, weight:600, color:C.muted, alpha:clamp(e)});
+    txt(val, cx, 392, {size:46, weight:900, color:done ? C.text : C.gold, alpha:clamp(e)});
+    txt(meta, cx, 448, {size:24, weight:600, font:MONO, color:done ? C.acc : C.gold, alpha:clamp(e)});
+  });
+  [['很早就开始的事务', 0], ['刚开始的事务', 1], ['事务 30 自己', 2]].forEach(([s, k], i) => {
+    const st = 11.4 + i*.9, e = eo(p(t, st, st + .5)), x = 560 + k*400;
+    arrow(x, 600, x, 495, e, e, C.gold, 3);
+    pill(s, x, 640, e, {size:28, color:C.gold, stroke:'rgba(255,211,138,.5)'});
+  });
+  rise('每个事务，只看到自己「该看」的那个版本', W/2, 800, t, 14.6, {size:46, weight:900});
+  rise('MVCC：Multi-Version Concurrency Control，多版本并发控制', W/2, 875, t, 16.0, {size:30, weight:600, color:C.muted});
+}
+
+/* ============ 场景 3 · 隐藏列与版本链 (19–35s) ============ */
+const COLS = [['id', 160], ['name', 220], ['余额', 220], ['DB_TRX_ID', 300], ['DB_ROLL_PTR', 300]];
+function s3(t){
+  rise('版本链是怎么串起来的？', W/2, 105, t, 19.2, {size:58, weight:900});
+  const ta = eo(p(t, 19.8, 20.4)), x0 = 400;
+  let x = x0; const cx = [];
+  COLS.forEach(([c, w]) => { cx.push(x + w/2); x += w; });
+  box(x0 + 680, 180, 600, 230, eo(p(t, 21.0, 21.5)), {fill:'rgba(77,208,225,.07)', stroke:'rgba(77,208,225,.45)', dash:[8, 6], r:14});
+  txt('隐藏列', x0 + 980, 200, {size:24, weight:800, color:C.acc, alpha:eo(p(t, 21.0, 21.5))});
+  box(x0, 220, 1200, 180, ta, {stroke:'rgba(255,255,255,.18)', r:12});
+  ctx.save(); al(ta*.5); ctx.strokeStyle = 'rgba(255,255,255,.18)'; ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(x0, 300); ctx.lineTo(x0 + 1200, 300); ctx.stroke(); ctx.restore();
+  COLS.forEach(([c], i) => txt(c, cx[i], 260, {size:26, weight:700, font:MONO, color:i >= 3 ? C.acc : C.muted, alpha:ta}));
+  const st2 = t > 23.2, st3 = t > 26.6;
+  const val = st3 ? '300' : st2 ? '200' : '100', trx = st3 ? '30' : st2 ? '20' : '10';
+  const flash = Math.max(1 - p(t, 23.2, 24), t > 26.6 ? 1 - p(t, 26.6, 27.4) : 0);
+  if (flash > 0 && t > 23.2){ ctx.save(); al(flash*.5); ctx.fillStyle = C.acc; rr(x0 + 382, 306, 816, 88, 10); ctx.fill(); ctx.restore(); }
+  ['1', '张三', val, trx].forEach((v, i) => txt(v, cx[i], 350, {size:32, weight:800, font:MONO, alpha:ta}));
+  const hasPtr = t > 23.2;
+  txt(hasPtr ? '● ↓' : 'NULL', cx[4], 350, {size:30, weight:800, font:MONO, color:hasPtr ? C.acc : C.muted, alpha:ta});
+  pill('UPDATE 余额 = 200  —  事务 20', W/2, 470, Math.min(eo(p(t, 22.4, 22.8)), 1 - p(t, 25.4, 25.8)), {size:28, font:MONO, color:C.gold, stroke:'rgba(255,211,138,.5)'});
+  pill('UPDATE 余额 = 300  —  事务 30', W/2, 470, eo(p(t, 25.8, 26.2)), {size:28, font:MONO, color:C.gold, stroke:'rgba(255,211,138,.5)'});
+  txt('undo log', 400, 560, {size:28, weight:800, font:MONO, color:C.muted, align:'left', alpha:eo(p(t, 23, 23.5))});
+  const mv = eio(p(t, 26.6, 27.4));
+  const cards = [];
+  if (t > 23.2) cards.push({val:'100', trx:'10', x:lerp(760, 1240, mv), e:eback(p(t, 23.2, 23.8))});
+  if (t > 26.6) cards.push({val:'200', trx:'20', x:760, e:eback(p(t, 27.2, 27.8))});
+  cards.forEach(c => {
+    if (c.e <= 0) return;
+    box(c.x - 180, 600, 360, 130, clamp(c.e), {fill:'rgba(255,255,255,.05)', stroke:'rgba(77,208,225,.5)'});
+    txt('余额 ' + c.val, c.x, 645, {size:36, weight:900, alpha:clamp(c.e)});
+    txt('trx_id = ' + c.trx, c.x, 695, {size:24, weight:600, font:MONO, color:C.acc, alpha:clamp(c.e)});
+  });
+  if (t > 23.4) arrow(cx[4], 395, 790, 595, eo(p(t, 23.4, 24.0)), 1, C.acc, 3);
+  if (t > 27.6) arrow(940, 665, 1056, 665, eo(p(t, 27.6, 28.1)), 1, C.acc, 3);
+  txt('最新', 760, 760, {size:22, weight:600, color:C.muted, alpha:eo(p(t, 28, 28.4))});
+  txt('更旧', 1240, 760, {size:22, weight:600, color:C.muted, alpha:eo(p(t, 28, 28.4))});
+  rise('每次修改：旧版本写进 undo log，用回滚指针串成「版本链」', W/2, 860, t, 29.6, {size:40, weight:900});
+  rise('DB_TRX_ID：最后修改它的事务　·　DB_ROLL_PTR：指向上一个版本', W/2, 930, t, 31.2, {size:30, weight:600, color:C.muted});
+}
+
+/* ============ 场景 4 · ReadView (35–53s) ============ */
+const RULES = [['① trx_id = 自己', '可见'], ['② trx_id < min_trx_id', '早已提交，可见'], ['③ trx_id ≥ max_trx_id', '之后才开始，不可见'], ['④ 介于两者之间', '在 m_ids 里不可见，否则可见']];
+const CHAIN = [['余额 300', 30, '30 在 m_ids 里 → 不可见', 4, 0], ['余额 200', 20, '20 在 m_ids 里 → 不可见', 4, 0], ['余额 100', 10, '10 < 20 → 可见', 2, 1]];
+function s4(t){
+  rise('ReadView：判断哪个版本可见', W/2, 100, t, 35.2, {size:58, weight:900});
+  const ra = eo(p(t, 35.8, 36.3));
+  panel(110, 170, 640, 300, 'ReadView（快照）', ra);
+  [['m_ids', '[20, 25, 30]', '活跃中的事务'], ['min_trx_id', '20', '其中最小的'], ['max_trx_id', '31', '下一个要分配的 ID'], ['creator_trx_id', '25', '我自己']].forEach(([k, v, note], i) => {
+    const e = eo(p(t, 36.2 + i*.3, 36.6 + i*.3)), y = 265 + i*52;
+    txt(k + ' = ' + v, 145, y, {size:26, weight:700, font:MONO, color:i === 0 ? C.acc : C.text, align:'left', alpha:e});
+    txt(note, 720, y, {size:22, weight:500, color:C.muted, align:'right', alpha:e});
+  });
+  const step = t < 42.4 ? -1 : t < 44.4 ? 0 : t < 46.4 ? 1 : 2, ruleOn = step >= 0 ? CHAIN[step][3] : -1;
+  RULES.forEach(([a, b], i) => {
+    const e = eo(p(t, 37.6 + i*.35, 38.1 + i*.35)), y = 540 + i*95, on = ruleOn === i + 1;
+    box(110, y - 40, 640, 80, e, on ? {fill:'rgba(77,208,225,.14)', stroke:C.acc, lw:3, glow:16} : {stroke:'rgba(255,255,255,.12)'});
+    txt(a, 135, y - 12, {size:26, weight:800, font:MONO, align:'left', alpha:e});
+    txt(b, 135, y + 20, {size:22, weight:600, color:on ? C.acc : C.muted, align:'left', alpha:e});
+  });
+  // 事务 ID 数轴
+  const la = eo(p(t, 39.2, 39.8)), X = v => lerp(840, 1780, v/36);
+  [[0, 20, 'rgba(110,231,200,.25)', '可见'], [20, 31, 'rgba(255,211,138,.25)', '查 m_ids'], [31, 36, 'rgba(255,138,138,.25)', '不可见']].forEach(([a, b, c, s]) => {
+    ctx.save(); al(la); ctx.fillStyle = c; ctx.fillRect(X(a), 200, X(b) - X(a), 44); ctx.restore();
+    txt(s, (X(a) + X(b))/2, 222, {size:22, weight:800, alpha:la});
+  });
+  [10, 20, 25, 30, 31].forEach(v => { txt(String(v), X(v), v === 31 ? 296 : 272, {size:22, weight:700, font:MONO, color:v === 25 ? C.gold : C.muted, alpha:la});
+    ctx.save(); al(la*.6); ctx.fillStyle = C.text; ctx.fillRect(X(v) - 1, 196, 2, 52); ctx.restore(); });
+  txt('事务 ID', 840, 172, {size:22, weight:600, color:C.muted, align:'left', alpha:la});
+  // 沿版本链查找
+  CHAIN.forEach(([v, id, note, , ok], i) => {
+    const e = eo(p(t, 40.4 + i*.3, 40.9 + i*.3)), x = 975 + i*350, on = step === i;
+    box(x - 135, 360, 270, 120, e, on ? {fill:ok ? 'rgba(110,231,200,.16)' : 'rgba(255,138,138,.14)', stroke:ok ? C.mint : C.rose, lw:3, glow:18} : {stroke:'rgba(77,208,225,.4)'});
+    txt(v, x, 400, {size:34, weight:900, alpha:e}); txt('trx_id = ' + id, x, 448, {size:22, weight:600, font:MONO, color:C.acc, alpha:e});
+    if (i < 2) arrow(x + 140, 420, x + 208, 420, e, e, C.acc, 3);
+    if (step >= i){ const k = eo(p(t, 42.6 + i*2, 43 + i*2));
+      txt(ok ? '✓' : '✗', x, 540, {size:48, weight:900, color:ok ? C.mint : C.rose, alpha:k});
+      txt(note, x, 600, {size:24, weight:700, color:ok ? C.mint : C.rose, alpha:k}); }
+  });
+  txt('从最新版本开始', 975, 330, {size:22, weight:600, color:C.muted, alpha:eo(p(t, 41, 41.5))});
+  rise('读到：余额 = 100', 1310, 720, t, 47.8, {size:56, weight:900, color:C.acc, glow:20});
+  rise('顺着版本链往回找，直到遇到第一个「可见」的版本', W/2, 960, t, 49.4, {size:38, weight:800});
+}
+
+/* ============ 场景 5 · RC vs RR (53–68s) ============ */
+const TL = [['① 事务 A 开始', '', ''], ['② A：SELECT 余额', '100', '100'], ['③ 事务 B：UPDATE 余额 = 200，提交', '', ''], ['④ A：再次 SELECT 余额', '200', '100']];
+function s5(t){
+  rise('RC 和 RR：差在 ReadView 什么时候生成', W/2, 105, t, 53.2, {size:54, weight:900});
+  const ha = eo(p(t, 53.8, 54.3));
+  txt('读已提交 RC', 1180, 220, {size:34, weight:900, color:C.gold, alpha:ha});
+  txt('可重复读 RR', 1600, 220, {size:34, weight:900, color:C.acc, alpha:ha});
+  TL.forEach(([s, rc, rrv], i) => {
+    const st = 54.4 + i*1.3, e = eo(p(t, st, st + .5)), y = 310 + i*105;
+    box(110, y - 42, 840, 84, e, {stroke:i === 2 ? 'rgba(255,138,138,.5)' : 'rgba(255,255,255,.14)'});
+    txt(s, 140, y, {size:30, weight:800, color:i === 2 ? C.rose : C.text, align:'left', alpha:e});
+    if (rc){ const k = eback(p(t, st + .4, st + .9));
+      pill(rc, 1180, y, clamp(k), {size:36, font:MONO, color:i === 3 ? C.gold : C.text, stroke:i === 3 ? C.gold : 'rgba(255,255,255,.2)', weight:900});
+      pill(rrv, 1600, y, clamp(k), {size:36, font:MONO, color:i === 3 ? C.acc : C.text, stroke:i === 3 ? C.acc : 'rgba(255,255,255,.2)', weight:900}); }
+  });
+  txt('新建 ReadView，看到 B 的提交', 1180, 690, {size:22, weight:700, color:C.gold, alpha:eo(p(t, 59.2, 59.7))});
+  txt('复用第一次的 ReadView', 1600, 690, {size:22, weight:700, color:C.acc, alpha:eo(p(t, 59.2, 59.7))});
+  rise('RC：每次 SELECT 都生成新的 ReadView', W/2, 790, t, 60.6, {size:38, weight:800, color:C.gold});
+  rise('RR：事务里第一次 SELECT 时生成，之后一直复用', W/2, 855, t, 61.8, {size:38, weight:800, color:C.acc});
+  rise('InnoDB 默认是 RR，所以同一个事务里多次读，结果一致', W/2, 950, t, 63.4, {size:34, weight:600, color:C.muted});
+}
+
+/* ============ 场景 6 · 快照读与当前读 (68–75s) ============ */
+function s6(t){
+  rise('两个要分清的概念', W/2, 115, t, 68.2, {size:58, weight:900});
+  [['快照读', ['普通的 SELECT', '读 ReadView 能看到的版本', '不加锁'], C.acc], ['当前读', ['SELECT … FOR UPDATE、UPDATE、DELETE', '读最新的版本', '并且加锁'], C.gold]].forEach(([h, lines, c], i) => {
+    const st = 68.6 + i*.6, e = eback(p(t, st, st + .6)); if (e <= 0) return;
+    const x = 160 + i*840;
+    ctx.save(); ctx.translate(x + 380, 400); ctx.scale(e, e); ctx.translate(-(x + 380), -400);
+    box(x, 220, 760, 360, clamp(e), {fill:'rgba(255,255,255,.04)', stroke:c, r:28}); ctx.restore();
+    txt(h, x + 380, 290, {size:52, weight:900, color:c, alpha:clamp(e)});
+    lines.forEach((l, k) => txt(l, x + 380, 385 + k*62, {size:k === 0 ? 30 : 30, weight:k === 0 ? 800 : 600, font:k === 0 ? MONO : FONT, color:k === 0 ? C.text : C.muted, alpha:clamp(e)}));
+  });
+  rise('⚠ 长事务会一直「抓着」旧版本，undo log 无法清理，越积越多', W/2, 700, t, 70.8, {size:36, weight:800, color:C.rose});
+  rise('所以：事务要尽量短', W/2, 790, t, 72.0, {size:44, weight:900, color:C.gold, glow:14});
+}
+
+/* ============ 场景 7 · 收尾 (75–80s) ============ */
+function s7(t){
+  const items = ['隐藏列', 'undo 版本链', 'ReadView'];
+  items.forEach((s, i) => { const e = eback(p(t, 75.2 + i*.4, 75.8 + i*.4)); const x = 520 + i*440;
+    if (e > 0){ ctx.save(); ctx.translate(x, 360); ctx.scale(e, e); ctx.translate(-x, -360);
+      box(x - 180, 290, 360, 140, clamp(e), {fill:'rgba(77,208,225,.10)', stroke:C.acc, r:24}); ctx.restore();
+      txt(s, x, 360, {size:42, weight:900, alpha:clamp(e)}); }
+    if (i > 0) txt('+', x - 220, 360, {size:64, weight:300, color:C.acc, alpha:clamp(e)});
+  });
+  rise('= MVCC', W/2, 560, t, 76.6, {size:100, weight:900, color:C.acc, glow:30, font:MONO});
+  rise('关注我，一起搞懂后端', W/2, 740, t, 77.4, {size:36, weight:500, color:C.muted});
+}
+
+/* ============ 总调度 ============ */
+const SCENES = [[s1,-1,7],[s2,7,19],[s3,19,35],[s4,35,53],[s5,53,68],[s6,68,75],[s7,75,80]];
+function draw(t){
+  t = clamp(t, 0, DUR);
+  ctx.save(); ctx.globalAlpha = 1; ctx.clearRect(0,0,W,H); background(t);
+  for (const [fn,a,b] of SCENES){
+    if (t < a || t > b) continue;
+    SA = sceneA(t, a, b, b === DUR ? .8 : .5);
+    if (SA > 0){ ctx.save(); fn(t); ctx.restore(); }
+  }
+  SA = 1; vignette();
+  const fo = p(t, DUR - .8, DUR);
+  if (fo > 0){ ctx.globalAlpha = fo; ctx.fillStyle = '#000'; ctx.fillRect(0,0,W,H); }
+  ctx.restore();
+}
+
+/* ============ 播放器 / 逐帧渲染接口 ============ */
+const isRender = new URLSearchParams(location.search).has('render');
+window.DURATION = DUR;
+window.renderFrame = t => draw(t);
+const btn = document.getElementById('btn'), seek = document.getElementById('seek'), timeEl = document.getElementById('time');
+const fmt = s => `${Math.floor(s/60)}:${String(Math.floor(s%60)).padStart(2,'0')}`;
+function fit(){
+  if (isRender){ cv.style.width = W+'px'; cv.style.height = H+'px'; return; }
+  const w = Math.min(innerWidth - 32, (innerHeight - 84)*16/9);
+  cv.style.width = w + 'px'; cv.style.height = w*9/16 + 'px';
+}
+addEventListener('resize', fit); fit();
+
+let cur = 0, playing = !isRender, last = null;
+function toggle(){ if (cur >= DUR) cur = 0; playing = !playing; }
+btn.onclick = toggle; cv.onclick = toggle;
+addEventListener('keydown', e => { if (e.code === 'Space'){ e.preventDefault(); toggle(); } });
+seek.oninput = () => { cur = +seek.value; draw(cur); };
+function loop(ts){
+  if (playing && last != null){ cur += (ts - last)/1000; if (cur >= DUR){ cur = DUR; playing = false; } }
+  last = ts; draw(cur);
+  seek.value = cur; timeEl.textContent = `${fmt(cur)} / ${fmt(DUR)}`;
+  btn.textContent = playing ? '❚❚' : (cur >= DUR ? '↺' : '▶');
+  requestAnimationFrame(loop);
+}
+document.fonts.ready.then(() => {
+  window.ready = true;
+  if (isRender) draw(0); else requestAnimationFrame(loop);
+});
+</script>
+</body>
+</html>
