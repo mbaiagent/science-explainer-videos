@@ -1,0 +1,357 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>RAG 是什么</title>
+<style>
+  :root{--bg:#07080f;--fg:#f4ede4;--muted:#9a93a8;--acc:#7cc7ff}
+  html,body{margin:0;height:100%;background:var(--bg);color:var(--fg);
+    font-family:-apple-system,"PingFang SC","Noto Sans SC","Noto Sans CJK SC","Microsoft YaHei",sans-serif}
+  body{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;overflow:hidden}
+  #stage{display:block;background:#07080f;border-radius:12px;box-shadow:0 20px 60px rgba(0,0,0,.55);cursor:pointer}
+  #bar{display:flex;align-items:center;gap:12px;width:min(calc(100vw - 32px),640px)}
+  #btn{width:40px;height:40px;border-radius:50%;border:1px solid rgba(124,199,255,.5);background:transparent;
+    color:var(--acc);font-size:16px;cursor:pointer;flex:none}
+  #seek{flex:1;accent-color:var(--acc)}
+  #time{font-variant-numeric:tabular-nums;font-size:13px;color:var(--muted);min-width:84px;text-align:right}
+  body.render{display:block}
+  body.render #bar{display:none}
+  body.render #stage{border-radius:0;box-shadow:none}
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="bar">
+  <button id="btn" aria-label="播放/暂停">❚❚</button>
+  <input id="seek" type="range" min="0" max="72" step="0.01" value="0">
+  <span id="time">0:00 / 1:12</span>
+</div>
+<script>
+/* ============ 基础设置（横屏 1920×1080） ============ */
+const W = 1920, H = 1080, DUR = 72;
+const cv = document.getElementById('stage'), ctx = cv.getContext('2d');
+cv.width = W; cv.height = H;
+const FONT = '"PingFang SC","Noto Sans SC","Noto Sans CJK SC","Source Han Sans SC","Microsoft YaHei",sans-serif';
+const MONO = '"JetBrains Mono","SF Mono",Menlo,Consolas,"DejaVu Sans Mono","Noto Sans Mono CJK SC","PingFang SC","Microsoft YaHei",monospace';
+const C = {acc:'#7cc7ff', mint:'#6ee7c8', gold:'#ffd38a', coral:'#ff9e7a', rose:'#ff8a8a', blue:'#9cc3ff', text:'#f4ede4', muted:'#9a93a8', dim:'#4a4558', panel:'#0f0e1f'};
+
+const clamp = (x,a=0,b=1) => Math.max(a, Math.min(b, x));
+const lerp = (a,b,t) => a + (b-a)*t;
+const p = (t,a,b) => clamp((t-a)/(b-a));
+const eo = x => 1 - Math.pow(1-x, 3);
+const eio = x => x < .5 ? 4*x*x*x : 1 - Math.pow(-2*x+2, 3)/2;
+const eback = x => { const c1=1.70158, c3=c1+1; return 1 + c3*Math.pow(x-1,3) + c1*Math.pow(x-1,2); };
+function rnd(seed){ let s = seed>>>0; return () => { s = (s*1664525 + 1013904223)>>>0; return s/4294967296; }; }
+
+let SA = 1;
+const al = a => { ctx.globalAlpha = clamp(SA*a); };
+const sceneA = (t,a,b,f=.5) => Math.min(p(t,a,a+f), 1 - p(t,b-f,b));
+
+function txt(s, x, y, o = {}){
+  const {size=64, weight=700, color=C.text, alpha=1, align='center', glow=0, scale=1, font=FONT} = o;
+  if (alpha <= 0) return;
+  ctx.save(); al(alpha);
+  ctx.font = `${weight} ${size}px ${font}`;
+  ctx.textAlign = align; ctx.textBaseline = 'middle'; ctx.fillStyle = color;
+  if (glow){ ctx.shadowColor = color; ctx.shadowBlur = glow; }
+  if (scale !== 1){ ctx.translate(x, y); ctx.scale(scale, scale); ctx.fillText(s, 0, 0); }
+  else ctx.fillText(s, x, y);
+  ctx.restore();
+}
+function rise(s, x, y, t, t0, o = {}, d = .7){
+  const e = eo(p(t, t0, t0+d));
+  if (e <= 0) return;
+  txt(s, x, y + (1-e)*36, {...o, alpha:(o.alpha ?? 1)*e});
+}
+function rr(x,y,w,h,r){ ctx.beginPath(); ctx.roundRect(x,y,w,h,r); }
+function box(x, y, w, h, a, o = {}){
+  const {fill='rgba(255,255,255,.05)', stroke='rgba(124,199,255,.35)', lw=2, glow=0, r=18, dash=null} = o;
+  if (a <= 0) return;
+  ctx.save(); al(a); rr(x, y, w, h, r); ctx.fillStyle = fill; ctx.fill();
+  if (dash) ctx.setLineDash(dash);
+  ctx.strokeStyle = stroke; ctx.lineWidth = lw; if (glow){ ctx.shadowColor = stroke; ctx.shadowBlur = glow; } ctx.stroke(); ctx.restore();
+}
+function arrow(x1, y1, x2, y2, e, a, color = C.acc, lw = 3){
+  if (e <= 0 || a <= 0) return;
+  const x = lerp(x1, x2, e), y = lerp(y1, y2, e), ang = Math.atan2(y2 - y1, x2 - x1);
+  ctx.save(); al(a); ctx.strokeStyle = color; ctx.fillStyle = color; ctx.lineWidth = lw; ctx.lineCap = 'round';
+  ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x, y); ctx.stroke();
+  if (e > .85){ ctx.translate(x, y); ctx.rotate(ang); ctx.beginPath(); ctx.moveTo(4, 0); ctx.lineTo(-14, -9); ctx.lineTo(-14, 9); ctx.closePath(); ctx.fill(); }
+  ctx.restore();
+}
+function panel(x, y, w, h, title, a){
+  box(x, y, w, h, a, {fill:C.panel, stroke:'rgba(255,255,255,.1)', r:20});
+  if (a <= 0) return;
+  ctx.save(); al(a); ctx.strokeStyle = 'rgba(255,255,255,.07)'; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(x, y + 52); ctx.lineTo(x + w, y + 52); ctx.stroke();
+  ['#ff6b6b','#ffd166','#6ee7a0'].forEach((c, i) => { ctx.fillStyle = c; ctx.globalAlpha = clamp(SA*a*.8); ctx.beginPath(); ctx.arc(x + 30 + i*24, y + 26, 7, 0, 6.283); ctx.fill(); });
+  ctx.restore();
+  txt(title, x + w/2, y + 27, {size:22, weight:500, color:C.muted, font:MONO, alpha:a});
+}
+
+/* ============ 背景 ============ */
+const PARTS = (() => { const r = rnd(61); return Array.from({length:100}, () => ({
+  x:r()*W, y:r()*H, s:r()*2.2+.5, v:r()*12+4, ph:r()*6.283, c:r()<.25})); })();
+function background(t){
+  const g = ctx.createLinearGradient(0,0,W,H);
+  g.addColorStop(0,'#08101a'); g.addColorStop(.55,'#0d1424'); g.addColorStop(1,'#14142c');
+  ctx.globalAlpha = 1; ctx.fillStyle = g; ctx.fillRect(0,0,W,H);
+  const gx = W*.5 + Math.sin(t*.27)*140;
+  const rg = ctx.createRadialGradient(gx, H*.45, 0, gx, H*.45, 950);
+  rg.addColorStop(0,'rgba(124,199,255,0.08)'); rg.addColorStop(1,'rgba(124,199,255,0)');
+  ctx.fillStyle = rg; ctx.fillRect(0,0,W,H);
+  ctx.fillStyle = C.acc;
+  for (let x = 40; x < W; x += 80) for (let y = 40; y < H; y += 80){ ctx.globalAlpha = .06; ctx.fillRect(x, y, 2, 2); }
+  for (const q of PARTS){
+    const y = ((q.y - t*q.v) % H + H) % H, x = q.x + Math.sin(t*.35 + q.ph)*12;
+    ctx.globalAlpha = .2 + .3*(.5 + .5*Math.sin(t*1.2 + q.ph));
+    ctx.fillStyle = q.c ? C.acc : '#d8d0ff';
+    ctx.beginPath(); ctx.arc(x, y, q.s, 0, 6.283); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+}
+function vignette(){
+  const v = ctx.createRadialGradient(W/2, H/2, W*.28, W/2, H/2, W*.62);
+  v.addColorStop(0,'rgba(0,0,0,0)'); v.addColorStop(1,'rgba(0,0,0,.55)');
+  ctx.globalAlpha = 1; ctx.fillStyle = v; ctx.fillRect(0,0,W,H);
+}
+function codeLine(s, x, y, size, a, kw = /\b(public|class|static|void|new|return)\b/){
+  const parts = s.split(/("[^"]*"|\b(?:public|class|static|void|new|return|getstatic|ldc|invokevirtual)\b)/g);
+  ctx.save(); al(a); ctx.font = `500 ${size}px ${MONO}`; ctx.textBaseline = 'middle'; ctx.textAlign = 'left';
+  let xx = x;
+  for (const seg of parts){ if (!seg) continue;
+    ctx.fillStyle = seg.startsWith('"') ? C.mint : /^(public|class|static|void|new|return|getstatic|ldc|invokevirtual)$/.test(seg) ? C.acc : C.text;
+    ctx.fillText(seg, xx, y); xx += ctx.measureText(seg).width; }
+  ctx.restore();
+}
+
+/* ============ 场景 1 · 钩子 (0–7s) ============ */
+function measure(s, size, weight, font = FONT){ ctx.save(); ctx.font = `${weight} ${size}px ${font}`; const w = ctx.measureText(s).width; ctx.restore(); return w; }
+function bubble(s, side, y, t, t0, typing = 0){
+  const e = eback(p(t, t0, t0 + .5)); if (e <= 0) return;
+  const size = 36, w = measure(s, size, 600) + 64, h = 76;
+  const x = side === 'r' ? 1400 - w : 520;
+  ctx.save(); ctx.translate(x + (side === 'r' ? w : 0), y); ctx.scale(e, e); al(clamp(e));
+  const bx = side === 'r' ? -w : 0;
+  rr(bx, -h/2, w, h, 26);
+  ctx.fillStyle = side === 'r' ? 'rgba(124,199,255,.18)' : 'rgba(255,255,255,.07)'; ctx.fill();
+  ctx.strokeStyle = side === 'r' ? 'rgba(124,199,255,.5)' : 'rgba(255,255,255,.12)'; ctx.lineWidth = 2; ctx.stroke();
+  ctx.font = `600 ${size}px ${FONT}`; ctx.textBaseline = 'middle'; ctx.textAlign = 'left'; ctx.fillStyle = C.text;
+  if (typing && t < t0 + typing){
+    for (let i = 0; i < 3; i++){ ctx.globalAlpha = clamp(SA*(.3 + .7*(.5 + .5*Math.sin(t*10 - i)))); ctx.beginPath(); ctx.arc(bx + 40 + i*26, 0, 7, 0, 6.283); ctx.fill(); }
+  } else ctx.fillText(s, bx + 32, 2);
+  ctx.restore();
+}
+function s1(t){
+  bubble('我们公司出差，住宿能报多少钱？', 'r', 190, t, .3);
+  bubble('抱歉，我无法得知贵公司的内部规定……', 'l', 300, t, 1.0, .8);
+  rise('大模型再聪明，也没读过你公司的文档', W/2, 480, t, 2.4, {size:52, weight:900});
+  const k = p(t, 3.8, 4.4);
+  if (k > 0) txt('R A G', W/2, 680, {size:150, weight:900, color:C.acc, glow:40, alpha:clamp(k*2), scale:eback(k)});
+  rise('先查资料，再回答', W/2, 840, t, 4.8, {size:48, weight:800, color:C.gold});
+}
+
+/* ============ 场景 2 · 开卷考试 (7–20s) ============ */
+function s2(t){
+  rise('RAG 就像一场「开卷考试」', W/2, 120, t, 7.2, {size:60, weight:900});
+  // 左：闭卷
+  const la = eo(p(t, 8.2, 8.8));
+  box(160, 210, 740, 420, la, {stroke:'rgba(255,255,255,.15)', r:26});
+  txt('普通 LLM · 闭卷', 530, 265, {size:38, weight:900, color:C.muted, alpha:la});
+  ctx.save(); al(la); ctx.strokeStyle = C.muted; ctx.lineWidth = 4; ctx.beginPath(); ctx.arc(530, 400, 70, 0, 6.283); ctx.stroke(); ctx.restore();
+  txt('?', 530, 402, {size:80, weight:900, color:C.muted, alpha:la*(.6 + .4*Math.sin(t*4))});
+  txt('只能靠训练时记住的东西', 530, 530, {size:32, weight:700, alpha:la});
+  txt('不知道的，可能会编', 530, 580, {size:30, weight:600, color:C.rose, alpha:eo(p(t, 9.4, 9.9))});
+  // 右：开卷
+  const ra = eo(p(t, 10.2, 10.8));
+  box(1020, 210, 740, 420, ra, {stroke:C.acc, glow:16, r:26});
+  txt('RAG · 开卷', 1390, 265, {size:38, weight:900, color:C.acc, alpha:ra});
+  for (let i = 0; i < 3; i++){                       // 书页
+    const fl = Math.sin(t*2 + i)*4;
+    box(1320 + i*18, 335 + i*14 + fl, 120, 140, ra, {fill:'rgba(124,199,255,.12)', stroke:'rgba(124,199,255,.6)', r:8});
+  }
+  ctx.save(); al(ra*.7); ctx.strokeStyle = C.acc; ctx.lineWidth = 3;
+  for (let k = 0; k < 4; k++){ ctx.beginPath(); ctx.moveTo(1373, 395 + k*22); ctx.lineTo(1458, 395 + k*22); ctx.stroke(); } ctx.restore();
+  txt('先翻资料，找到相关内容', 1390, 530, {size:32, weight:700, alpha:ra});
+  txt('照着资料回答，有据可查', 1390, 580, {size:30, weight:600, color:C.mint, alpha:eo(p(t, 11.4, 11.9))});
+  // 缩写拆解
+  [['R','Retrieval','检索'],['A','Augmented','增强'],['G','Generation','生成']].forEach(([l, en, zh], i) => {
+    const st = 13.6 + i*.5, e = eback(p(t, st, st + .6)); if (e <= 0) return;
+    const x = 560 + i*400;
+    txt(l, x - 80, 790, {size:96, weight:900, color:C.acc, glow:24, alpha:clamp(e), scale:e});
+    txt(zh, x + 10, 768, {size:44, weight:900, align:'left', alpha:clamp(e)});
+    txt(en, x + 10, 822, {size:26, weight:500, color:C.muted, font:MONO, align:'left', alpha:clamp(e)});
+  });
+  rise('检索增强生成：先检索，用检索结果增强提示词，再生成答案', W/2, 940, t, 15.6, {size:32, weight:600, color:C.muted});
+}
+
+/* ============ 场景 3 · 建索引 (20–36s) ============ */
+const VEC = (() => { const r = rnd(21); return Array.from({length:6}, () => '[' + Array.from({length:3}, () => (r()*2 - 1).toFixed(2)).join(', ') + ', …]'); })();
+function s3(t){
+  rise('第一步：把资料变成「向量」', W/2, 115, t, 20.2, {size:60, weight:900});
+  // 文档
+  ['报销制度.pdf', '员工手册.docx', '产品文档.md'].forEach((s, i) => {
+    const e = eo(p(t, 20.8 + i*.25, 21.3 + i*.25));
+    box(120 + i*18, 300 + i*90, 260, 76, e, {fill:'#121a2c', stroke:'rgba(255,255,255,.18)', r:12});
+    txt(s, 250 + i*18, 338 + i*90, {size:24, weight:700, font:MONO, alpha:e});
+  });
+  arrow(430, 450, 500, 450, eo(p(t, 22.0, 22.5)), 1);
+  txt('切块', 465, 415, {size:26, weight:800, color:C.acc, alpha:eo(p(t, 22.0, 22.5))});
+  for (let i = 0; i < 6; i++){
+    const e = eo(p(t, 22.4 + i*.18, 22.8 + i*.18)), y = 255 + i*68;
+    box(520, y, 220, 54, e, {fill:'rgba(124,199,255,.08)', stroke:'rgba(124,199,255,.4)', r:10});
+    txt(`片段 ${i + 1}`, 545, y + 27, {size:22, weight:700, align:'left', alpha:e});
+    ctx.save(); al(e*.5); ctx.fillStyle = C.muted; ctx.fillRect(640, y + 20, 80, 4); ctx.fillRect(640, y + 32, 56, 4); ctx.restore();
+  }
+  arrow(760, 470, 830, 470, eo(p(t, 24.0, 24.5)), 1);
+  const ea = eback(p(t, 24.3, 24.9));
+  if (ea > 0){ ctx.save(); ctx.translate(960, 470); ctx.scale(ea, ea); ctx.translate(-960, -470);
+    box(840, 400, 240, 140, clamp(ea), {fill:'rgba(124,199,255,.18)', stroke:C.acc, lw:3, glow:24}); ctx.restore();
+    txt('Embedding', 960, 450, {size:30, weight:800, font:MONO, color:C.acc, alpha:clamp(ea)}); txt('向量模型', 960, 495, {size:26, weight:600, color:C.muted, alpha:clamp(ea)}); }
+  arrow(1090, 470, 1150, 470, eo(p(t, 25.4, 25.9)), 1);
+  VEC.forEach((v, i) => txt(v, 1165, 282 + i*68, {size:22, weight:500, font:MONO, color:i % 2 ? C.acc : C.text, align:'left', alpha:eo(p(t, 25.8 + i*.18, 26.2 + i*.18))}));
+  arrow(1500, 470, 1560, 470, eo(p(t, 27.2, 27.7)), 1);
+  const da = eo(p(t, 27.6, 28.2));                // 数据库圆柱
+  if (da > 0){ ctx.save(); al(da); ctx.strokeStyle = C.acc; ctx.lineWidth = 3; ctx.fillStyle = 'rgba(124,199,255,.10)';
+    const cx = 1680, top = 360, bot = 580, rx = 110, ry = 30;
+    ctx.beginPath(); ctx.ellipse(cx, bot, rx, ry, 0, 0, Math.PI); ctx.lineTo(cx - rx, top); ctx.ellipse(cx, top, rx, ry, 0, Math.PI, 0, true); ctx.closePath(); ctx.fill(); ctx.stroke();
+    ctx.beginPath(); ctx.ellipse(cx, top, rx, ry, 0, 0, 6.283); ctx.stroke();
+    for (const yy of [440, 510]){ ctx.beginPath(); ctx.ellipse(cx, yy, rx, ry, 0, 0, Math.PI); ctx.stroke(); }
+    ctx.restore();
+    txt('向量数据库', 1680, 650, {size:30, weight:900, color:C.acc, alpha:da}); }
+  if (t > 28.4){                                  // 流动粒子
+    const xs = [250, 630, 960, 1320, 1680];
+    for (let k = 0; k < 8; k++){ const u = ((t - 28.4)*.35 + k/8) % 1, seg = Math.floor(u*4), f = u*4 - seg;
+      ctx.save(); al(.9*Math.sin(Math.PI*f)); ctx.fillStyle = C.gold; ctx.shadowColor = C.gold; ctx.shadowBlur = 16;
+      ctx.beginPath(); ctx.arc(lerp(xs[seg], xs[seg + 1], f), 470 + Math.sin(u*20)*6, 6, 0, 6.283); ctx.fill(); ctx.restore(); }
+  }
+  rise('每一段文字 → 一串数字（向量），代表它的「意思」', W/2, 830, t, 29.6, {size:42, weight:900});
+  rise('全部存进向量数据库，随时可查', W/2, 905, t, 31.4, {size:34, weight:600, color:C.muted});
+}
+
+/* ============ 场景 4 · 语义检索 (36–50s) ============ */
+const PTS = [['差旅报销标准', 620, 420, 1], ['住宿费上限', 700, 355, 1], ['报销审批流程', 560, 565, 1], ['发票怎么开', 800, 610, 0], ['年会安排', 1110, 760, 0], ['请假制度', 1060, 300, 0], ['产品定价', 420, 800, 0], ['Wi-Fi 密码', 1180, 520, 0]];
+const Q = [650, 470];
+function s4(t){
+  rise('意思相近，向量就靠得近', W/2, 115, t, 36.2, {size:60, weight:900});
+  const sa = eo(p(t, 36.8, 37.4));
+  box(280, 210, 1040, 680, sa, {fill:'rgba(124,199,255,.03)', stroke:'rgba(124,199,255,.25)', dash:[10, 8], r:24});
+  txt('向量空间（示意）', 310, 245, {size:24, weight:600, color:C.muted, align:'left', alpha:sa});
+  const near = eo(p(t, 42.6, 43.4)), R = 155;
+  if (near > 0){ ctx.save(); al(near*.9); ctx.strokeStyle = C.gold; ctx.lineWidth = 3; ctx.setLineDash([10, 8]); ctx.fillStyle = 'rgba(255,211,138,.07)';
+    ctx.beginPath(); ctx.arc(Q[0], Q[1], R*near, 0, 6.283); ctx.fill(); ctx.stroke(); ctx.restore(); }
+  PTS.forEach(([s, x, y, hit], i) => {
+    const e = eback(p(t, 37.4 + i*.18, 37.8 + i*.18)); if (e <= 0) return;
+    const on = hit && t > 43.4;
+    ctx.save(); al(clamp(e)); ctx.fillStyle = on ? C.gold : C.acc; if (on){ ctx.shadowColor = C.gold; ctx.shadowBlur = 20; }
+    ctx.beginPath(); ctx.arc(x, y, 12*e, 0, 6.283); ctx.fill(); ctx.restore();
+    txt(s, x + 22, y, {size:28, weight:700, color:on ? C.gold : hit ? C.text : C.muted, align:'left', alpha:clamp(e)});
+  });
+  const qa = eback(p(t, 40.4, 41));
+  if (qa > 0){ ctx.save(); al(clamp(qa)); ctx.translate(Q[0], Q[1]); ctx.scale(qa, qa); ctx.fillStyle = C.mint; ctx.shadowColor = C.mint; ctx.shadowBlur = 30;
+    ctx.beginPath(); for (let i = 0; i < 10; i++){ const a = i*Math.PI/5 - Math.PI/2, r = i % 2 ? 9 : 22; ctx.lineTo(Math.cos(a)*r, Math.sin(a)*r); } ctx.closePath(); ctx.fill(); ctx.restore();
+    box(Q[0] - 340, Q[1] - 28, 290, 56, clamp(qa), {fill:'rgba(110,231,200,.15)', stroke:C.mint, r:28});
+    txt('出差能报多少钱？', Q[0] - 195, Q[1], {size:28, weight:800, color:C.mint, alpha:clamp(qa)}); }
+  // 右侧结果
+  const ra = eo(p(t, 43.6, 44.2));
+  txt('检索结果 Top 3', 1380, 280, {size:32, weight:900, color:C.gold, align:'left', alpha:ra});
+  [['差旅报销标准', '0.92'], ['住宿费上限', '0.87'], ['报销审批流程', '0.81']].forEach(([s, sc], i) => {
+    const e = eo(p(t, 44.0 + i*.3, 44.5 + i*.3)), y = 360 + i*100;
+    box(1380, y - 38, 420, 76, e, {fill:'rgba(255,211,138,.08)', stroke:'rgba(255,211,138,.45)', r:14});
+    txt(s, 1405, y, {size:28, weight:700, align:'left', alpha:e});
+    txt(sc, 1775, y, {size:26, weight:700, font:MONO, color:C.gold, align:'right', alpha:e});
+  });
+  txt('相似度', 1775, 280, {size:22, weight:500, color:C.muted, align:'right', alpha:ra});
+  rise('按「意思」找，而不是按关键词', W/2, 950, t, 45.6, {size:42, weight:900, color:C.acc, alpha:1 - p(t, 47.6, 48)});
+  rise('问题里没有「报销」二字，照样能找到', W/2, 950, t, 48.0, {size:42, weight:900, color:C.mint});
+}
+
+/* ============ 场景 5 · 生成回答 (50–64s) ============ */
+const PROMPT = [['请根据下面的资料回答问题，', C.muted], ['资料里没有的，就说不知道。', C.muted], ['', C.text],
+  ['[资料1] 一线城市住宿每晚不超过 600 元……', C.acc], ['[资料2] 其他城市按二、三档标准执行……', C.acc], ['[资料3] 出差结束后 30 天内提交报销……', C.acc], ['', C.text],
+  ['问题：出差能报多少钱？', C.gold]];
+function s5(t){
+  rise('第二步：带着资料去回答', W/2, 115, t, 50.2, {size:60, weight:900});
+  const pa = eo(p(t, 50.8, 51.3));
+  panel(110, 200, 940, 600, '拼好的提示词（示例）', pa);
+  PROMPT.forEach(([s, c], i) => { if (!s) return;
+    const e = eo(p(t, 51.2 + i*.32, 51.6 + i*.32));
+    txt(s, 150, 300 + i*62 + (1-e)*14, {size:30, weight:i === 7 ? 800 : 600, color:c, align:'left', alpha:e}); });
+  arrow(1060, 500, 1150, 500, eo(p(t, 54.4, 54.9)), 1);
+  const la = eback(p(t, 54.8, 55.4));
+  if (la > 0){ ctx.save(); ctx.translate(1250, 500); ctx.scale(la, la); ctx.translate(-1250, -500);
+    box(1160, 420, 180, 160, clamp(la), {fill:'rgba(124,199,255,.18)', stroke:C.acc, lw:3, glow:24}); ctx.restore();
+    txt('LLM', 1250, 500, {size:52, weight:900, color:C.acc, alpha:clamp(la)}); }
+  arrow(1350, 500, 1420, 500, eo(p(t, 55.6, 56.1)), 1);
+  const aa = eo(p(t, 56.0, 56.6));
+  box(1430, 300, 380, 400, aa, {fill:'rgba(110,231,200,.08)', stroke:'rgba(110,231,200,.5)', r:22});
+  ['一线城市住宿', '每晚最多 600 元，', '其他城市按分档标准。', '记得出差后 30 天', '内提交哦。'].forEach((s, i) =>
+    txt(s, 1460, 360 + i*52, {size:30, weight:700, align:'left', alpha:eo(p(t, 56.4 + i*.25, 56.8 + i*.25))}));
+  txt('来源：资料 1、2、3', 1460, 650, {size:24, weight:700, color:C.mint, align:'left', alpha:eo(p(t, 58, 58.5))});
+  rise('检索 → 拼进提示词 → 生成，这就是 RAG 的全部流程', W/2, 890, t, 59.4, {size:42, weight:900});
+  rise('答案里的每一句，都能找到出处', W/2, 960, t, 61.0, {size:32, weight:600, color:C.muted});
+}
+
+/* ============ 场景 6 · 收尾 (64–72s) ============ */
+function s6(t){
+  [['用上私有数据', '公司文档、知识库都能用'], ['知识随时更新', '改文档就行，不用重新训练'], ['减少胡编', '答案有出处，可以核对']].forEach(([a, b], i) => {
+    const st = 64.2 + i*.5, e = eback(p(t, st, st + .6)); if (e <= 0) return;
+    const x = 400 + i*560, y = 300;
+    ctx.save(); ctx.translate(x, y); ctx.scale(e, e); ctx.translate(-x, -y);
+    box(x - 250, y - 100, 500, 200, clamp(e), {fill:'rgba(124,199,255,.08)', stroke:'rgba(124,199,255,.5)', r:28}); ctx.restore();
+    txt(a, x, y - 26, {size:48, weight:900, color:C.acc, alpha:clamp(e)});
+    txt(b, x, y + 44, {size:28, weight:500, color:C.muted, alpha:clamp(e)});
+  });
+  rise('RAG = 给大模型配一座图书馆', W/2, 600, t, 66.0, {size:72, weight:900, glow:20});
+  rise('关注我，一起看懂 AI', W/2, 780, t, 67.6, {size:36, weight:500, color:C.muted});
+}
+
+/* ============ 总调度 ============ */
+const SCENES = [[s1,-1,7],[s2,7,20],[s3,20,36],[s4,36,50],[s5,50,64],[s6,64,72]];
+function draw(t){
+  t = clamp(t, 0, DUR);
+  ctx.save(); ctx.globalAlpha = 1; ctx.clearRect(0,0,W,H); background(t);
+  for (const [fn,a,b] of SCENES){
+    if (t < a || t > b) continue;
+    SA = sceneA(t, a, b, b === DUR ? .8 : .5);
+    if (SA > 0){ ctx.save(); fn(t); ctx.restore(); }
+  }
+  SA = 1; vignette();
+  const fo = p(t, DUR - .8, DUR);
+  if (fo > 0){ ctx.globalAlpha = fo; ctx.fillStyle = '#000'; ctx.fillRect(0,0,W,H); }
+  ctx.restore();
+}
+
+/* ============ 播放器 / 逐帧渲染接口 ============ */
+const isRender = new URLSearchParams(location.search).has('render');
+window.DURATION = DUR;
+window.renderFrame = t => draw(t);
+const btn = document.getElementById('btn'), seek = document.getElementById('seek'), timeEl = document.getElementById('time');
+const fmt = s => `${Math.floor(s/60)}:${String(Math.floor(s%60)).padStart(2,'0')}`;
+function fit(){
+  if (isRender){ cv.style.width = W+'px'; cv.style.height = H+'px'; return; }
+  const w = Math.min(innerWidth - 32, (innerHeight - 84)*16/9);
+  cv.style.width = w + 'px'; cv.style.height = w*9/16 + 'px';
+}
+addEventListener('resize', fit); fit();
+
+let cur = 0, playing = !isRender, last = null;
+function toggle(){ if (cur >= DUR) cur = 0; playing = !playing; }
+btn.onclick = toggle; cv.onclick = toggle;
+addEventListener('keydown', e => { if (e.code === 'Space'){ e.preventDefault(); toggle(); } });
+seek.oninput = () => { cur = +seek.value; draw(cur); };
+function loop(ts){
+  if (playing && last != null){ cur += (ts - last)/1000; if (cur >= DUR){ cur = DUR; playing = false; } }
+  last = ts; draw(cur);
+  seek.value = cur; timeEl.textContent = `${fmt(cur)} / ${fmt(DUR)}`;
+  btn.textContent = playing ? '❚❚' : (cur >= DUR ? '↺' : '▶');
+  requestAnimationFrame(loop);
+}
+document.fonts.ready.then(() => {
+  window.ready = true;
+  if (isRender) draw(0); else requestAnimationFrame(loop);
+});
+</script>
+</body>
+</html>
