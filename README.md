@@ -29,6 +29,7 @@
 | Function Calling 与 MCP | `function-calling-mcp/landscape.html` | 横屏 1920×1080 | 80s |
 | CAP 与 BASE | `cap-theorem/landscape.html` | 横屏 1920×1080 | 80s |
 | 限流算法 | `rate-limiting/landscape.html` | 横屏 1920×1080 | 80s |
+| Prompt 工程与结构化输出 | `prompt-engineering/landscape.html` | 横屏 1920×1080 | 80s |
 
 ### 幸福的科学
 钩子 → 享乐适应（快乐曲线 + 跑步机）→ 哈佛成人发展研究（关系网络）→ 心流（挑战 × 技能坐标图）→ 今晚就能做的 3 件事 → 收尾
@@ -89,6 +90,9 @@
 
 ### 限流算法
 秒杀打垮服务 → 为什么限流 → 固定窗口与边界突刺 → 滑动窗口 → 漏桶 → 令牌桶 → 对比与实战 → 收尾
+
+### Prompt 工程与结构化输出
+两种问法对比 → 好提示词的六块 → 少样本示例 → 思维链 → 结构化输出与校验重试 → 系统提示词与标签分隔 → 常见的坑 → 收尾
 
 ## 预览
 
