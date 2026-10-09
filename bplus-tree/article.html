@@ -1,0 +1,317 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>数据库索引：为什么是 B+ 树 · 图文详解</title>
+<meta name="description" content="从磁盘 IO 讲起，看懂 B+ 树的结构与查找、聚簇索引与回表、覆盖索引、最左前缀和索引失效，最后学会用 EXPLAIN">
+<link rel="stylesheet" href="../assets/article.css">
+<style>:root{--acc:#fb923c}</style>
+</head>
+<body>
+<div class="wrap">
+  <nav class="top"><a href="../index.html">← 全部视频</a><a class="watch" href="landscape.html">▶ 看视频</a></nav>
+  <header class="hero">
+    <div class="tag">计算机与后端 · 图文详解</div>
+    <h1>数据库索引：为什么是 B+ 树</h1>
+    <p>从磁盘 IO 讲起，看懂 B+ 树的结构与查找、聚簇索引与回表、覆盖索引、最左前缀和索引失效，最后学会用 EXPLAIN</p>
+    <div class="meta">约 9 分钟读完 · 配套视频 1:20</div>
+  </header>
+  <nav class="toc">
+<ul>
+<li><a href="#_1">没有索引会怎样</a></li>
+<li><a href="#_2">关键约束：数据在磁盘上</a></li>
+<li><a href="#b">B+ 树的结构</a></li>
+<li><a href="#_5">范围查询：叶子链表的威力</a></li>
+<li><a href="#_6">聚簇索引、二级索引与回表</a></li>
+<li><a href="#_12">联合索引与最左前缀</a></li>
+<li><a href="#_15">常见的索引失效</a></li>
+<li><a href="#explain">学会用 EXPLAIN</a></li>
+<li><a href="#_16">建索引的原则</a></li>
+<li><a href="#_17">高频面试题速答</a></li>
+<li><a href="#_18">总结</a></li>
+</ul>
+</nav>
+
+  <article>
+<figure><img src="img/f-6.jpg" alt="没有索引，只能一行一行地翻" loading="lazy"><figcaption>没有索引，只能一行一行地翻</figcaption></figure>
+<h2 id="_1">没有索引会怎样</h2>
+<p>在一张有一百万行的用户表里执行：</p>
+<pre><code class="language-sql">SELECT * FROM user WHERE id = 8848;
+</code></pre>
+<p>如果 <code>id</code> 上没有任何索引，数据库只能从第一行开始，一行一行地比对，直到找到为止，最坏情况要读完整张表。这叫<strong>全表扫描</strong>。</p>
+<p><strong>索引</strong>就像一本书的目录：数据库按照某一列提前把数据排好序，组织成便于查找的结构，查询时直接定位，不用逐页翻找。MySQL 的 InnoDB 存储引擎，用的就是 <strong>B+ 树</strong>。</p>
+<h2 id="_2">关键约束：数据在磁盘上</h2>
+<figure><img src="img/f-17.jpg" alt="为什么不用哈希表、二叉树" loading="lazy"><figcaption>为什么不用哈希表、二叉树</figcaption></figure>
+<p>理解 B+ 树，要先理解一个前提：<strong>数据库的数据存放在磁盘上</strong>，而磁盘的读取速度比内存慢几个数量级。</p>
+<p>InnoDB 以<strong>页</strong>（page）为单位从磁盘读取数据，默认每页 <strong>16KB</strong>。索引树的每个节点就是一个页，<strong>读一个节点，就是一次磁盘 IO</strong>（如果这个页已经被缓存在内存的 Buffer Pool 里，就可以省掉这次 IO）。</p>
+<p>所以，评价一种索引结构好不好，核心看：<strong>找到一条数据，要读多少个节点？</strong> 换句话说，就是<strong>树有多高</strong>。</p>
+<h3 id="_3">几种候选结构的比较</h3>
+<table>
+<thead>
+<tr>
+<th>结构</th>
+<th>优点</th>
+<th>缺点</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>哈希表</td>
+<td>等值查询非常快</td>
+<td>数据无序，不支持范围查询、排序和前缀匹配</td>
+</tr>
+<tr>
+<td>二叉搜索树</td>
+<td>有序，支持范围查询</td>
+<td>每个节点只有两个分叉，树很高；插入有序数据时可能退化成链表</td>
+</tr>
+<tr>
+<td>平衡二叉树 / 红黑树</td>
+<td>不会退化</td>
+<td>依然是二叉，一百万条数据大约需要 20 层，也就是约 20 次 IO</td>
+</tr>
+<tr>
+<td>B 树</td>
+<td>多叉，矮胖</td>
+<td>每个节点都存数据，一页能放的键变少；范围查询需要在树中来回遍历</td>
+</tr>
+<tr>
+<td><strong>B+ 树</strong></td>
+<td>多叉、矮胖、叶子有序相连</td>
+<td>写入时需要维护树结构，有一定开销</td>
+</tr>
+</tbody>
+</table>
+<h2 id="b">B+ 树的结构</h2>
+<figure><img src="img/f-33.jpg" alt="B+ 树查找 id = 37" loading="lazy"><figcaption>B+ 树查找 id = 37</figcaption></figure>
+<p>B+ 树有三个关键特征：</p>
+<ol>
+<li><strong>非叶子节点只存「键 + 指针」</strong>，不存数据。这样一个 16KB 的页能放下非常多的键，<strong>分叉数（扇出）极大</strong>，树就很矮；</li>
+<li><strong>所有数据都存放在叶子节点</strong>，因此每次查询都走到叶子，查询时间稳定；</li>
+<li><strong>叶子节点按键的顺序排列，并用链表串起来</strong>，方便范围扫描。</li>
+</ol>
+<h3 id="_4">查找过程</h3>
+<p>以查找 <code>id = 37</code> 为例：</p>
+<ol>
+<li>读根节点 <code>[30 | 60]</code>：37 在 30 和 60 之间，走中间的指针；</li>
+<li>读中间节点 <code>[40 | 50]</code>：37 小于 40，走最左边的指针；</li>
+<li>读叶子节点 <code>[30, 33, 37]</code>：找到 37。</li>
+</ol>
+<p>一共 3 次磁盘读取。而实际上，根节点和上层节点访问非常频繁，通常常驻在内存里，真正需要的磁盘 IO 往往更少。</p>
+<h3 id="3">3 层能存多少数据</h3>
+<p>这是一个经典的估算：</p>
+<ul>
+<li>假设主键是 <code>BIGINT</code>（8 字节），InnoDB 中一个指针约 6 字节，一组「键 + 指针」约 14 字节；</li>
+<li>一个 16KB 的非叶子节点大约能放 16384 ÷ 14 ≈ <strong>1170</strong> 个指针；</li>
+<li>假设每行数据约 1KB，一个叶子节点能放约 <strong>16</strong> 行。</li>
+</ul>
+<table>
+<thead>
+<tr>
+<th>树高</th>
+<th>大约能存的行数</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>2 层</td>
+<td>1170 × 16 ≈ 1.9 万</td>
+</tr>
+<tr>
+<td>3 层</td>
+<td>1170 × 1170 × 16 ≈ <strong>2190 万</strong></td>
+</tr>
+<tr>
+<td>4 层</td>
+<td>1170³ × 16 ≈ 256 亿</td>
+</tr>
+</tbody>
+</table>
+<p>所以，一张两千万行左右的表，主键查询通常只需要 3 层。这只是数量级上的估算，实际取决于行的大小和页的填充率。</p>
+<h2 id="_5">范围查询：叶子链表的威力</h2>
+<figure><img src="img/f-47.jpg" alt="沿着叶子链表扫描" loading="lazy"><figcaption>沿着叶子链表扫描</figcaption></figure>
+<pre><code class="language-sql">SELECT * FROM user WHERE id BETWEEN 30 AND 60;
+</code></pre>
+<p>B+ 树的做法是：</p>
+<ol>
+<li>从根节点往下，定位到第一个满足条件的叶子（<code>id = 30</code>）；</li>
+<li>沿着叶子之间的链表<strong>一路向右扫描</strong>，直到遇到大于 60 的键为止。</li>
+</ol>
+<p>不需要回到上层节点重新查找。同理，<code>ORDER BY id</code>、<code>id &gt; 100</code> 这类查询，都能利用叶子的有序性高效完成。这也是 B+ 树相比 B 树更适合数据库的重要原因。</p>
+<h2 id="_6">聚簇索引、二级索引与回表</h2>
+<figure><img src="img/f-63.jpg" alt="主键索引、二级索引和回表" loading="lazy"><figcaption>主键索引、二级索引和回表</figcaption></figure>
+<h3 id="_7">聚簇索引：数据就是索引</h3>
+<p>在 InnoDB 中，<strong>表的数据本身就存放在主键的 B+ 树里</strong>，叶子节点存的是完整的行。这棵树叫<strong>聚簇索引</strong>（clustered index）。</p>
+<ul>
+<li>如果表定义了主键，就用主键建聚簇索引；</li>
+<li>没有主键，就选第一个非空的唯一索引；</li>
+<li>都没有，InnoDB 会自动生成一个隐藏的 6 字节行 ID。</li>
+</ul>
+<h3 id="_8">二级索引：叶子里存的是主键</h3>
+<p>在其他列上建的索引叫<strong>二级索引</strong>（secondary index）。它的叶子节点不存整行，只存<strong>索引列的值 + 对应的主键值</strong>。</p>
+<h3 id="_9">回表</h3>
+<pre><code class="language-sql">SELECT * FROM user WHERE name = '张三';   -- name 上有二级索引
+</code></pre>
+<ol>
+<li>在 <code>name</code> 的二级索引里找到 <code>张三</code>，拿到主键 <code>id = 5</code>；</li>
+<li>再拿 <code>id = 5</code> 去聚簇索引里查一遍，取出整行数据。</li>
+</ol>
+<p>第二步就叫<strong>回表</strong>。如果查询命中的行很多，每一行都要回表，开销就会很大。</p>
+<h3 id="_10">覆盖索引：不用回表</h3>
+<pre><code class="language-sql">SELECT id, name FROM user WHERE name = '张三';
+</code></pre>
+<p>需要的 <code>id</code> 和 <code>name</code> 在二级索引里都有，不用回表。这叫<strong>覆盖索引</strong>，在 <code>EXPLAIN</code> 的 <code>Extra</code> 列中会显示 <code>Using index</code>。这也是为什么提倡<strong>少用 <code>SELECT *</code>，只查需要的列</strong>。</p>
+<h3 id="_11">主键怎么选</h3>
+<p>因为聚簇索引按主键排序存储，主键的选择会影响写入性能：</p>
+<ul>
+<li><strong>自增主键</strong>：新数据总是追加到最右边的叶子，写入顺序、页面紧凑；</li>
+<li><strong>随机主键（如 UUID）</strong>：新数据会插入到树的任意位置，频繁引发<strong>页分裂</strong>，产生碎片，写入变慢；</li>
+<li><strong>主键不宜过长</strong>：每个二级索引的叶子都要存一份主键，主键越长，所有二级索引越占空间。</li>
+</ul>
+<h2 id="_12">联合索引与最左前缀</h2>
+<figure><img src="img/f-73.jpg" alt="最左前缀与索引失效" loading="lazy"><figcaption>最左前缀与索引失效</figcaption></figure>
+<h3 id="_13">联合索引是怎么排序的</h3>
+<pre><code class="language-sql">CREATE INDEX idx_city_age ON user (city, age);
+</code></pre>
+<p>联合索引在 B+ 树中<strong>先按 <code>city</code> 排序，<code>city</code> 相同时再按 <code>age</code> 排序</strong>，就像字典先按第一个字母排，再按第二个字母排。</p>
+<table>
+<thead>
+<tr>
+<th>查询条件</th>
+<th>能否用上索引</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>WHERE city = '北京'</code></td>
+<td>能</td>
+</tr>
+<tr>
+<td><code>WHERE city = '北京' AND age = 25</code></td>
+<td>能，两列都用上</td>
+</tr>
+<tr>
+<td><code>WHERE age = 25</code></td>
+<td>不能用来定位：不同城市下的 age = 25 散落在各处</td>
+</tr>
+<tr>
+<td><code>WHERE city = '北京' AND age &gt; 20</code></td>
+<td>能，city 等值定位，age 范围扫描</td>
+</tr>
+</tbody>
+</table>
+<p>这就是<strong>最左前缀原则</strong>：联合索引只有从最左边的列开始连续使用，才能用来定位。</p>
+<p>另外，在联合索引 <code>(a, b, c)</code> 上，如果条件是 <code>a = 1 AND b &gt; 2 AND c = 3</code>，b 是范围条件，c 就无法再用来<strong>定位</strong>了。不过 MySQL 5.6 起支持<strong>索引下推</strong>（Index Condition Pushdown），可以在遍历索引时直接用 c 过滤，减少回表次数，<code>EXPLAIN</code> 中显示为 <code>Using index condition</code>。</p>
+<h3 id="_14">设计联合索引的顺序</h3>
+<ul>
+<li>等值查询的列放前面，范围查询的列放后面；</li>
+<li>区分度高（取值多样）的列优先；</li>
+<li>尽量让常用查询能用上覆盖索引。</li>
+</ul>
+<h2 id="_15">常见的索引失效</h2>
+<p>索引能不能用，本质上只看一件事：<strong>查询条件能不能利用 B+ 树中已经排好的顺序。</strong> 下面这些写法会破坏这一点：</p>
+<table>
+<thead>
+<tr>
+<th>写法</th>
+<th>为什么失效</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>跳过联合索引的最左列</td>
+<td>数据不是按后面的列全局排序的</td>
+</tr>
+<tr>
+<td><code>LIKE '%三'</code>（左模糊）</td>
+<td>不知道开头是什么，无法定位；<code>LIKE '张%'</code> 则可以</td>
+</tr>
+<tr>
+<td><code>WHERE YEAR(created_at) = 2026</code></td>
+<td>对索引列做了函数运算，索引中存的是原值；可改写为 <code>created_at &gt;= '2026-01-01' AND created_at &lt; '2027-01-01'</code></td>
+</tr>
+<tr>
+<td><code>WHERE id + 1 = 10</code></td>
+<td>同上，对索引列做了运算</td>
+</tr>
+<tr>
+<td>字符串列 <code>phone = 13800000000</code></td>
+<td>隐式类型转换，相当于对列套了函数；应写成 <code>phone = '13800000000'</code></td>
+</tr>
+<tr>
+<td><code>OR</code> 连接的条件中，有一边没有索引</td>
+<td>可能导致整体放弃索引</td>
+</tr>
+</tbody>
+</table>
+<p>还有一种情况：即使能用索引，优化器也可能<strong>主动选择全表扫描</strong>，比如表很小，或者条件匹配了表中大部分数据，此时走索引再回表反而更慢。</p>
+<h2 id="explain">学会用 EXPLAIN</h2>
+<p>在查询前加上 <code>EXPLAIN</code>，就能看到 MySQL 打算怎么执行：</p>
+<pre><code class="language-sql">EXPLAIN SELECT id, name FROM user WHERE name = '张三';
+</code></pre>
+<p>重点关注几列：</p>
+<table>
+<thead>
+<tr>
+<th>列</th>
+<th>关注什么</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>type</code></td>
+<td>访问方式，从好到差大致是：<code>const</code> &gt; <code>eq_ref</code> &gt; <code>ref</code> &gt; <code>range</code> &gt; <code>index</code> &gt; <code>ALL</code>（全表扫描）</td>
+</tr>
+<tr>
+<td><code>key</code></td>
+<td>实际使用的索引，为 <code>NULL</code> 表示没用索引</td>
+</tr>
+<tr>
+<td><code>rows</code></td>
+<td>预计需要扫描的行数</td>
+</tr>
+<tr>
+<td><code>Extra</code></td>
+<td><code>Using index</code>（覆盖索引）、<code>Using where</code>、<code>Using filesort</code>（需要额外排序）、<code>Using temporary</code>（用了临时表）等</td>
+</tr>
+</tbody>
+</table>
+<h2 id="_16">建索引的原则</h2>
+<ol>
+<li>为经常出现在 <code>WHERE</code>、<code>JOIN</code>、<code>ORDER BY</code>、<code>GROUP BY</code> 中的列建索引；</li>
+<li>优先选择区分度高的列；</li>
+<li>索引不是越多越好：每次写入都要同步维护所有索引，也会占用存储空间；</li>
+<li>很长的字符串列，可以考虑<strong>前缀索引</strong>；</li>
+<li>用 <code>EXPLAIN</code> 和慢查询日志验证效果，而不是凭感觉。</li>
+</ol>
+<h2 id="_17">高频面试题速答</h2>
+<p><strong>Q：为什么 MySQL 用 B+ 树而不是 B 树？</strong>
+B+ 树的非叶子节点不存数据，扇出更大，树更矮；数据都在叶子，查询性能稳定；叶子节点相连，范围查询和排序更高效。</p>
+<p><strong>Q：为什么不用哈希索引？</strong>
+哈希无序，只适合等值查询，不支持范围查询、排序和最左前缀匹配。</p>
+<p><strong>Q：什么是回表？如何避免？</strong>
+通过二级索引找到主键后，再去聚簇索引查整行，叫回表。可以通过覆盖索引避免。</p>
+<p><strong>Q：为什么推荐自增主键？</strong>
+插入时顺序追加，避免页分裂和碎片；同时主键较短，能减小二级索引的体积。</p>
+<h2 id="_18">总结</h2>
+<figure><img src="img/f-77.jpg" alt="矮胖、叶子相连、按序排列" loading="lazy"><figcaption>矮胖、叶子相连、按序排列</figcaption></figure>
+<ul>
+<li>数据库索引的核心矛盾是<strong>磁盘 IO</strong>，B+ 树通过<strong>巨大的扇出</strong>让树非常矮，3 层就能存约两千万行；</li>
+<li>数据全在叶子，叶子有序相连，<strong>等值和范围查询都高效</strong>；</li>
+<li>InnoDB 的表就是一棵<strong>聚簇索引</strong>；二级索引查整行需要<strong>回表</strong>，<strong>覆盖索引</strong>可以避免；</li>
+<li>索引能否生效，关键看查询能否利用<strong>已排好的顺序</strong>：牢记最左前缀，避免对索引列做运算。</li>
+</ul>
+<div class="refs">
+<h3 id="_19">参考资料</h3>
+<ul>
+<li>MySQL 8.0 Reference Manual: The Physical Structure of an InnoDB Index；Clustered and Secondary Indexes；Index Condition Pushdown Optimization；EXPLAIN Output Format.</li>
+<li>Comer, D. (1979). The Ubiquitous B-Tree. <em>ACM Computing Surveys</em>.</li>
+<li>小孩子 4919.《MySQL 是怎样运行的：从根儿上理解 MySQL》.</li>
+</ul>
+</div>
+  </article>
+  <div class="foot"><a href="../index.html">← 返回首页</a><a href="landscape.html">▶ 看配套视频</a></div>
+</div>
+</body>
+</html>
