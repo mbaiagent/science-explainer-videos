@@ -1,0 +1,364 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>TCP 三次握手</title>
+<style>
+  :root{--bg:#07080f;--fg:#f4ede4;--muted:#9a93a8;--acc:#facc15}
+  html,body{margin:0;height:100%;background:var(--bg);color:var(--fg);
+    font-family:-apple-system,"PingFang SC","Noto Sans SC","Noto Sans CJK SC","Microsoft YaHei",sans-serif}
+  body{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;overflow:hidden}
+  #stage{display:block;background:#07080f;border-radius:12px;box-shadow:0 20px 60px rgba(0,0,0,.55);cursor:pointer}
+  #bar{display:flex;align-items:center;gap:12px;width:min(calc(100vw - 32px),640px)}
+  #btn{width:40px;height:40px;border-radius:50%;border:1px solid rgba(250,204,21,.5);background:transparent;
+    color:var(--acc);font-size:16px;cursor:pointer;flex:none}
+  #seek{flex:1;accent-color:var(--acc)}
+  #time{font-variant-numeric:tabular-nums;font-size:13px;color:var(--muted);min-width:84px;text-align:right}
+  body.render{display:block}
+  body.render #bar{display:none}
+  body.render #stage{border-radius:0;box-shadow:none}
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="bar">
+  <button id="btn" aria-label="播放/暂停">❚❚</button>
+  <input id="seek" type="range" min="0" max="80" step="0.01" value="0">
+  <span id="time">0:00 / 1:20</span>
+</div>
+<script>
+/* ============ 基础设置（横屏 1920×1080） ============ */
+const W = 1920, H = 1080, DUR = 80;
+const cv = document.getElementById('stage'), ctx = cv.getContext('2d');
+cv.width = W; cv.height = H;
+const FONT = '"PingFang SC","Noto Sans SC","Noto Sans CJK SC","Source Han Sans SC","Microsoft YaHei",sans-serif';
+const MONO = '"JetBrains Mono","SF Mono",Menlo,Consolas,"DejaVu Sans Mono","Noto Sans Mono CJK SC","PingFang SC","Microsoft YaHei",monospace';
+const C = {acc:'#facc15', mint:'#6ee7c8', gold:'#ffd38a', coral:'#ff9e7a', rose:'#ff8a8a', blue:'#9cc3ff', text:'#f4ede4', muted:'#9a93a8', dim:'#4a4558', panel:'#0f0e1f'};
+
+const clamp = (x,a=0,b=1) => Math.max(a, Math.min(b, x));
+const lerp = (a,b,t) => a + (b-a)*t;
+const p = (t,a,b) => clamp((t-a)/(b-a));
+const eo = x => 1 - Math.pow(1-x, 3);
+const eio = x => x < .5 ? 4*x*x*x : 1 - Math.pow(-2*x+2, 3)/2;
+const eback = x => { const c1=1.70158, c3=c1+1; return 1 + c3*Math.pow(x-1,3) + c1*Math.pow(x-1,2); };
+function rnd(seed){ let s = seed>>>0; return () => { s = (s*1664525 + 1013904223)>>>0; return s/4294967296; }; }
+
+let SA = 1;
+const al = a => { ctx.globalAlpha = clamp(SA*a); };
+const sceneA = (t,a,b,f=.5) => Math.min(p(t,a,a+f), 1 - p(t,b-f,b));
+
+function txt(s, x, y, o = {}){
+  const {size=64, weight=700, color=C.text, alpha=1, align='center', glow=0, scale=1, font=FONT} = o;
+  if (alpha <= 0) return;
+  ctx.save(); al(alpha);
+  ctx.font = `${weight} ${size}px ${font}`;
+  ctx.textAlign = align; ctx.textBaseline = 'middle'; ctx.fillStyle = color;
+  if (glow){ ctx.shadowColor = color; ctx.shadowBlur = glow; }
+  if (scale !== 1){ ctx.translate(x, y); ctx.scale(scale, scale); ctx.fillText(s, 0, 0); }
+  else ctx.fillText(s, x, y);
+  ctx.restore();
+}
+function rise(s, x, y, t, t0, o = {}, d = .7){
+  const e = eo(p(t, t0, t0+d));
+  if (e <= 0) return;
+  txt(s, x, y + (1-e)*36, {...o, alpha:(o.alpha ?? 1)*e});
+}
+function rr(x,y,w,h,r){ ctx.beginPath(); ctx.roundRect(x,y,w,h,r); }
+function box(x, y, w, h, a, o = {}){
+  const {fill='rgba(255,255,255,.05)', stroke='rgba(250,204,21,.35)', lw=2, glow=0, r=18, dash=null} = o;
+  if (a <= 0) return;
+  ctx.save(); al(a); rr(x, y, w, h, r); ctx.fillStyle = fill; ctx.fill();
+  if (dash) ctx.setLineDash(dash);
+  ctx.strokeStyle = stroke; ctx.lineWidth = lw; if (glow){ ctx.shadowColor = stroke; ctx.shadowBlur = glow; } ctx.stroke(); ctx.restore();
+}
+function arrow(x1, y1, x2, y2, e, a, color = C.acc, lw = 3){
+  if (e <= 0 || a <= 0) return;
+  const x = lerp(x1, x2, e), y = lerp(y1, y2, e), ang = Math.atan2(y2 - y1, x2 - x1);
+  ctx.save(); al(a); ctx.strokeStyle = color; ctx.fillStyle = color; ctx.lineWidth = lw; ctx.lineCap = 'round';
+  ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x, y); ctx.stroke();
+  if (e > .85){ ctx.translate(x, y); ctx.rotate(ang); ctx.beginPath(); ctx.moveTo(4, 0); ctx.lineTo(-14, -9); ctx.lineTo(-14, 9); ctx.closePath(); ctx.fill(); }
+  ctx.restore();
+}
+function panel(x, y, w, h, title, a){
+  box(x, y, w, h, a, {fill:C.panel, stroke:'rgba(255,255,255,.1)', r:20});
+  if (a <= 0) return;
+  ctx.save(); al(a); ctx.strokeStyle = 'rgba(255,255,255,.07)'; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(x, y + 52); ctx.lineTo(x + w, y + 52); ctx.stroke();
+  ['#ff6b6b','#ffd166','#6ee7a0'].forEach((c, i) => { ctx.fillStyle = c; ctx.globalAlpha = clamp(SA*a*.8); ctx.beginPath(); ctx.arc(x + 30 + i*24, y + 26, 7, 0, 6.283); ctx.fill(); });
+  ctx.restore();
+  txt(title, x + w/2, y + 27, {size:22, weight:500, color:C.muted, font:MONO, alpha:a});
+}
+
+/* ============ 背景 ============ */
+const PARTS = (() => { const r = rnd(127); return Array.from({length:100}, () => ({
+  x:r()*W, y:r()*H, s:r()*2.2+.5, v:r()*12+4, ph:r()*6.283, c:r()<.25})); })();
+function background(t){
+  const g = ctx.createLinearGradient(0,0,W,H);
+  g.addColorStop(0,'#0a0916'); g.addColorStop(.55,'#110f24'); g.addColorStop(1,'#18122c');
+  ctx.globalAlpha = 1; ctx.fillStyle = g; ctx.fillRect(0,0,W,H);
+  const gx = W*.5 + Math.sin(t*.27)*140;
+  const rg = ctx.createRadialGradient(gx, H*.45, 0, gx, H*.45, 950);
+  rg.addColorStop(0,'rgba(250,204,21,0.09)'); rg.addColorStop(1,'rgba(250,204,21,0)');
+  ctx.fillStyle = rg; ctx.fillRect(0,0,W,H);
+  ctx.fillStyle = C.acc;
+  for (let x = 40; x < W; x += 80) for (let y = 40; y < H; y += 80){ ctx.globalAlpha = .06; ctx.fillRect(x, y, 2, 2); }
+  for (const q of PARTS){
+    const y = ((q.y - t*q.v) % H + H) % H, x = q.x + Math.sin(t*.35 + q.ph)*12;
+    ctx.globalAlpha = .2 + .3*(.5 + .5*Math.sin(t*1.2 + q.ph));
+    ctx.fillStyle = q.c ? C.acc : '#d8d0ff';
+    ctx.beginPath(); ctx.arc(x, y, q.s, 0, 6.283); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+}
+function vignette(){
+  const v = ctx.createRadialGradient(W/2, H/2, W*.28, W/2, H/2, W*.62);
+  v.addColorStop(0,'rgba(0,0,0,0)'); v.addColorStop(1,'rgba(0,0,0,.55)');
+  ctx.globalAlpha = 1; ctx.fillStyle = v; ctx.fillRect(0,0,W,H);
+}
+function codeLine(s, x, y, size, a, kw = /\b(public|class|static|void|new|return)\b/){
+  const parts = s.split(/("[^"]*"|\b(?:public|class|static|void|new|return|getstatic|ldc|invokevirtual)\b)/g);
+  ctx.save(); al(a); ctx.font = `500 ${size}px ${MONO}`; ctx.textBaseline = 'middle'; ctx.textAlign = 'left';
+  let xx = x;
+  for (const seg of parts){ if (!seg) continue;
+    ctx.fillStyle = seg.startsWith('"') ? C.mint : /^(public|class|static|void|new|return|getstatic|ldc|invokevirtual)$/.test(seg) ? C.acc : C.text;
+    ctx.fillText(seg, xx, y); xx += ctx.measureText(seg).width; }
+  ctx.restore();
+}
+
+function pill(s, x, y, a, o = {}){
+  const {size=30, color=C.text, stroke='rgba(255,255,255,.2)', fill='rgba(255,255,255,.05)', font=FONT, weight=700} = o;
+  if (a <= 0) return;
+  ctx.save(); ctx.font = `${weight} ${size}px ${font}`; const w = ctx.measureText(s).width + 52; ctx.restore();
+  box(x - w/2, y - size*.9, w, size*1.8, a, {fill, stroke, r:size*.9});
+  txt(s, x, y, {size, weight, color, font, alpha:a});
+}
+function lifelines(cx, sx, top, bot, a, l1 = '客户端', l2 = '服务器'){
+  [[cx, l1], [sx, l2]].forEach(([x, s]) => {
+    pill(s, x, top, a, {size:28, color:C.acc, stroke:C.acc});
+    ctx.save(); al(a*.5); ctx.strokeStyle = 'rgba(255,255,255,.4)'; ctx.lineWidth = 2; ctx.setLineDash([6, 8]);
+    ctx.beginPath(); ctx.moveTo(x, top + 35); ctx.lineTo(x, bot); ctx.stroke(); ctx.restore();
+  });
+}
+function msg(x1, y1, x2, y2, label, t, ts, o = {}){
+  const {color=C.acc, dash=null, dur=.7, size=26, font=MONO, lx=(x1 + x2)/2, ly=Math.min(y1, y2) - 18, align='center'} = o;
+  const e = eo(p(t, ts, ts + dur)); if (e <= 0) return;
+  if (dash){ ctx.save(); al(1); ctx.setLineDash(dash); ctx.strokeStyle = color; ctx.lineWidth = 3;
+    ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(lerp(x1, x2, e), lerp(y1, y2, e)); ctx.stroke(); ctx.restore();
+    if (e > .9) arrow(lerp(x1, x2, .9), lerp(y1, y2, .9), x2, y2, 1, 1, color, 3); }
+  else arrow(x1, y1, x2, y2, e, 1, color, 3);
+  txt(label, lx, ly, {size, weight:800, font, color, align, alpha:eo(p(t, ts + .3, ts + .7))});
+}
+function state(s, x, y, a, color = C.text, align = 'right'){
+  if (a <= 0) return;
+  ctx.save(); ctx.font = `700 22px ${MONO}`; const w = ctx.measureText(s).width + 28; ctx.restore();
+  const bx = align === 'right' ? x - w : x;
+  box(bx, y - 20, w, 40, a, {fill:'rgba(250,204,21,.08)', stroke:'rgba(250,204,21,.45)', r:8});
+  txt(s, bx + w/2, y, {size:22, weight:700, font:MONO, color, alpha:a});
+}
+
+/* ============ 场景 1 · 钩子 (0–7s) ============ */
+function s1(t){
+  const a = eo(p(t, 0, .4));
+  pill('电脑 A', 300, 330, a, {size:32}); pill('电脑 B', 1620, 330, a, {size:32});
+  ctx.save(); al(a*.3); ctx.strokeStyle = C.muted; ctx.lineWidth = 2; ctx.setLineDash([10, 10]); ctx.beginPath(); ctx.moveTo(420, 330); ctx.lineTo(1500, 330); ctx.stroke(); ctx.restore();
+  [[1, .4, 0], [2, .9, 1], [3, 1.4, 2], [4, 1.9, 0]].forEach(([n, ts, fate]) => {
+    const u = clamp((t - ts)/1.6), lost = fate === 1, late = fate === 2;
+    if (u <= 0) return;
+    const k = late ? Math.min(u*.75, 1) : u, x = lerp(430, 1490, lost ? Math.min(u, .5) : k), y = 330 + (late ? -60 : 0) + (lost ? 0 : 0);
+    const alpha = lost ? 1 - p(u, .5, .8) : 1;
+    box(x - 40, y - 28, 80, 56, alpha, {fill:lost ? 'rgba(255,138,138,.25)' : 'rgba(250,204,21,.2)', stroke:lost ? C.rose : C.acc, r:10});
+    txt('#' + n, x, y, {size:24, weight:800, font:MONO, alpha});
+    if (lost && u > .5) txt('丢了', x, y + 60, {size:24, weight:800, color:C.rose, alpha:1 - p(u, .9, 1)});
+  });
+  rise('数据包会丢、会乱序、会重复', W/2, 500, t, 2.8, {size:46, weight:900, color:C.rose});
+  rise('网络本身，并不可靠', W/2, 580, t, 3.4, {size:40, weight:700, color:C.muted});
+  const k = p(t, 4.4, 5);
+  if (k > 0) txt('TCP', W/2, 760, {size:130, weight:900, color:C.acc, glow:40, font:MONO, alpha:clamp(k*2), scale:eback(k)});
+  rise('在不可靠的网络上，建立可靠的连接', W/2, 900, t, 5.2, {size:44, weight:800});
+}
+
+/* ============ 场景 2 · 三次握手 (7–22s) ============ */
+function s2(t){
+  rise('三次握手：先打个招呼', W/2, 105, t, 7.2, {size:58, weight:900});
+  const cx = 640, sx = 1280, la = eo(p(t, 7.6, 8.1));
+  lifelines(cx, sx, 195, 760, la);
+  state('CLOSED', cx - 30, 260, la * (1 - p(t, 8.8, 9)), C.muted);
+  state('SYN_SENT', cx - 30, 260, eo(p(t, 9, 9.3)) * (1 - p(t, 12.2, 12.4)));
+  state('ESTABLISHED', cx - 30, 470, eo(p(t, 12.4, 12.7)), C.mint);
+  state('LISTEN', sx + 30, 260, la * (1 - p(t, 10.4, 10.6)), C.muted, 'left');
+  state('SYN_RCVD', sx + 30, 360, eo(p(t, 10.6, 10.9)) * (1 - p(t, 13.6, 13.8)), C.text, 'left');
+  state('ESTABLISHED', sx + 30, 560, eo(p(t, 13.8, 14.1)), C.mint, 'left');
+  msg(cx, 280, sx, 360, 'SYN  seq=1000', t, 9.0);
+  msg(sx, 380, cx, 460, 'SYN+ACK  seq=5000  ack=1001', t, 10.6);
+  msg(cx, 480, sx, 560, 'ACK  ack=5001', t, 12.4);
+  [['「喂，听得到吗？」', 9.4, 320], ['「听得到！你听得到我吗？」', 11.0, 420], ['「听得到！」', 12.8, 520]].forEach(([s, ts, y]) =>
+    txt(s, 1700, y, {size:28, weight:700, color:C.gold, alpha:eo(p(t, ts, ts + .5))}));
+  rise('ack = 对方的 seq + 1：表示「你的这个包我收到了，下一个请从这里开始」', W/2, 850, t, 15.0, {size:34, weight:800});
+  rise('seq（序列号）给每个字节编号，初始值是随机选的', W/2, 920, t, 16.8, {size:30, weight:600, color:C.muted});
+}
+
+/* ============ 场景 3 · 为什么是三次 (22–38s) ============ */
+function s3(t){
+  rise('为什么一定要三次？', W/2, 105, t, 22.2, {size:58, weight:900});
+  [['确认收发能力', '双方都确认：我能发、你能收'], ['同步序列号', '双方的初始 seq 都要被对方确认'], ['拒绝过期连接', '防止网络里滞留的旧 SYN 建立连接']].forEach(([h, d], i) => {
+    const st = 22.8 + i*.6, e = eback(p(t, st, st + .5)); if (e <= 0) return;
+    const x = 330 + i*630, on = i === 2 && t > 26;
+    ctx.save(); ctx.translate(x, 245); ctx.scale(e, e); ctx.translate(-x, -245);
+    box(x - 280, 180, 560, 130, clamp(e), on ? {fill:'rgba(250,204,21,.12)', stroke:C.acc, lw:3, glow:18} : {stroke:'rgba(250,204,21,.35)'}); ctx.restore();
+    txt(h, x, 225, {size:36, weight:900, color:on ? C.acc : C.text, alpha:clamp(e)}); txt(d, x, 278, {size:24, weight:600, color:C.muted, alpha:clamp(e)});
+  });
+  const cx = 640, sx = 1280, la = eo(p(t, 25.6, 26.1));
+  lifelines(cx, sx, 380, 830, la);
+  msg(cx, 420, sx, 720, '旧 SYN  seq=100（在网络里滞留）', t, 26.2, {dash:[10, 8], color:C.muted, dur:3.2, size:22, font:FONT, lx:cx - 20, ly:420, align:'right'});
+  msg(cx, 520, sx, 560, '新 SYN  seq=200', t, 27.4, {size:22});
+  msg(sx, 740, cx, 790, 'SYN+ACK  ack=101', t, 29.6, {size:22});
+  const rst = eo(p(t, 31.2, 31.9));
+  if (rst > 0){ arrow(cx, 810, lerp(cx, sx, rst), 830, rst, 1, C.rose, 3);
+    txt('RST：我要的是 201，这是旧的，作废！', (cx + sx)/2, 860, {size:24, weight:800, color:C.rose, alpha:eo(p(t, 31.6, 32))}); }
+  rise('客户端发现 ack 对不上，直接拒绝', 1680, 650, t, 30.6, {size:26, weight:700, color:C.gold});
+  rise('如果只有两次握手，服务器收到旧 SYN 就会直接建立连接，白白浪费资源', W/2, 965, t, 33.4, {size:32, weight:800});
+}
+
+/* ============ 场景 4 · 四次挥手 (38–52s) ============ */
+function s4(t){
+  rise('断开连接：四次挥手', W/2, 105, t, 38.2, {size:58, weight:900});
+  const cx = 640, sx = 1280, la = eo(p(t, 38.6, 39.1));
+  lifelines(cx, sx, 195, 830, la);
+  msg(cx, 260, sx, 320, 'FIN', t, 39.4);
+  msg(sx, 340, cx, 400, 'ACK', t, 40.6);
+  const da = eo(p(t, 41.6, 42.1));
+  if (da > 0){ for (let i = 0; i < 3; i++){ const u = clamp((t - 41.6 - i*.35)/.8); if (u > 0) arrow(sx, 430 + i*36, lerp(sx, cx, u), 440 + i*36, u, .7, C.blue, 2); }
+    txt('服务器可能还有数据没发完', 1640, 470, {size:24, weight:700, color:C.blue, alpha:da}); }
+  msg(sx, 580, cx, 640, 'FIN', t, 43.6);
+  msg(cx, 660, sx, 720, 'ACK', t, 44.8);
+  [['「我说完了」', 39.6, 290], ['「好的，知道了」', 40.8, 370], ['「我也说完了」', 43.8, 610], ['「好，再见」', 45, 690]].forEach(([s, ts, y]) =>
+    txt(s, 300, y, {size:26, weight:700, color:C.gold, alpha:eo(p(t, ts, ts + .5))}));
+  const tw = eo(p(t, 45.6, 46.1));
+  if (tw > 0){ state('TIME_WAIT', cx - 30, 770, tw, C.gold);
+    ctx.save(); al(tw); ctx.strokeStyle = C.gold; ctx.lineWidth = 6; ctx.lineCap = 'round'; ctx.beginPath(); ctx.arc(cx - 260, 770, 24, -Math.PI/2, -Math.PI/2 + 6.283*clamp((t - 45.6)/4)); ctx.stroke(); ctx.restore();
+    txt('等待 2MSL', cx - 330, 770, {size:24, weight:800, color:C.gold, align:'right', alpha:tw}); }
+  rise('为什么是四次？服务器的 ACK 和 FIN 往往不能合并：它可能还有数据要发', W/2, 900, t, 47.0, {size:32, weight:800});
+  rise('TIME_WAIT：确保最后的 ACK 送达，并让旧连接的残留数据在网络中消失', W/2, 960, t, 48.6, {size:28, weight:600, color:C.muted});
+}
+
+/* ============ 场景 5 · 可靠性 (52–66s) ============ */
+function s5(t){
+  rise('握手之后，TCP 怎样保证可靠？', W/2, 105, t, 52.2, {size:56, weight:900});
+  const pa = [eo(p(t, 52.8, 53.3)), eo(p(t, 53.2, 53.7)), eo(p(t, 53.6, 54.1))];
+  [['确认与重传', '丢了就再发一次'], ['滑动窗口', '按接收方的能力控制发送量'], ['拥塞控制', '网络堵了就主动放慢']].forEach(([h, d], i) => {
+    const x = 120 + i*580; box(x, 180, 540, 560, pa[i], {fill:'rgba(255,255,255,.03)', stroke:'rgba(250,204,21,.35)', r:24});
+    txt(h, x + 270, 230, {size:36, weight:900, color:C.acc, alpha:pa[i]}); txt(d, x + 270, 280, {size:24, weight:600, color:C.muted, alpha:pa[i]});
+  });
+  // 1. 重传
+  const x1 = 200, x2 = 580;
+  ctx.save(); al(pa[0]*.5); ctx.strokeStyle = 'rgba(255,255,255,.4)'; ctx.setLineDash([6, 8]); ctx.lineWidth = 2;
+  [x1, x2].forEach(x => { ctx.beginPath(); ctx.moveTo(x, 330); ctx.lineTo(x, 700); ctx.stroke(); }); ctx.restore();
+  txt('发送方', x1, 320, {size:22, weight:700, alpha:pa[0]}); txt('接收方', x2, 320, {size:22, weight:700, alpha:pa[0]});
+  const l = eo(p(t, 54.4, 55.2));
+  if (l > 0){ arrow(x1, 370, lerp(x1, 420, l), lerp(370, 420, l), l, 1 - p(t, 55.4, 55.8), C.rose, 3);
+    txt('✗', 430, 420, {size:36, weight:900, color:C.rose, alpha:eo(p(t, 55.2, 55.5))}); }
+  const tm = clamp((t - 55.4)/2.2);
+  if (tm > 0){ ctx.save(); al(1); ctx.strokeStyle = C.gold; ctx.lineWidth = 5; ctx.beginPath(); ctx.arc(x1 - 50, 480, 22, -Math.PI/2, -Math.PI/2 + 6.283*tm); ctx.stroke(); ctx.restore();
+    txt('超时', x1 - 50, 530, {size:20, weight:700, color:C.gold, alpha:1}); }
+  msg(x1, 600, x2, 640, '重传', t, 57.8, {size:22, font:FONT});
+  msg(x2, 660, x1, 700, 'ACK', t, 58.8, {size:22, color:C.mint});
+  // 2. 滑动窗口
+  const wx = 740, wy = 450;
+  for (let i = 0; i < 10; i++){ const sent = i < Math.floor(clamp((t - 55)/6)*6) + 3;
+    box(wx + i*46, wy, 40, 60, pa[1], {fill:i < 3 ? 'rgba(110,231,200,.3)' : 'rgba(255,255,255,.05)', stroke:'rgba(255,255,255,.2)', r:6}); }
+  const shift = Math.floor(clamp((t - 56)/6)*4);
+  box(wx + (3 + shift)*46 - 5, wy - 12, 4*46 + 4, 84, pa[1], {fill:'rgba(0,0,0,0)', stroke:C.acc, lw:4, r:10});
+  txt('窗口：可以连续发、不必逐个等确认', wx + 230, 560, {size:22, weight:700, alpha:pa[1]});
+  txt('收到确认，窗口就向右滑动', wx + 230, 600, {size:22, weight:600, color:C.muted, alpha:pa[1]});
+  txt('已确认', wx + 70, 420, {size:20, weight:600, color:C.mint, alpha:pa[1]});
+  // 3. 拥塞控制
+  const gx = 1320, gy = 680, gw = 440, gh = 340, ga = pa[2];
+  ctx.save(); al(ga*.7); ctx.strokeStyle = C.dim; ctx.lineWidth = 3; ctx.beginPath(); ctx.moveTo(gx, gy - gh); ctx.lineTo(gx, gy); ctx.lineTo(gx + gw, gy); ctx.stroke(); ctx.restore();
+  txt('发送窗口', gx + 10, gy - gh - 14, {size:20, weight:600, color:C.muted, align:'left', alpha:ga});
+  const cw = u => u < .35 ? Math.pow(2, u*14)/Math.pow(2, 4.9)*.62 : u < .7 ? .62 + (u - .35)*.9 : (u < .72 ? .31 : .31 + (u - .72)*.9);
+  const k = clamp((t - 54.4)/8);
+  if (k > 0){ ctx.save(); al(1); ctx.strokeStyle = C.acc; ctx.lineWidth = 5; ctx.shadowColor = C.acc; ctx.shadowBlur = 12; ctx.beginPath();
+    for (let u = 0; u <= k; u += .005){ const x = gx + u*gw, y = gy - clamp(cw(u), 0, 1)*gh*.9; u ? ctx.lineTo(x, y) : ctx.moveTo(x, y); } ctx.stroke(); ctx.restore(); }
+  txt('慢启动', gx + 70, gy - 60, {size:20, weight:700, color:C.acc, alpha:eo(p(t, 56, 56.5))});
+  txt('丢包，减半', gx + gw*.72, gy - gh*.95, {size:20, weight:700, color:C.rose, alpha:eo(p(t, 60.2, 60.7))});
+  rise('这些机制，让 TCP 在不可靠的网络上，交付完整、有序的数据', W/2, 840, t, 62.0, {size:38, weight:900});
+}
+
+/* ============ 场景 6 · SYN 洪水 (66–74s) ============ */
+function s6(t){
+  rise('握手也能被利用：SYN 洪水攻击', W/2, 105, t, 66.2, {size:56, weight:900});
+  const sx = 1400, a = eo(p(t, 66.6, 67.1));
+  pill('攻击者', 300, 420, a, {size:30, color:C.rose, stroke:C.rose}); pill('服务器', sx, 300, a, {size:30, color:C.acc, stroke:C.acc});
+  for (let i = 0; i < 12; i++){ const u = clamp((t - 67 - i*.12)/1.2); if (u <= 0) continue;
+    arrow(400, 420, lerp(400, sx - 80, u), lerp(420, 300, u)*0 + lerp(420, 380 + (i % 4)*30, u), u, .6*(1 - p(u, .9, 1)), C.rose, 2); }
+  box(sx - 200, 360, 400, 300, a, {stroke:'rgba(255,255,255,.2)'});
+  txt('半连接队列', sx, 395, {size:24, weight:700, color:C.muted, alpha:a});
+  const fill = Math.floor(clamp((t - 67.4)/2)*8);
+  for (let i = 0; i < 8; i++) box(sx - 170 + (i % 4)*86, 430 + Math.floor(i/4)*90, 76, 70, a, {fill:i < fill ? 'rgba(255,138,138,.35)' : 'rgba(255,255,255,.04)', stroke:i < fill ? C.rose : 'rgba(255,255,255,.15)', r:8});
+  if (fill >= 8) txt('满了！正常用户连不上', sx, 700, {size:26, weight:900, color:C.rose, alpha:eo(p(t, 69.4, 69.8))});
+  rise('只发 SYN，从不回第三次 ACK，占满服务器的半连接队列', W/2, 820, t, 69.0, {size:34, weight:800});
+  rise('常见防御：SYN Cookie——先不占用队列，等第三次握手合法了再建立连接', W/2, 900, t, 70.4, {size:32, weight:800, color:C.mint});
+}
+
+/* ============ 场景 7 · 收尾 (74–80s) ============ */
+function s7(t){
+  ['SYN', 'SYN + ACK', 'ACK'].forEach((s, i) => {
+    const e = eback(p(t, 74.2 + i*.35, 74.7 + i*.35)), x = 560 + i*400;
+    if (e > 0){ ctx.save(); ctx.translate(x, 360); ctx.scale(e, e); ctx.translate(-x, -360);
+      box(x - 160, 300, 320, 120, clamp(e), {fill:'rgba(250,204,21,.10)', stroke:C.acc, r:24}); ctx.restore(); }
+    txt(s, x, 360, {size:40, weight:900, font:MONO, alpha:clamp(e)});
+    if (i > 0) arrow(x - 230, 360, x - 168, 360, e, clamp(e), C.acc, 4);
+  });
+  rise('确认收发能力 · 同步序列号 · 拒绝过期连接', W/2, 550, t, 75.6, {size:48, weight:900, glow:16});
+  rise('关注我，一起搞懂计算机', W/2, 720, t, 76.6, {size:36, weight:500, color:C.muted});
+}
+
+/* ============ 总调度 ============ */
+const SCENES = [[s1,-1,7],[s2,7,22],[s3,22,38],[s4,38,52],[s5,52,66],[s6,66,74],[s7,74,80]];
+function draw(t){
+  t = clamp(t, 0, DUR);
+  ctx.save(); ctx.globalAlpha = 1; ctx.clearRect(0,0,W,H); background(t);
+  for (const [fn,a,b] of SCENES){
+    if (t < a || t > b) continue;
+    SA = sceneA(t, a, b, b === DUR ? .8 : .5);
+    if (SA > 0){ ctx.save(); fn(t); ctx.restore(); }
+  }
+  SA = 1; vignette();
+  const fo = p(t, DUR - .8, DUR);
+  if (fo > 0){ ctx.globalAlpha = fo; ctx.fillStyle = '#000'; ctx.fillRect(0,0,W,H); }
+  ctx.restore();
+}
+
+/* ============ 播放器 / 逐帧渲染接口 ============ */
+const isRender = new URLSearchParams(location.search).has('render');
+window.DURATION = DUR;
+window.renderFrame = t => draw(t);
+const btn = document.getElementById('btn'), seek = document.getElementById('seek'), timeEl = document.getElementById('time');
+const fmt = s => `${Math.floor(s/60)}:${String(Math.floor(s%60)).padStart(2,'0')}`;
+function fit(){
+  if (isRender){ cv.style.width = W+'px'; cv.style.height = H+'px'; return; }
+  const w = Math.min(innerWidth - 32, (innerHeight - 84)*16/9);
+  cv.style.width = w + 'px'; cv.style.height = w*9/16 + 'px';
+}
+addEventListener('resize', fit); fit();
+
+let cur = 0, playing = !isRender, last = null;
+function toggle(){ if (cur >= DUR) cur = 0; playing = !playing; }
+btn.onclick = toggle; cv.onclick = toggle;
+addEventListener('keydown', e => { if (e.code === 'Space'){ e.preventDefault(); toggle(); } });
+seek.oninput = () => { cur = +seek.value; draw(cur); };
+function loop(ts){
+  if (playing && last != null){ cur += (ts - last)/1000; if (cur >= DUR){ cur = DUR; playing = false; } }
+  last = ts; draw(cur);
+  seek.value = cur; timeEl.textContent = `${fmt(cur)} / ${fmt(DUR)}`;
+  btn.textContent = playing ? '❚❚' : (cur >= DUR ? '↺' : '▶');
+  requestAnimationFrame(loop);
+}
+document.fonts.ready.then(() => {
+  window.ready = true;
+  if (isRender) draw(0); else requestAnimationFrame(loop);
+});
+</script>
+</body>
+</html>

@@ -1,0 +1,268 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>TCP 三次握手：为什么偏偏是三次 · 图文详解</title>
+<meta name="description" content="握手过程与序列号、为什么不能两次、四次挥手与 TIME_WAIT、重传与滑动窗口、拥塞控制，以及 SYN 洪水攻击">
+<link rel="stylesheet" href="../assets/article.css">
+<style>:root{--acc:#facc15}</style>
+</head>
+<body>
+<div class="wrap">
+  <nav class="top"><a href="../index.html">← 全部视频</a><a class="watch" href="landscape.html">▶ 看视频</a></nav>
+  <header class="hero">
+    <div class="tag">计算机与后端 · 图文详解</div>
+    <h1>TCP 三次握手：为什么偏偏是三次</h1>
+    <p>握手过程与序列号、为什么不能两次、四次挥手与 TIME_WAIT、重传与滑动窗口、拥塞控制，以及 SYN 洪水攻击</p>
+    <div class="meta">约 8 分钟读完 · 配套视频 1:20</div>
+  </header>
+  <nav class="toc">
+<ul>
+<li><a href="#_1">不可靠的网络，可靠的连接</a></li>
+<li><a href="#_2">三次握手的过程</a></li>
+<li><a href="#_6">为什么一定是三次</a></li>
+<li><a href="#_8">断开连接：四次挥手</a></li>
+<li><a href="#tcp">握手之后：TCP 如何保证可靠</a></li>
+<li><a href="#syn">握手也能被利用：SYN 洪水攻击</a></li>
+<li><a href="#_14">动手观察</a></li>
+<li><a href="#_15">高频面试题速答</a></li>
+<li><a href="#_16">总结</a></li>
+</ul>
+</nav>
+
+  <article>
+<figure><img src="img/f-6.jpg" alt="网络本身，并不可靠" loading="lazy"><figcaption>网络本身，并不可靠</figcaption></figure>
+<h2 id="_1">不可靠的网络，可靠的连接</h2>
+<p>互联网底层的 IP 协议只负责「尽力而为」地把数据包送到目的地，但它不保证：</p>
+<ul>
+<li>数据包一定能到（可能<strong>丢失</strong>）；</li>
+<li>按发送的顺序到达（可能<strong>乱序</strong>）；</li>
+<li>只到达一次（可能<strong>重复</strong>）。</li>
+</ul>
+<p>而我们访问网页、传输文件、调用接口时，需要的是完整、有序、不重复的数据。<strong>TCP（传输控制协议）</strong> 就是在不可靠的 IP 之上，构建出一条可靠的「字节流管道」。</p>
+<p>建立这条管道之前，双方要先「打个招呼」，这就是著名的<strong>三次握手</strong>。</p>
+<h2 id="_2">三次握手的过程</h2>
+<figure><img src="img/f-18.jpg" alt="三次握手：像打电话时确认双方都能听到" loading="lazy"><figcaption>三次握手：像打电话时确认双方都能听到</figcaption></figure>
+<h3 id="_3">一个类比</h3>
+<p>就像打电话时确认信号：</p>
+<ol>
+<li>「喂，听得到吗？」</li>
+<li>「听得到！你听得到我吗？」</li>
+<li>「听得到！」</li>
+</ol>
+<p>三句话之后，双方都确认了：我能说、对方能听；对方能说、我能听。</p>
+<h3 id="_4">真实的报文</h3>
+<table>
+<thead>
+<tr>
+<th>步骤</th>
+<th>方向</th>
+<th>报文</th>
+<th>客户端状态</th>
+<th>服务器状态</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>0</td>
+<td></td>
+<td></td>
+<td>CLOSED</td>
+<td>LISTEN（监听端口）</td>
+</tr>
+<tr>
+<td>1</td>
+<td>客户端 → 服务器</td>
+<td><code>SYN, seq=x</code></td>
+<td>SYN_SENT</td>
+<td></td>
+</tr>
+<tr>
+<td>2</td>
+<td>服务器 → 客户端</td>
+<td><code>SYN+ACK, seq=y, ack=x+1</code></td>
+<td></td>
+<td>SYN_RCVD</td>
+</tr>
+<tr>
+<td>3</td>
+<td>客户端 → 服务器</td>
+<td><code>ACK, ack=y+1</code></td>
+<td>ESTABLISHED</td>
+<td>ESTABLISHED</td>
+</tr>
+</tbody>
+</table>
+<p>几个关键字段：</p>
+<ul>
+<li><strong>SYN</strong>（Synchronize）：请求建立连接，并同步自己的初始序列号；</li>
+<li><strong>ACK</strong>（Acknowledgment）：确认收到了对方的数据；</li>
+<li><strong>seq</strong>（序列号）：TCP 给发送的每个字节编号，<code>seq</code> 是本次报文第一个字节的编号；</li>
+<li><strong>ack</strong>（确认号）：「我已经收到了你编号到 ack−1 为止的所有数据，下一个请从 ack 开始」。</li>
+</ul>
+<p>SYN 报文虽然不携带数据，但规定它要占用一个序列号，所以对 SYN 的确认是 <code>x+1</code>。</p>
+<h3 id="_5">初始序列号为什么是随机的</h3>
+<p>每个连接的初始序列号（ISN）都是随机生成的，而不是从 0 开始。原因有两个：</p>
+<ol>
+<li><strong>避免和旧连接混淆</strong>：如果同一对地址和端口上，旧连接残留的数据包晚到了，随机的序列号让它几乎不可能恰好落在新连接的有效范围里；</li>
+<li><strong>安全</strong>：如果序列号可以预测，攻击者就能伪造报文，插入到别人的连接中。</li>
+</ol>
+<h2 id="_6">为什么一定是三次</h2>
+<figure><img src="img/f-35.jpg" alt="第三次握手的关键作用：拒绝过期的连接请求" loading="lazy"><figcaption>第三次握手的关键作用：拒绝过期的连接请求</figcaption></figure>
+<p>这是面试中最常被追问的问题。可以从三个角度回答。</p>
+<h3 id="1">1. 确认双方的收发能力</h3>
+<table>
+<thead>
+<tr>
+<th>握手后</th>
+<th>客户端知道</th>
+<th>服务器知道</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>第 1 次</td>
+<td>什么都不确定</td>
+<td>客户端能发，自己能收</td>
+</tr>
+<tr>
+<td>第 2 次</td>
+<td>自己能发能收，服务器能发能收</td>
+<td>（同上）</td>
+</tr>
+<tr>
+<td>第 3 次</td>
+<td>（同上）</td>
+<td>自己能发，客户端能收</td>
+</tr>
+</tbody>
+</table>
+<p>只有三次之后，<strong>双方都确认了</strong>对方和自己的发送、接收能力都正常。</p>
+<h3 id="2">2. 同步双方的初始序列号</h3>
+<p>TCP 是双向通信，两个方向各有一套序列号。客户端的 ISN 由服务器在第二步确认；服务器的 ISN 必须由客户端在第三步确认。少了第三次，服务器就无法确定客户端是否收到了自己的序列号。</p>
+<h3 id="3">3. 防止过期的连接请求建立连接（最重要）</h3>
+<p>TCP 的规范（RFC 793）中特别强调了这一点。设想这样一个场景：</p>
+<ol>
+<li>客户端发出一个 SYN（seq=100），但它在网络中滞留了很久；</li>
+<li>客户端等不到回应，又发了一个新的 SYN（seq=200），并正常完成了连接和通信；</li>
+<li>后来，那个旧的 SYN 终于到达了服务器。</li>
+</ol>
+<p><strong>如果只有两次握手</strong>：服务器收到旧 SYN 并回复后，就认为连接已经建立了，开始为它分配资源、等待数据。但客户端根本不需要这个连接，服务器的资源就被白白浪费了。</p>
+<p><strong>有了第三次握手</strong>：服务器回复 <code>SYN+ACK, ack=101</code>；客户端发现这个确认号对应的是自己早已放弃的请求（当前期待的应该是 201），就回复 <strong>RST</strong> 报文，让服务器放弃这个连接。</p>
+<h3 id="_7">那为什么不是四次</h3>
+<p>理论上，服务器的 ACK（确认客户端的 SYN）和 SYN（发出自己的序列号）可以分两次发。但它们可以合并在同一个报文里，没必要多一次往返，所以三次就够了。</p>
+<h2 id="_8">断开连接：四次挥手</h2>
+<figure><img src="img/f-50.jpg" alt="四次挥手与 TIME_WAIT" loading="lazy"><figcaption>四次挥手与 TIME_WAIT</figcaption></figure>
+<h3 id="_9">过程</h3>
+<table>
+<thead>
+<tr>
+<th>步骤</th>
+<th>方向</th>
+<th>报文</th>
+<th>含义</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td>客户端 → 服务器</td>
+<td><code>FIN</code></td>
+<td>我的数据发完了</td>
+</tr>
+<tr>
+<td>2</td>
+<td>服务器 → 客户端</td>
+<td><code>ACK</code></td>
+<td>知道了（但我可能还有数据要发）</td>
+</tr>
+<tr>
+<td>3</td>
+<td>服务器 → 客户端</td>
+<td><code>FIN</code></td>
+<td>我的数据也发完了</td>
+</tr>
+<tr>
+<td>4</td>
+<td>客户端 → 服务器</td>
+<td><code>ACK</code></td>
+<td>知道了，再见</td>
+</tr>
+</tbody>
+</table>
+<p>这里以客户端主动关闭为例，实际上任何一方都可以先发起关闭。</p>
+<h3 id="_10">为什么是四次，而不是三次</h3>
+<p>因为 TCP 是<strong>全双工</strong>的，两个方向要分别关闭。服务器收到客户端的 FIN 时，可能还有数据没有发完，所以它先回一个 ACK，等自己的数据发完了，再单独发 FIN。如果服务器恰好没有数据要发，第二步和第三步有时也可以合并。</p>
+<h3 id="time_wait-2msl">TIME_WAIT：为什么要等 2MSL</h3>
+<p>主动关闭的一方发出最后一个 ACK 后，不会立刻关闭，而是进入 <strong>TIME_WAIT</strong> 状态，等待 <strong>2MSL</strong>（MSL 是报文在网络中的最大生存时间）。原因有两个：</p>
+<ol>
+<li><strong>确保最后的 ACK 送达</strong>：如果这个 ACK 丢了，对方会重发 FIN，而处于 TIME_WAIT 的一方还能再回一次 ACK；</li>
+<li><strong>让旧连接的数据包在网络中消失</strong>：避免它们被同一个地址和端口上新建立的连接误收。</li>
+</ol>
+<p>在高并发的服务端，大量短连接可能产生很多 TIME_WAIT，占用端口和资源。常见的应对方式包括：尽量使用<strong>长连接</strong>（如 HTTP keep-alive、连接池），以及在合适的场景下调整系统参数。</p>
+<h2 id="tcp">握手之后：TCP 如何保证可靠</h2>
+<figure><img src="img/f-63.jpg" alt="确认与重传、滑动窗口、拥塞控制" loading="lazy"><figcaption>确认与重传、滑动窗口、拥塞控制</figcaption></figure>
+<p>三次握手只是开始，TCP 的可靠性主要依靠以下机制。</p>
+<h3 id="_11">确认与重传</h3>
+<p>接收方收到数据后回复 ACK。发送方如果在一定时间内没有收到确认（<strong>超时重传</strong>），或者连续收到三个重复的 ACK（<strong>快速重传</strong>），就会重新发送这部分数据。</p>
+<h3 id="_12">滑动窗口与流量控制</h3>
+<p>如果每发一个包都等确认，效率太低。TCP 允许发送方在<strong>窗口</strong>范围内连续发送多个包，不必逐个等待；收到确认后，窗口向前滑动。</p>
+<p>接收方会在 ACK 中告诉发送方自己还有多少缓冲空间（<strong>接收窗口</strong>），发送方据此控制发送速度，避免把接收方「淹没」。这叫<strong>流量控制</strong>。</p>
+<h3 id="_13">拥塞控制</h3>
+<p>流量控制照顾的是接收方，<strong>拥塞控制</strong>照顾的是整个网络。发送方维护一个<strong>拥塞窗口</strong>：</p>
+<ol>
+<li><strong>慢启动</strong>：刚开始时窗口很小，每收到一轮确认就翻倍，指数增长；</li>
+<li><strong>拥塞避免</strong>：达到一定阈值后，改为每轮只增加一点，线性增长；</li>
+<li><strong>发现丢包</strong>：认为网络可能拥塞了，把窗口大幅缩小，再慢慢恢复。</li>
+</ol>
+<p>现代操作系统还有 CUBIC、BBR 等更先进的拥塞控制算法，但基本思想一致：<strong>网络通畅时加速，出现拥塞时退让。</strong></p>
+<h2 id="syn">握手也能被利用：SYN 洪水攻击</h2>
+<figure><img src="img/f-72.jpg" alt="SYN 洪水与 SYN Cookie" loading="lazy"><figcaption>SYN 洪水与 SYN Cookie</figcaption></figure>
+<p>服务器收到 SYN 后，会把这个「半连接」放进一个队列，等待第三次握手。攻击者可以伪造大量源地址，只发 SYN，从不回复第三次 ACK，迅速占满这个队列，导致正常用户无法建立连接。这就是 <strong>SYN 洪水攻击</strong>（SYN Flood）。</p>
+<p>常见的防御手段：</p>
+<ul>
+<li><strong>SYN Cookie</strong>：服务器收到 SYN 时不立即分配队列资源，而是把连接信息编码进自己返回的初始序列号里。等收到合法的第三次 ACK 时，再从确认号中还原信息，建立连接。</li>
+<li>增大半连接队列、缩短超时时间；</li>
+<li>在网络层面使用防火墙和流量清洗服务。</li>
+</ul>
+<h2 id="_14">动手观察</h2>
+<p>用 <code>tcpdump</code> 可以亲眼看到三次握手（需要管理员权限）：</p>
+<pre><code class="language-bash">sudo tcpdump -i any -nn 'tcp port 443 and (tcp[tcpflags] &amp; (tcp-syn|tcp-fin) != 0)'
+</code></pre>
+<p>在另一个终端执行 <code>curl https://example.com</code>，就能看到带 <code>[S]</code>（SYN）、<code>[S.]</code>（SYN+ACK）和 <code>[F.]</code>（FIN+ACK）标记的报文。</p>
+<p>查看本机各个连接的状态：</p>
+<pre><code class="language-bash">ss -tan | awk '{print $1}' | sort | uniq -c
+</code></pre>
+<h2 id="_15">高频面试题速答</h2>
+<p><strong>Q：为什么是三次握手，不是两次？</strong>
+主要是为了防止已经失效的连接请求突然到达服务器，导致服务器错误地建立连接；同时也是为了让双方都确认对方的收发能力，并同步双方的初始序列号。</p>
+<p><strong>Q：第三次握手的 ACK 丢了会怎样？</strong>
+服务器停留在 SYN_RCVD 状态，会超时重发 SYN+ACK；客户端此时已认为连接建立，如果它直接发送数据，数据包中携带的 ACK 也能让服务器完成连接建立。</p>
+<p><strong>Q：TIME_WAIT 出现在哪一方？为什么要等 2MSL？</strong>
+出现在主动关闭的一方。等待 2MSL 是为了确保最后的 ACK 能送达，并让旧连接的残留数据包在网络中消失。</p>
+<p><strong>Q：流量控制和拥塞控制有什么区别？</strong>
+流量控制防止发送方压垮接收方，依据接收窗口；拥塞控制防止发送方压垮网络，依据拥塞窗口。</p>
+<h2 id="_16">总结</h2>
+<figure><img src="img/f-77.jpg" alt="三次握手的三个作用" loading="lazy"><figcaption>三次握手的三个作用</figcaption></figure>
+<ul>
+<li>三次握手：<strong>SYN → SYN+ACK → ACK</strong>；</li>
+<li>为什么是三次：<strong>确认收发能力、同步序列号、拒绝过期连接</strong>；</li>
+<li>四次挥手：因为双向分别关闭，服务器可能还有数据要发；主动关闭方要经历 <strong>TIME_WAIT</strong>；</li>
+<li>可靠性来自：<strong>确认与重传、滑动窗口、拥塞控制</strong>；</li>
+<li>握手过程也可能被利用，<strong>SYN Cookie</strong> 是经典的防御方法。</li>
+</ul>
+<div class="refs">
+<h3 id="_17">参考资料</h3>
+<ul>
+<li>RFC 793 / RFC 9293：Transmission Control Protocol.</li>
+<li>RFC 5681：TCP Congestion Control.</li>
+<li>RFC 4987：TCP SYN Flooding Attacks and Common Mitigations.</li>
+<li>Stevens, W. R. <em>TCP/IP Illustrated, Volume 1</em>.（中译本：《TCP/IP 详解 卷 1》）</li>
+</ul>
+</div>
+  </article>
+  <div class="foot"><a href="../index.html">← 返回首页</a><a href="landscape.html">▶ 看配套视频</a></div>
+</div>
+</body>
+</html>

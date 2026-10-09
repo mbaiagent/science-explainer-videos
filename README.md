@@ -18,6 +18,7 @@
 | Opus 5.5 是怎么做出视频的 | `opus-video/landscape.html` | 横屏 1920×1080 | 76s |
 | MySQL 的 MVCC | `mysql-mvcc/landscape.html` | 横屏 1920×1080 | 80s |
 | 按下回车后发生了什么 | `http-request/landscape.html` | 横屏 1920×1080 | 80s |
+| TCP 三次握手 | `tcp-handshake/landscape.html` | 横屏 1920×1080 | 80s |
 
 ### 幸福的科学
 钩子 → 享乐适应（快乐曲线 + 跑步机）→ 哈佛成人发展研究（关系网络）→ 心流（挑战 × 技能坐标图）→ 今晚就能做的 3 件事 → 收尾
@@ -51,6 +52,9 @@
 
 ### 按下回车后发生了什么
 按下回车 → DNS 逐级查询 → TCP 三次握手与 TLS 握手 → HTTP 请求与响应、服务器内部 → 浏览器渲染流程 → 耗时分布与优化 → 收尾
+
+### TCP 三次握手
+不可靠的网络 → 三次握手与序列号 → 为什么必须三次（拒绝过期 SYN）→ 四次挥手与 TIME_WAIT → 重传、滑动窗口、拥塞控制 → SYN 洪水与 SYN Cookie → 收尾
 
 ## 预览
 
