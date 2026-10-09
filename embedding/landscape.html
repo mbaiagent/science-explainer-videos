@@ -1,0 +1,320 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Embedding 向量</title>
+<style>
+  :root{--bg:#07080f;--fg:#f4ede4;--muted:#9a93a8;--acc:#818cf8}
+  html,body{margin:0;height:100%;background:var(--bg);color:var(--fg);
+    font-family:-apple-system,"PingFang SC","Noto Sans SC","Noto Sans CJK SC","Microsoft YaHei",sans-serif}
+  body{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;overflow:hidden}
+  #stage{display:block;background:#07080f;border-radius:12px;box-shadow:0 20px 60px rgba(0,0,0,.55);cursor:pointer}
+  #bar{display:flex;align-items:center;gap:12px;width:min(calc(100vw - 32px),640px)}
+  #btn{width:40px;height:40px;border-radius:50%;border:1px solid rgba(129,140,248,.5);background:transparent;
+    color:var(--acc);font-size:16px;cursor:pointer;flex:none}
+  #seek{flex:1;accent-color:var(--acc)}
+  #time{font-variant-numeric:tabular-nums;font-size:13px;color:var(--muted);min-width:84px;text-align:right}
+  body.render{display:block}
+  body.render #bar{display:none}
+  body.render #stage{border-radius:0;box-shadow:none}
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="bar">
+  <button id="btn" aria-label="播放/暂停">❚❚</button>
+  <input id="seek" type="range" min="0" max="80" step="0.01" value="0">
+  <span id="time">0:00 / 1:20</span>
+</div>
+<script>
+/* ============ 基础设置（横屏 1920×1080） ============ */
+const W = 1920, H = 1080, DUR = 80;
+const cv = document.getElementById('stage'), ctx = cv.getContext('2d');
+cv.width = W; cv.height = H;
+const FONT = '"PingFang SC","Noto Sans SC","Noto Sans CJK SC","Source Han Sans SC","Microsoft YaHei",sans-serif';
+const MONO = '"JetBrains Mono","SF Mono",Menlo,Consolas,"DejaVu Sans Mono","Noto Sans Mono CJK SC","PingFang SC","Microsoft YaHei",monospace';
+const C = {acc:'#818cf8', mint:'#6ee7c8', gold:'#ffd38a', coral:'#ff9e7a', rose:'#ff8a8a', blue:'#9cc3ff', text:'#f4ede4', muted:'#9a93a8', dim:'#4a4558', panel:'#0f0e1f'};
+
+const clamp = (x,a=0,b=1) => Math.max(a, Math.min(b, x));
+const lerp = (a,b,t) => a + (b-a)*t;
+const p = (t,a,b) => clamp((t-a)/(b-a));
+const eo = x => 1 - Math.pow(1-x, 3);
+const eio = x => x < .5 ? 4*x*x*x : 1 - Math.pow(-2*x+2, 3)/2;
+const eback = x => { const c1=1.70158, c3=c1+1; return 1 + c3*Math.pow(x-1,3) + c1*Math.pow(x-1,2); };
+function rnd(seed){ let s = seed>>>0; return () => { s = (s*1664525 + 1013904223)>>>0; return s/4294967296; }; }
+
+let SA = 1;
+const al = a => { ctx.globalAlpha = clamp(SA*a); };
+const sceneA = (t,a,b,f=.5) => Math.min(p(t,a,a+f), 1 - p(t,b-f,b));
+
+function txt(s, x, y, o = {}){
+  const {size=64, weight=700, color=C.text, alpha=1, align='center', glow=0, scale=1, font=FONT} = o;
+  if (alpha <= 0) return;
+  ctx.save(); al(alpha);
+  ctx.font = `${weight} ${size}px ${font}`;
+  ctx.textAlign = align; ctx.textBaseline = 'middle'; ctx.fillStyle = color;
+  if (glow){ ctx.shadowColor = color; ctx.shadowBlur = glow; }
+  if (scale !== 1){ ctx.translate(x, y); ctx.scale(scale, scale); ctx.fillText(s, 0, 0); }
+  else ctx.fillText(s, x, y);
+  ctx.restore();
+}
+function rise(s, x, y, t, t0, o = {}, d = .7){
+  const e = eo(p(t, t0, t0+d));
+  if (e <= 0) return;
+  txt(s, x, y + (1-e)*36, {...o, alpha:(o.alpha ?? 1)*e});
+}
+function rr(x,y,w,h,r){ ctx.beginPath(); ctx.roundRect(x,y,w,h,r); }
+function box(x, y, w, h, a, o = {}){
+  const {fill='rgba(255,255,255,.05)', stroke='rgba(129,140,248,.35)', lw=2, glow=0, r=18, dash=null} = o;
+  if (a <= 0) return;
+  ctx.save(); al(a); rr(x, y, w, h, r); ctx.fillStyle = fill; ctx.fill();
+  if (dash) ctx.setLineDash(dash);
+  ctx.strokeStyle = stroke; ctx.lineWidth = lw; if (glow){ ctx.shadowColor = stroke; ctx.shadowBlur = glow; } ctx.stroke(); ctx.restore();
+}
+function arrow(x1, y1, x2, y2, e, a, color = C.acc, lw = 3){
+  if (e <= 0 || a <= 0) return;
+  const x = lerp(x1, x2, e), y = lerp(y1, y2, e), ang = Math.atan2(y2 - y1, x2 - x1);
+  ctx.save(); al(a); ctx.strokeStyle = color; ctx.fillStyle = color; ctx.lineWidth = lw; ctx.lineCap = 'round';
+  ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x, y); ctx.stroke();
+  if (e > .85){ ctx.translate(x, y); ctx.rotate(ang); ctx.beginPath(); ctx.moveTo(4, 0); ctx.lineTo(-14, -9); ctx.lineTo(-14, 9); ctx.closePath(); ctx.fill(); }
+  ctx.restore();
+}
+function panel(x, y, w, h, title, a){
+  box(x, y, w, h, a, {fill:C.panel, stroke:'rgba(255,255,255,.1)', r:20});
+  if (a <= 0) return;
+  ctx.save(); al(a); ctx.strokeStyle = 'rgba(255,255,255,.07)'; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(x, y + 52); ctx.lineTo(x + w, y + 52); ctx.stroke();
+  ['#ff6b6b','#ffd166','#6ee7a0'].forEach((c, i) => { ctx.fillStyle = c; ctx.globalAlpha = clamp(SA*a*.8); ctx.beginPath(); ctx.arc(x + 30 + i*24, y + 26, 7, 0, 6.283); ctx.fill(); });
+  ctx.restore();
+  txt(title, x + w/2, y + 27, {size:22, weight:500, color:C.muted, font:MONO, alpha:a});
+}
+
+/* ============ 背景 ============ */
+const PARTS = (() => { const r = rnd(151); return Array.from({length:100}, () => ({
+  x:r()*W, y:r()*H, s:r()*2.2+.5, v:r()*12+4, ph:r()*6.283, c:r()<.25})); })();
+function background(t){
+  const g = ctx.createLinearGradient(0,0,W,H);
+  g.addColorStop(0,'#0a0916'); g.addColorStop(.55,'#110f24'); g.addColorStop(1,'#18122c');
+  ctx.globalAlpha = 1; ctx.fillStyle = g; ctx.fillRect(0,0,W,H);
+  const gx = W*.5 + Math.sin(t*.27)*140;
+  const rg = ctx.createRadialGradient(gx, H*.45, 0, gx, H*.45, 950);
+  rg.addColorStop(0,'rgba(129,140,248,0.09)'); rg.addColorStop(1,'rgba(129,140,248,0)');
+  ctx.fillStyle = rg; ctx.fillRect(0,0,W,H);
+  ctx.fillStyle = C.acc;
+  for (let x = 40; x < W; x += 80) for (let y = 40; y < H; y += 80){ ctx.globalAlpha = .06; ctx.fillRect(x, y, 2, 2); }
+  for (const q of PARTS){
+    const y = ((q.y - t*q.v) % H + H) % H, x = q.x + Math.sin(t*.35 + q.ph)*12;
+    ctx.globalAlpha = .2 + .3*(.5 + .5*Math.sin(t*1.2 + q.ph));
+    ctx.fillStyle = q.c ? C.acc : '#d8d0ff';
+    ctx.beginPath(); ctx.arc(x, y, q.s, 0, 6.283); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+}
+function vignette(){
+  const v = ctx.createRadialGradient(W/2, H/2, W*.28, W/2, H/2, W*.62);
+  v.addColorStop(0,'rgba(0,0,0,0)'); v.addColorStop(1,'rgba(0,0,0,.55)');
+  ctx.globalAlpha = 1; ctx.fillStyle = v; ctx.fillRect(0,0,W,H);
+}
+function codeLine(s, x, y, size, a, kw = /\b(public|class|static|void|new|return)\b/){
+  const parts = s.split(/("[^"]*"|\b(?:public|class|static|void|new|return|getstatic|ldc|invokevirtual)\b)/g);
+  ctx.save(); al(a); ctx.font = `500 ${size}px ${MONO}`; ctx.textBaseline = 'middle'; ctx.textAlign = 'left';
+  let xx = x;
+  for (const seg of parts){ if (!seg) continue;
+    ctx.fillStyle = seg.startsWith('"') ? C.mint : /^(public|class|static|void|new|return|getstatic|ldc|invokevirtual)$/.test(seg) ? C.acc : C.text;
+    ctx.fillText(seg, xx, y); xx += ctx.measureText(seg).width; }
+  ctx.restore();
+}
+
+function pill(s, x, y, a, o = {}){
+  const {size=30, color=C.text, stroke='rgba(255,255,255,.2)', fill='rgba(255,255,255,.05)', font=FONT, weight=700} = o;
+  if (a <= 0) return;
+  ctx.save(); ctx.font = `${weight} ${size}px ${font}`; const w = ctx.measureText(s).width + 52; ctx.restore();
+  box(x - w/2, y - size*.9, w, size*1.8, a, {fill, stroke, r:size*.9});
+  txt(s, x, y, {size, weight, color, font, alpha:a});
+}
+function pt(s, x, y, a, c = C.acc, o = {}){
+  if (a <= 0) return;
+  const {r=12, size=30, dx=20, align='left', glow=0} = o;
+  ctx.save(); al(a); ctx.fillStyle = c; ctx.shadowColor = c; ctx.shadowBlur = glow || 12; ctx.beginPath(); ctx.arc(x, y, r, 0, 6.283); ctx.fill(); ctx.restore();
+  if (s) txt(s, x + (align === 'left' ? dx : -dx), y, {size, weight:800, align, alpha:a});
+}
+function blob(x, y, rx, ry, a, c){ if (a <= 0) return; ctx.save(); al(a*.14); ctx.fillStyle = c; ctx.beginPath(); ctx.ellipse(x, y, rx, ry, 0, 0, 6.283); ctx.fill(); al(a*.4); ctx.strokeStyle = c; ctx.lineWidth = 2; ctx.setLineDash([8, 8]); ctx.stroke(); ctx.restore(); }
+
+/* ============ 场景 1 · 钩子 (0–7s) ============ */
+function s1(t){
+  rise('电脑怎么知道：', W/2, 200, t, .2, {size:48, weight:800, color:C.muted});
+  rise('「猫」和「狗」更像，和「汽车」不像？', W/2, 300, t, .8, {size:64, weight:900});
+  const a = eo(p(t, 1.8, 2.3));
+  pt('猫', 760, 500, a, C.acc, {size:40}); pt('狗', 900, 540, a, C.acc, {size:40}); pt('汽车', 1240, 470, a, C.blue, {size:40});
+  if (t > 2.6){ const k = eo(p(t, 2.6, 3.2)); ctx.save(); al(k); ctx.strokeStyle = C.mint; ctx.lineWidth = 3; ctx.setLineDash([6, 6]);
+    ctx.beginPath(); ctx.moveTo(772, 504); ctx.lineTo(lerp(772, 888, k), lerp(504, 536, k)); ctx.stroke(); ctx.strokeStyle = C.rose; ctx.beginPath(); ctx.moveTo(912, 536); ctx.lineTo(lerp(912, 1228, k), lerp(536, 474, k)); ctx.stroke(); ctx.restore();
+    txt('近', 830, 560, {size:28, weight:900, color:C.mint, alpha:k}); txt('远', 1070, 540, {size:28, weight:900, color:C.rose, alpha:k}); }
+  const k = p(t, 4.0, 4.6);
+  if (k > 0) txt('Embedding', W/2, 760, {size:120, weight:900, color:C.acc, glow:40, font:MONO, alpha:clamp(k*2), scale:eback(k)});
+  rise('把「意思」变成一串数字', W/2, 900, t, 4.8, {size:48, weight:800});
+}
+
+/* ============ 场景 2 · 编号不行 (7–19s) ============ */
+function s2(t){
+  rise('最直接的办法：给每个词编号？', W/2, 110, t, 7.2, {size:58, weight:900});
+  [['猫', '1'], ['狗', '2'], ['汽车', '3']].forEach(([w, n], i) => { const e = eo(p(t, 7.8 + i*.3, 8.2 + i*.3)), y = 260 + i*90;
+    txt(w, 420, y, {size:40, weight:900, align:'right', alpha:e}); txt('→ ' + n, 470, y, {size:40, weight:800, font:MONO, color:C.acc, align:'left', alpha:e}); });
+  rise('「3 − 2 = 1」难道说明汽车和狗的差别，等于狗和猫的差别？', 1180, 350, t, 9.2, {size:30, weight:700, color:C.rose});
+  rise('独热编码（one-hot）：', 300, 600, t, 11.0, {size:34, weight:800, align:'left'});
+  [['猫', '[1, 0, 0, 0, …, 0]'], ['狗', '[0, 1, 0, 0, …, 0]'], ['汽车', '[0, 0, 1, 0, …, 0]']].forEach(([w, v], i) => { const e = eo(p(t, 11.4 + i*.3, 11.8 + i*.3)), y = 680 + i*62;
+    txt(w, 420, y, {size:30, weight:900, align:'right', alpha:e}); txt(v, 470, y, {size:28, weight:600, font:MONO, align:'left', alpha:e}); });
+  rise('维度和词表一样大（几万到几十万维）', 880, 700, t, 12.8, {size:28, weight:700, color:C.rose, align:'left'});
+  rise('而且任意两个词之间的距离都一样', 880, 750, t, 13.3, {size:28, weight:700, color:C.rose, align:'left'});
+  rise('这两种表示，都装不下「意思」', W/2, 950, t, 14.8, {size:44, weight:900, color:C.gold});
+}
+
+/* ============ 场景 3 · 语义空间 (19–33s) ============ */
+const ANIMAL = [['猫', 520, 380], ['狗', 600, 450], ['老虎', 450, 300], ['兔子', 660, 340]];
+const VEH = [['汽车', 1290, 650], ['自行车', 1180, 720], ['飞机', 1420, 580], ['火车', 1360, 740]];
+const FOOD = [['苹果', 980, 300], ['香蕉', 1080, 250], ['面包', 1120, 350]];
+function s3(t){
+  rise('Embedding：用一串「有意义」的数字表示一个词', W/2, 100, t, 19.2, {size:52, weight:900});
+  const a = eo(p(t, 19.8, 20.3));
+  box(260, 170, 1400, 680, a, {fill:'rgba(129,140,248,.03)', stroke:'rgba(129,140,248,.25)', dash:[10, 8], r:24});
+  txt('语义空间（示意：实际有几百到几千维）', 290, 205, {size:22, weight:600, color:C.muted, align:'left', alpha:a});
+  blob(560, 370, 200, 140, eo(p(t, 23.2, 23.8)), C.acc); blob(1300, 660, 220, 140, eo(p(t, 23.6, 24.2)), C.blue); blob(1060, 300, 160, 100, eo(p(t, 24.0, 24.6)), C.gold);
+  txt('动物', 560, 520, {size:28, weight:900, color:C.acc, alpha:eo(p(t, 23.2, 23.8))});
+  txt('交通工具', 1300, 820, {size:28, weight:900, color:C.blue, alpha:eo(p(t, 23.6, 24.2))});
+  txt('食物', 1060, 420, {size:28, weight:900, color:C.gold, alpha:eo(p(t, 24.0, 24.6))});
+  [[ANIMAL, C.acc, 20.6], [VEH, C.blue, 21.4], [FOOD, C.gold, 22.2]].forEach(([g, c, ts]) => g.forEach(([s, x, y], i) => pt(s, x, y, eback(p(t, ts + i*.15, ts + i*.15 + .4)), c, {size:28})));
+  pill('猫 = [0.82, 0.10, −0.33, 0.57, …]', 1500, 260, eo(p(t, 25.4, 25.9)), {size:24, font:MONO, color:C.acc, stroke:C.acc});
+  rise('意思相近的词，在空间里靠得近', W/2, 920, t, 26.6, {size:44, weight:900});
+  rise('每个词是一个点，也就是一串数字；数字本身没有含义，「位置关系」才有', W/2, 985, t, 28.4, {size:28, weight:600, color:C.muted});
+}
+
+/* ============ 场景 4 · 向量运算 (33–45s) ============ */
+function s4(t){
+  rise('更神奇的是：方向也有含义', W/2, 105, t, 33.2, {size:58, weight:900});
+  const a = eo(p(t, 33.8, 34.3));
+  const M = [480, 720], Wm = [700, 520], K = [1100, 660], Q = [1320, 460];
+  pt('男人', M[0], M[1], a, C.blue, {size:34}); pt('女人', Wm[0], Wm[1], a, C.rose, {size:34});
+  pt('国王', K[0], K[1], eo(p(t, 34.6, 35)), C.blue, {size:34});
+  const g = eo(p(t, 35.4, 36.2));
+  arrow(M[0], M[1], Wm[0] - 10, Wm[1] + 10, g, 1, C.gold, 4);
+  txt('「性别」方向', 520, 590, {size:26, weight:800, color:C.gold, alpha:g});
+  const g2 = eo(p(t, 37.0, 38.0));
+  if (g2 > 0){ ctx.save(); al(.6); ctx.setLineDash([8, 8]); ctx.strokeStyle = C.gold; ctx.lineWidth = 3; ctx.beginPath(); ctx.moveTo(K[0], K[1]); ctx.lineTo(lerp(K[0], Q[0], g2), lerp(K[1], Q[1], g2)); ctx.stroke(); ctx.restore(); }
+  pt('女王', Q[0], Q[1], eback(p(t, 38.0, 38.5)), C.rose, {size:34, glow:30});
+  rise('国王 − 男人 + 女人 ≈ 女王', W/2, 230, t, 38.8, {size:56, weight:900, color:C.acc, glow:20, font:FONT});
+  rise('同理：法国 → 巴黎 的方向，和 意大利 → 罗马 很接近', W/2, 860, t, 40.4, {size:36, weight:800});
+  rise('这个经典例子来自 2013 年的 word2vec 研究', W/2, 930, t, 41.8, {size:28, weight:600, color:C.muted});
+}
+
+/* ============ 场景 5 · 怎么学出来的 (45–59s) ============ */
+const PAIRS = [['怎么退货？', '我想把买的东西退了', 1], ['怎么退货？', '今天天气不错', 0]];
+function s5(t){
+  rise('这些数字是怎么学出来的？', W/2, 105, t, 45.2, {size:58, weight:900});
+  const a = eo(p(t, 45.8, 46.3));
+  box(120, 190, 820, 620, a, {fill:'rgba(255,255,255,.03)', stroke:'rgba(129,140,248,.35)', r:24});
+  txt('思路一：看「上下文」', 530, 240, {size:34, weight:900, color:C.acc, alpha:a});
+  [['我家的', '猫', '喜欢晒太阳'], ['我家的', '狗', '喜欢晒太阳'], ['我家的', '猫', '刚吃完饭'], ['我家的', '狗', '刚吃完饭']].forEach(([l, m, r], i) => {
+    const e = eo(p(t, 46.6 + i*.35, 47 + i*.35)), y = 330 + i*70;
+    txt(l, 400, y, {size:30, weight:600, color:C.muted, align:'right', alpha:e});
+    pill(m, 445, y, e, {size:30, color:C.acc, stroke:C.acc});
+    txt(r, 490, y, {size:30, weight:600, color:C.muted, align:'left', alpha:e});
+  });
+  txt('出现在相似的上下文里 → 意思相近', 530, 650, {size:28, weight:800, color:C.gold, alpha:eo(p(t, 48.4, 48.8))});
+  txt('训练时让它们的向量靠近', 530, 700, {size:26, weight:600, color:C.muted, alpha:eo(p(t, 48.8, 49.2))});
+  box(980, 190, 820, 620, eo(p(t, 49.6, 50.1)), {fill:'rgba(255,255,255,.03)', stroke:'rgba(129,140,248,.35)', r:24});
+  txt('思路二：对比学习', 1390, 240, {size:34, weight:900, color:C.acc, alpha:eo(p(t, 49.6, 50.1))});
+  const cx = 1390, cy = 470, pull = eio(p(t, 51.2, 53)), e2 = eo(p(t, 50.4, 50.9));
+  pt('', cx, cy, e2, C.acc, {r:14});
+  txt('怎么退货？', cx, cy - 40, {size:26, weight:800, alpha:e2});
+  const P = [lerp(cx + 300, cx + 90, pull), lerp(cy + 120, cy + 40, pull)], N = [lerp(cx - 200, cx - 320, pull), lerp(cy + 80, cy + 180, pull)];
+  pt('', P[0], P[1], e2, C.mint, {r:12}); txt('我想把买的东西退了', P[0], P[1] + 38, {size:22, weight:700, color:C.mint, alpha:e2});
+  pt('', N[0], N[1], e2, C.rose, {r:12}); txt('今天天气不错', N[0], N[1] + 38, {size:22, weight:700, color:C.rose, alpha:e2});
+  txt('意思相同 → 拉近', cx + 200, 740, {size:24, weight:800, color:C.mint, alpha:eo(p(t, 51.4, 51.8))});
+  txt('意思无关 → 推远', cx - 200, 740, {size:24, weight:800, color:C.rose, alpha:eo(p(t, 51.4, 51.8))});
+  txt('现代的句子向量模型主要这样训练', cx, 785, {size:24, weight:600, color:C.muted, alpha:eo(p(t, 53, 53.4))});
+  rise('没有人告诉模型「猫是动物」，它从海量文本里自己学出了这些关系', W/2, 900, t, 54.4, {size:36, weight:900});
+}
+
+/* ============ 场景 6 · 相似度与应用 (59–73s) ============ */
+const USES = [['语义搜索 / RAG', '按意思找文档'], ['推荐系统', '找相似的商品、内容'], ['聚类与去重', '把相似的文本归到一起'], ['分类', '用向量训练轻量分类器'], ['跨模态', '图片和文字放进同一空间']];
+function s6(t){
+  rise('怎么比较？怎么用？', W/2, 105, t, 59.2, {size:58, weight:900});
+  const a = eo(p(t, 59.8, 60.3)), ox = 380, oy = 640;
+  box(120, 190, 640, 640, a, {fill:'rgba(255,255,255,.03)', stroke:'rgba(129,140,248,.35)', r:24});
+  txt('余弦相似度', 440, 240, {size:34, weight:900, color:C.acc, alpha:a});
+  const ang = lerp(.9, .25, eio(p(t, 60.6, 62.4)));
+  arrow(ox, oy, ox + 300, oy - 60, a, a, C.acc, 5); txt('A', ox + 320, oy - 70, {size:28, weight:900, color:C.acc, alpha:a});
+  const bx = ox + 300*Math.cos(ang + .2), by = oy - 300*Math.sin(ang + .2);
+  arrow(ox, oy, bx, by, a, a, C.gold, 5); txt('B', bx + 16, by - 12, {size:28, weight:900, color:C.gold, alpha:a});
+  ctx.save(); al(a*.8); ctx.strokeStyle = C.text; ctx.lineWidth = 2; ctx.beginPath(); ctx.arc(ox, oy, 70, -(ang + .2), -.197, false); ctx.stroke(); ctx.restore();
+  txt('θ', ox + 92, oy - 40, {size:26, weight:800, alpha:a});
+  const cos = Math.cos(ang + .2 - .197);
+  txt(`cos θ = ${cos.toFixed(2)}`, 440, 730, {size:34, weight:800, font:MONO, color:cos > .9 ? C.mint : C.text, alpha:a});
+  txt('夹角越小，越接近 1，意思越像', 440, 785, {size:24, weight:600, color:C.muted, alpha:a});
+  USES.forEach(([h, d], i) => { const st = 62.6 + i*.5, e = eo(p(t, st, st + .4)), y = 230 + i*118;
+    box(830, y - 48, 970, 100, e, {fill:'rgba(129,140,248,.06)', stroke:'rgba(129,140,248,.45)', r:18});
+    txt(h, 870, y + 2, {size:32, weight:900, color:C.acc, align:'left', alpha:e}); txt(d, 1770, y + 2, {size:26, weight:600, color:'#d9d2e4', align:'right', alpha:e}); });
+  rise('文本、图片、音频、用户行为，都可以变成向量来比较', W/2, 920, t, 66.4, {size:38, weight:900, color:C.gold});
+}
+
+/* ============ 场景 7 · 收尾 (73–80s) ============ */
+function s7(t){
+  [['意思', '→ 向量'], ['相近', '→ 靠近'], ['比较', '→ 余弦相似度']].forEach(([a, b], i) => {
+    const st = 73.2 + i*.4, e = eback(p(t, st, st + .6)); if (e <= 0) return;
+    const x = 400 + i*560, y = 330;
+    ctx.save(); ctx.translate(x, y); ctx.scale(e, e); ctx.translate(-x, -y);
+    box(x - 240, y - 100, 480, 200, clamp(e), {fill:'rgba(129,140,248,.08)', stroke:'rgba(129,140,248,.5)', r:28}); ctx.restore();
+    txt(a, x, y - 26, {size:58, weight:900, color:C.acc, alpha:clamp(e)}); txt(b, x, y + 44, {size:30, weight:500, color:C.muted, alpha:clamp(e)});
+  });
+  rise('这就是 Embedding', W/2, 620, t, 74.6, {size:90, weight:900, glow:24});
+  rise('关注我，一起看懂 AI', W/2, 790, t, 75.6, {size:36, weight:500, color:C.muted});
+}
+
+/* ============ 总调度 ============ */
+const SCENES = [[s1,-1,7],[s2,7,19],[s3,19,33],[s4,33,45],[s5,45,59],[s6,59,73],[s7,73,80]];
+function draw(t){
+  t = clamp(t, 0, DUR);
+  ctx.save(); ctx.globalAlpha = 1; ctx.clearRect(0,0,W,H); background(t);
+  for (const [fn,a,b] of SCENES){
+    if (t < a || t > b) continue;
+    SA = sceneA(t, a, b, b === DUR ? .8 : .5);
+    if (SA > 0){ ctx.save(); fn(t); ctx.restore(); }
+  }
+  SA = 1; vignette();
+  const fo = p(t, DUR - .8, DUR);
+  if (fo > 0){ ctx.globalAlpha = fo; ctx.fillStyle = '#000'; ctx.fillRect(0,0,W,H); }
+  ctx.restore();
+}
+
+/* ============ 播放器 / 逐帧渲染接口 ============ */
+const isRender = new URLSearchParams(location.search).has('render');
+window.DURATION = DUR;
+window.renderFrame = t => draw(t);
+const btn = document.getElementById('btn'), seek = document.getElementById('seek'), timeEl = document.getElementById('time');
+const fmt = s => `${Math.floor(s/60)}:${String(Math.floor(s%60)).padStart(2,'0')}`;
+function fit(){
+  if (isRender){ cv.style.width = W+'px'; cv.style.height = H+'px'; return; }
+  const w = Math.min(innerWidth - 32, (innerHeight - 84)*16/9);
+  cv.style.width = w + 'px'; cv.style.height = w*9/16 + 'px';
+}
+addEventListener('resize', fit); fit();
+
+let cur = 0, playing = !isRender, last = null;
+function toggle(){ if (cur >= DUR) cur = 0; playing = !playing; }
+btn.onclick = toggle; cv.onclick = toggle;
+addEventListener('keydown', e => { if (e.code === 'Space'){ e.preventDefault(); toggle(); } });
+seek.oninput = () => { cur = +seek.value; draw(cur); };
+function loop(ts){
+  if (playing && last != null){ cur += (ts - last)/1000; if (cur >= DUR){ cur = DUR; playing = false; } }
+  last = ts; draw(cur);
+  seek.value = cur; timeEl.textContent = `${fmt(cur)} / ${fmt(DUR)}`;
+  btn.textContent = playing ? '❚❚' : (cur >= DUR ? '↺' : '▶');
+  requestAnimationFrame(loop);
+}
+document.fonts.ready.then(() => {
+  window.ready = true;
+  if (isRender) draw(0); else requestAnimationFrame(loop);
+});
+</script>
+</body>
+</html>

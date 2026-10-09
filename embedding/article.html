@@ -1,0 +1,210 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Embedding 向量：把「意思」变成一串数字 · 图文详解</title>
+<meta name="description" content="从独热编码到 word2vec、BERT 和句向量；向量为什么能表达语义、怎么比较相似度、怎么选模型，以及它在搜索、推荐、RAG 中的用法">
+<link rel="stylesheet" href="../assets/article.css">
+<style>:root{--acc:#818cf8}</style>
+</head>
+<body>
+<div class="wrap">
+  <nav class="top"><a href="../index.html">← 全部视频</a><a class="watch" href="landscape.html">▶ 看视频</a></nav>
+  <header class="hero">
+    <div class="tag">AI 与大模型 · 图文详解</div>
+    <h1>Embedding 向量：把「意思」变成一串数字</h1>
+    <p>从独热编码到 word2vec、BERT 和句向量；向量为什么能表达语义、怎么比较相似度、怎么选模型，以及它在搜索、推荐、RAG 中的用法</p>
+    <div class="meta">约 8 分钟读完 · 配套视频 1:20</div>
+  </header>
+  <nav class="toc">
+<ul>
+<li><a href="#_1">计算机怎么理解「意思」</a></li>
+<li><a href="#_2">为什么简单的编号不行</a></li>
+<li><a href="#embedding">Embedding：稠密、有语义的向量</a></li>
+<li><a href="#_5">方向也有含义：向量运算</a></li>
+<li><a href="#_6">这些数字是怎么学出来的</a></li>
+<li><a href="#_10">怎么比较两个向量</a></li>
+<li><a href="#_11">动手试一试</a></li>
+<li><a href="#embedding_1">Embedding 能用来做什么</a></li>
+<li><a href="#_12">怎么选向量模型</a></li>
+<li><a href="#_13">需要注意的局限</a></li>
+<li><a href="#_14">总结</a></li>
+</ul>
+</nav>
+
+  <article>
+<figure><img src="img/f-6.jpg" alt="「猫」和「狗」更像，和「汽车」不像" loading="lazy"><figcaption>「猫」和「狗」更像，和「汽车」不像</figcaption></figure>
+<h2 id="_1">计算机怎么理解「意思」</h2>
+<p>人一眼就能看出「猫」和「狗」比较像，而和「汽车」不像。但对计算机来说，文字只是一串字符编码，<code>猫</code> 和 <code>狗</code> 之间没有任何天然的联系。</p>
+<p><strong>Embedding</strong>（嵌入、向量表示）就是用来解决这个问题的：把一个词、一句话、一张图片，转换成一串数字（向量），而且让<strong>意思相近的东西，向量也相近</strong>。有了它，计算机就能用数学的方法来「比较意思」。</p>
+<p>今天的语义搜索、推荐系统、RAG 知识库问答，背后都离不开 Embedding。</p>
+<h2 id="_2">为什么简单的编号不行</h2>
+<figure><img src="img/f-16.jpg" alt="编号和独热编码，都装不下「意思」" loading="lazy"><figcaption>编号和独热编码，都装不下「意思」</figcaption></figure>
+<h3 id="_3">直接编号</h3>
+<p>给每个词一个整数：猫 = 1，狗 = 2，汽车 = 3。问题是这些数字之间的大小和差值毫无意义：「3 − 2 = 1」并不说明汽车和狗的差别，等于狗和猫的差别。</p>
+<h3 id="_4">独热编码</h3>
+<p>准备一个和词表一样长的向量，每个词只在自己的位置上是 1，其余都是 0：</p>
+<pre><code class="language-text">猫   = [1, 0, 0, 0, …, 0]
+狗   = [0, 1, 0, 0, …, 0]
+汽车 = [0, 0, 1, 0, …, 0]
+</code></pre>
+<p>它有两个致命问题：</p>
+<ol>
+<li><strong>维度太高</strong>：词表有几万到几十万个词，每个向量就有几万到几十万维，几乎全是 0；</li>
+<li><strong>毫无语义</strong>：任意两个不同词的向量都互相垂直，「猫」和「狗」的距离，与「猫」和「汽车」的距离完全一样。</li>
+</ol>
+<h2 id="embedding">Embedding：稠密、有语义的向量</h2>
+<figure><img src="img/f-30.jpg" alt="语义空间：意思相近的词靠得近" loading="lazy"><figcaption>语义空间：意思相近的词靠得近</figcaption></figure>
+<p>Embedding 用一个<strong>低维</strong>（通常几百到几千维）、<strong>稠密</strong>（每一维都有取值）的向量来表示一个词或一段文字：</p>
+<pre><code class="language-text">猫 = [0.82, 0.10, −0.33, 0.57, …]
+</code></pre>
+<p>可以把它想象成一个高维空间里的一个<strong>点</strong>：</p>
+<ul>
+<li>动物类的词聚在一起，交通工具聚在另一处，食物又在另一处；</li>
+<li>意思越相近，点之间的距离越近。</li>
+</ul>
+<p>要注意的是，<strong>单独某一维的数字通常没有可解释的含义</strong>。不像人为设计的特征（「是不是动物」「有多大」），模型学出来的每一维都混合了很多信息。真正有意义的，是<strong>点与点之间的相对位置</strong>。</p>
+<h2 id="_5">方向也有含义：向量运算</h2>
+<figure><img src="img/f-43.jpg" alt="国王 − 男人 + 女人 ≈ 女王" loading="lazy"><figcaption>国王 − 男人 + 女人 ≈ 女王</figcaption></figure>
+<p>2013 年，谷歌的研究人员发布了 <strong>word2vec</strong>，其中一个令人惊讶的发现是，词向量之间可以做「加减法」：</p>
+<pre><code class="language-text">vec(国王) − vec(男人) + vec(女人) ≈ vec(女王)
+</code></pre>
+<p>「男人 → 女人」的方向，大致代表了「性别」这层含义；从「国王」出发沿着同样的方向移动，就会到达「女王」附近。类似地，「法国 → 巴黎」的方向和「意大利 → 罗马」很接近，代表了「国家 → 首都」的关系。</p>
+<p>这说明 Embedding 不只是把相似的词放在一起，还把<strong>词与词之间的关系</strong>编码成了空间中的方向。（这类类比在实际中并不总是完美成立，但它很直观地说明了向量空间的结构。）</p>
+<h2 id="_6">这些数字是怎么学出来的</h2>
+<figure><img src="img/f-56.jpg" alt="两种学习思路：看上下文、对比学习" loading="lazy"><figcaption>两种学习思路：看上下文、对比学习</figcaption></figure>
+<h3 id="_7">思路一：看上下文（分布式假设）</h3>
+<p>语言学中有一个经典的观点：<strong>一个词的意思，可以从它经常和哪些词一起出现看出来。</strong></p>
+<pre><code class="language-text">我家的 [猫] 喜欢晒太阳        我家的 [狗] 喜欢晒太阳
+我家的 [猫] 刚吃完饭          我家的 [狗] 刚吃完饭
+</code></pre>
+<p>「猫」和「狗」总是出现在相似的上下文里，所以它们的意思应该相近。word2vec 就是基于这个思想训练的：让模型根据一个词预测它周围的词（Skip-gram），或者根据周围的词预测中间的词（CBOW）。训练完成后，模型内部用来表示每个词的那组参数，就是词向量。</p>
+<h3 id="_8">从词向量到上下文相关的向量</h3>
+<p>word2vec 有一个局限：一个词只有一个固定的向量。但「苹果」在「吃苹果」和「苹果手机」里的意思完全不同。</p>
+<p>2018 年前后，以 <strong>BERT</strong> 为代表的 Transformer 模型带来了<strong>上下文相关的向量</strong>：同一个词在不同句子中，会得到不同的向量，因为注意力机制会综合整句话的信息。</p>
+<h3 id="_9">思路二：对比学习（句向量）</h3>
+<p>在实际应用中，我们更常需要表示<strong>一整句话或一段文字</strong>。现代的句向量模型（比如 Sentence-BERT，以及之后的大量模型）主要用<strong>对比学习</strong>来训练：</p>
+<ul>
+<li>准备大量「意思相同」的文本对，比如「怎么退货？」和「我想把买的东西退了」，训练时把它们的向量<strong>拉近</strong>；</li>
+<li>同时把意思无关的文本（比如「今天天气不错」）的向量<strong>推远</strong>。</li>
+</ul>
+<p>经过海量数据训练后，模型就学会了把任意一段文字映射到一个能反映语义的位置上。没有人告诉模型「猫是动物」，这些关系都是它从数据中自己学出来的。</p>
+<h2 id="_10">怎么比较两个向量</h2>
+<figure><img src="img/f-70.jpg" alt="余弦相似度" loading="lazy"><figcaption>余弦相似度</figcaption></figure>
+<table>
+<thead>
+<tr>
+<th>方法</th>
+<th>含义</th>
+<th>特点</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>余弦相似度</strong></td>
+<td>两个向量夹角的余弦值，范围 −1 到 1</td>
+<td>只看方向，不受向量长度影响，最常用</td>
+</tr>
+<tr>
+<td><strong>点积</strong></td>
+<td>对应维度相乘再求和</td>
+<td>向量归一化（长度为 1）后，等于余弦相似度</td>
+</tr>
+<tr>
+<td><strong>欧氏距离</strong></td>
+<td>两点之间的直线距离</td>
+<td>越小越相似</td>
+</tr>
+</tbody>
+</table>
+<p>很多向量模型输出的向量已经做了归一化，或者建议你在使用时归一化。归一化之后，用点积计算就等价于余弦相似度，而且计算更快。</p>
+<h2 id="_11">动手试一试</h2>
+<p>用开源的 <code>sentence-transformers</code> 库和一个中文向量模型，几行代码就能看到效果：</p>
+<pre><code class="language-python">from sentence_transformers import SentenceTransformer
+
+model = SentenceTransformer(&quot;BAAI/bge-small-zh-v1.5&quot;)
+texts = [&quot;怎么退货？&quot;, &quot;我想把买的东西退了&quot;, &quot;今天天气不错&quot;]
+emb = model.encode(texts, normalize_embeddings=True)   # 每句话变成一个向量
+
+print(emb.shape)        # (3, 512)：3 句话，每句 512 维
+print(emb @ emb.T)      # 两两相似度矩阵
+</code></pre>
+<p>你会看到「怎么退货？」和「我想把买的东西退了」的相似度明显高于它和「今天天气不错」的相似度，尽管前两句几乎没有相同的字。</p>
+<h2 id="embedding_1">Embedding 能用来做什么</h2>
+<table>
+<thead>
+<tr>
+<th>应用</th>
+<th>做法</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>语义搜索 / RAG</strong></td>
+<td>把文档切块后向量化存入向量数据库；问题也向量化，找最相近的片段（详见本系列《RAG 是什么》）</td>
+</tr>
+<tr>
+<td><strong>推荐系统</strong></td>
+<td>用户和物品都表示成向量，推荐和用户向量最接近的物品，或者和用户喜欢的物品相似的物品</td>
+</tr>
+<tr>
+<td><strong>聚类与去重</strong></td>
+<td>把相似的文本自动归为一类，或者找出重复、近似重复的内容</td>
+</tr>
+<tr>
+<td><strong>分类</strong></td>
+<td>用向量作为特征，训练一个简单的分类器，比如情感分析、工单分类</td>
+</tr>
+<tr>
+<td><strong>异常检测</strong></td>
+<td>和大多数数据距离都很远的点，可能就是异常</td>
+</tr>
+<tr>
+<td><strong>跨模态检索</strong></td>
+<td>像 CLIP 这样的模型，把图片和文字映射到同一个空间，可以用文字搜图片</td>
+</tr>
+</tbody>
+</table>
+<p>当数据量很大时，需要配合<strong>向量数据库</strong>和近似最近邻（ANN）算法，才能在毫秒级的时间内，从上百万个向量中找到最相似的几个。</p>
+<h2 id="_12">怎么选向量模型</h2>
+<ol>
+<li><strong>语言</strong>：中文场景要选在中文数据上训练过的模型，或者多语言模型；</li>
+<li><strong>效果</strong>：可以参考 <strong>MTEB</strong>（以及中文的 C-MTEB）等公开评测榜单，但最好在自己的数据上做一次小规模测试；</li>
+<li><strong>维度</strong>：维度越高，表达能力通常越强，但存储和计算成本也越高；</li>
+<li><strong>最大长度</strong>：模型能处理的文本长度有限，超出的部分会被截断，所以要配合合理的切块策略；</li>
+<li><strong>一致性</strong>：<strong>建库和查询必须使用同一个模型</strong>，不同模型生成的向量处在不同的空间里，不能混用；换了模型就要把所有数据重新向量化。</li>
+</ol>
+<p>有些检索模型建议在<strong>查询</strong>前加一段固定的指令前缀，具体以模型的说明为准。</p>
+<h2 id="_13">需要注意的局限</h2>
+<ul>
+<li><strong>相似不等于正确</strong>：Embedding 衡量的是「话题和表达是否接近」，而不是「内容是否正确」；</li>
+<li><strong>对否定和细节不敏感</strong>：「我喜欢这个产品」和「我不喜欢这个产品」的向量往往很接近，因为它们的用词和话题几乎相同；</li>
+<li><strong>专业术语和编号</strong>：对于型号、错误码、人名等，语义检索可能不如关键词检索准确，实践中常把两者结合（混合检索）；</li>
+<li><strong>偏见</strong>：模型从数据中学习，也会学到数据中的偏见。</li>
+</ul>
+<h2 id="_14">总结</h2>
+<figure><img src="img/f-77.jpg" alt="意思 → 向量，相近 → 靠近，比较 → 余弦相似度" loading="lazy"><figcaption>意思 → 向量，相近 → 靠近，比较 → 余弦相似度</figcaption></figure>
+<ul>
+<li>Embedding 把文字等内容转换成<strong>稠密的向量</strong>，让<strong>意思相近的内容在空间中靠得近</strong>；</li>
+<li>它从数据中学出来：早期通过<strong>上下文</strong>（word2vec），现在主要通过<strong>对比学习</strong>训练句向量；</li>
+<li>比较向量最常用<strong>余弦相似度</strong>；</li>
+<li>它是语义搜索、推荐、RAG、聚类等应用的基础；</li>
+<li>选模型要看语言、效果、维度和长度，<strong>建库和查询必须用同一个模型</strong>。</li>
+</ul>
+<div class="refs">
+<h3 id="_15">参考资料</h3>
+<ul>
+<li>Mikolov, T., et al. (2013). Efficient Estimation of Word Representations in Vector Space. <em>arXiv:1301.3781</em>.</li>
+<li>Pennington, J., Socher, R., &amp; Manning, C. (2014). GloVe: Global Vectors for Word Representation. <em>EMNLP</em>.</li>
+<li>Devlin, J., et al. (2019). BERT: Pre-training of Deep Bidirectional Transformers for Language Understanding. <em>NAACL</em>.</li>
+<li>Reimers, N., &amp; Gurevych, I. (2019). Sentence-BERT. <em>EMNLP</em>.</li>
+<li>Radford, A., et al. (2021). Learning Transferable Visual Models From Natural Language Supervision (CLIP). <em>ICML</em>.</li>
+<li>Muennighoff, N., et al. (2023). MTEB: Massive Text Embedding Benchmark. <em>EACL</em>.</li>
+</ul>
+</div>
+  </article>
+  <div class="foot"><a href="../index.html">← 返回首页</a><a href="landscape.html">▶ 看配套视频</a></div>
+</div>
+</body>
+</html>
