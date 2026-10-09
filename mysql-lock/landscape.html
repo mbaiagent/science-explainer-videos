@@ -1,0 +1,344 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>MySQL 的锁 · 拾星</title>
+<style>
+  :root{--bg:#07080f;--fg:#f4ede4;--muted:#9a93a8;--acc:#fb7185}
+  html,body{margin:0;height:100%;background:var(--bg);color:var(--fg);
+    font-family:-apple-system,"PingFang SC","Noto Sans SC","Noto Sans CJK SC","Microsoft YaHei",sans-serif}
+  body{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;overflow:hidden}
+  #stage{display:block;background:#07080f;border-radius:12px;box-shadow:0 20px 60px rgba(0,0,0,.55);cursor:pointer}
+  #bar{display:flex;align-items:center;gap:12px;width:min(calc(100vw - 32px),640px)}
+  #btn{width:40px;height:40px;border-radius:50%;border:1px solid rgba(251,113,133,.5);background:transparent;
+    color:var(--acc);font-size:16px;cursor:pointer;flex:none}
+  #seek{flex:1;accent-color:var(--acc)}
+  #time{font-variant-numeric:tabular-nums;font-size:13px;color:var(--muted);min-width:84px;text-align:right}
+  body.render{display:block}
+  body.render #bar{display:none}
+  body.render #stage{border-radius:0;box-shadow:none}
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="bar">
+  <button id="btn" aria-label="播放/暂停">❚❚</button>
+  <input id="seek" type="range" min="0" max="80" step="0.01" value="0">
+  <span id="time">0:00 / 1:20</span>
+</div>
+<script>
+/* ============ 基础设置（横屏 1920×1080） ============ */
+const W = 1920, H = 1080, DUR = 80;
+const cv = document.getElementById('stage'), ctx = cv.getContext('2d');
+cv.width = W; cv.height = H;
+const FONT = '"PingFang SC","Noto Sans SC","Noto Sans CJK SC","Source Han Sans SC","Microsoft YaHei",sans-serif';
+const MONO = '"JetBrains Mono","SF Mono",Menlo,Consolas,"DejaVu Sans Mono","Noto Sans Mono CJK SC","PingFang SC","Microsoft YaHei",monospace';
+const C = {acc:'#fb7185', mint:'#6ee7c8', gold:'#ffd38a', coral:'#ff9e7a', rose:'#ff8a8a', blue:'#9cc3ff', text:'#f4ede4', muted:'#9a93a8', dim:'#4a4558', panel:'#0f0e1f'};
+
+const clamp = (x,a=0,b=1) => Math.max(a, Math.min(b, x));
+const lerp = (a,b,t) => a + (b-a)*t;
+const p = (t,a,b) => clamp((t-a)/(b-a));
+const eo = x => 1 - Math.pow(1-x, 3);
+const eio = x => x < .5 ? 4*x*x*x : 1 - Math.pow(-2*x+2, 3)/2;
+const eback = x => { const c1=1.70158, c3=c1+1; return 1 + c3*Math.pow(x-1,3) + c1*Math.pow(x-1,2); };
+function rnd(seed){ let s = seed>>>0; return () => { s = (s*1664525 + 1013904223)>>>0; return s/4294967296; }; }
+
+let SA = 1;
+const al = a => { ctx.globalAlpha = clamp(SA*a); };
+const sceneA = (t,a,b,f=.5) => Math.min(p(t,a,a+f), 1 - p(t,b-f,b));
+
+function txt(s, x, y, o = {}){
+  const {size=64, weight=700, color=C.text, alpha=1, align='center', glow=0, scale=1, font=FONT} = o;
+  if (alpha <= 0) return;
+  ctx.save(); al(alpha);
+  ctx.font = `${weight} ${size}px ${font}`;
+  ctx.textAlign = align; ctx.textBaseline = 'middle'; ctx.fillStyle = color;
+  if (glow){ ctx.shadowColor = color; ctx.shadowBlur = glow; }
+  if (scale !== 1){ ctx.translate(x, y); ctx.scale(scale, scale); ctx.fillText(s, 0, 0); }
+  else ctx.fillText(s, x, y);
+  ctx.restore();
+}
+function rise(s, x, y, t, t0, o = {}, d = .7){
+  const e = eo(p(t, t0, t0+d));
+  if (e <= 0) return;
+  txt(s, x, y + (1-e)*36, {...o, alpha:(o.alpha ?? 1)*e});
+}
+function rr(x,y,w,h,r){ ctx.beginPath(); ctx.roundRect(x,y,w,h,r); }
+function box(x, y, w, h, a, o = {}){
+  const {fill='rgba(255,255,255,.05)', stroke='rgba(251,113,133,.35)', lw=2, glow=0, r=18, dash=null} = o;
+  if (a <= 0) return;
+  ctx.save(); al(a); rr(x, y, w, h, r); ctx.fillStyle = fill; ctx.fill();
+  if (dash) ctx.setLineDash(dash);
+  ctx.strokeStyle = stroke; ctx.lineWidth = lw; if (glow){ ctx.shadowColor = stroke; ctx.shadowBlur = glow; } ctx.stroke(); ctx.restore();
+}
+function arrow(x1, y1, x2, y2, e, a, color = C.acc, lw = 3){
+  if (e <= 0 || a <= 0) return;
+  const x = lerp(x1, x2, e), y = lerp(y1, y2, e), ang = Math.atan2(y2 - y1, x2 - x1);
+  ctx.save(); al(a); ctx.strokeStyle = color; ctx.fillStyle = color; ctx.lineWidth = lw; ctx.lineCap = 'round';
+  ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x, y); ctx.stroke();
+  if (e > .85){ ctx.translate(x, y); ctx.rotate(ang); ctx.beginPath(); ctx.moveTo(4, 0); ctx.lineTo(-14, -9); ctx.lineTo(-14, 9); ctx.closePath(); ctx.fill(); }
+  ctx.restore();
+}
+function panel(x, y, w, h, title, a){
+  box(x, y, w, h, a, {fill:C.panel, stroke:'rgba(255,255,255,.1)', r:20});
+  if (a <= 0) return;
+  ctx.save(); al(a); ctx.strokeStyle = 'rgba(255,255,255,.07)'; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(x, y + 52); ctx.lineTo(x + w, y + 52); ctx.stroke();
+  ['#ff6b6b','#ffd166','#6ee7a0'].forEach((c, i) => { ctx.fillStyle = c; ctx.globalAlpha = clamp(SA*a*.8); ctx.beginPath(); ctx.arc(x + 30 + i*24, y + 26, 7, 0, 6.283); ctx.fill(); });
+  ctx.restore();
+  txt(title, x + w/2, y + 27, {size:22, weight:500, color:C.muted, font:MONO, alpha:a});
+}
+
+/* ============ 背景 ============ */
+const PARTS = (() => { const r = rnd(181); return Array.from({length:100}, () => ({
+  x:r()*W, y:r()*H, s:r()*2.2+.5, v:r()*12+4, ph:r()*6.283, c:r()<.25})); })();
+function background(t){
+  const g = ctx.createLinearGradient(0,0,W,H);
+  g.addColorStop(0,'#0a0916'); g.addColorStop(.55,'#110f24'); g.addColorStop(1,'#18122c');
+  ctx.globalAlpha = 1; ctx.fillStyle = g; ctx.fillRect(0,0,W,H);
+  const gx = W*.5 + Math.sin(t*.27)*140;
+  const rg = ctx.createRadialGradient(gx, H*.45, 0, gx, H*.45, 950);
+  rg.addColorStop(0,'rgba(251,113,133,0.09)'); rg.addColorStop(1,'rgba(251,113,133,0)');
+  ctx.fillStyle = rg; ctx.fillRect(0,0,W,H);
+  ctx.fillStyle = C.acc;
+  for (let x = 40; x < W; x += 80) for (let y = 40; y < H; y += 80){ ctx.globalAlpha = .06; ctx.fillRect(x, y, 2, 2); }
+  for (const q of PARTS){
+    const y = ((q.y - t*q.v) % H + H) % H, x = q.x + Math.sin(t*.35 + q.ph)*12;
+    ctx.globalAlpha = .2 + .3*(.5 + .5*Math.sin(t*1.2 + q.ph));
+    ctx.fillStyle = q.c ? C.acc : '#d8d0ff';
+    ctx.beginPath(); ctx.arc(x, y, q.s, 0, 6.283); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+}
+function vignette(){
+  const v = ctx.createRadialGradient(W/2, H/2, W*.28, W/2, H/2, W*.62);
+  v.addColorStop(0,'rgba(0,0,0,0)'); v.addColorStop(1,'rgba(0,0,0,.55)');
+  ctx.globalAlpha = 1; ctx.fillStyle = v; ctx.fillRect(0,0,W,H);
+}
+function codeLine(s, x, y, size, a, kw = /\b(public|class|static|void|new|return)\b/){
+  const parts = s.split(/("[^"]*"|\b(?:public|class|static|void|new|return|getstatic|ldc|invokevirtual)\b)/g);
+  ctx.save(); al(a); ctx.font = `500 ${size}px ${MONO}`; ctx.textBaseline = 'middle'; ctx.textAlign = 'left';
+  let xx = x;
+  for (const seg of parts){ if (!seg) continue;
+    ctx.fillStyle = seg.startsWith('"') ? C.mint : /^(public|class|static|void|new|return|getstatic|ldc|invokevirtual)$/.test(seg) ? C.acc : C.text;
+    ctx.fillText(seg, xx, y); xx += ctx.measureText(seg).width; }
+  ctx.restore();
+}
+
+function pill(s, x, y, a, o = {}){
+  const {size=30, color=C.text, stroke='rgba(255,255,255,.2)', fill='rgba(255,255,255,.05)', font=FONT, weight=700} = o;
+  if (a <= 0) return;
+  ctx.save(); ctx.font = `${weight} ${size}px ${font}`; const w = ctx.measureText(s).width + 52; ctx.restore();
+  box(x - w/2, y - size*.9, w, size*1.8, a, {fill, stroke, r:size*.9});
+  txt(s, x, y, {size, weight, color, font, alpha:a});
+}
+function lock(x, y, s, a, color = C.acc){
+  if (a <= 0) return;
+  ctx.save(); al(a); ctx.translate(x, y); ctx.scale(s, s); ctx.strokeStyle = color; ctx.fillStyle = color; ctx.lineWidth = 6;
+  ctx.beginPath(); ctx.arc(0, -14, 15, Math.PI, 0); ctx.stroke(); rr(-22, -14, 44, 36, 7); ctx.fill();
+  ctx.fillStyle = '#1a0f16'; ctx.beginPath(); ctx.arc(0, 2, 5, 0, 6.283); ctx.fill(); ctx.restore();
+}
+function spinner(x, y, t, a, c = C.gold){ if (a <= 0) return; ctx.save(); al(a); ctx.strokeStyle = c; ctx.lineWidth = 4; ctx.lineCap = 'round'; ctx.beginPath(); ctx.arc(x, y, 15, t*5, t*5 + 4.5); ctx.stroke(); ctx.restore(); }
+function trx(name, sql, x, y, a, c){ box(x - 260, y - 70, 520, 140, a, {fill:'rgba(255,255,255,.04)', stroke:c, r:20}); txt(name, x, y - 30, {size:30, weight:900, color:c, alpha:a}); txt(sql, x, y + 22, {size:22, weight:600, font:MONO, alpha:a}); }
+
+/* ============ 场景 1 · 钩子 (0–7s) ============ */
+function s1(t){
+  const a = eo(p(t, 0, .4));
+  trx('事务 A', 'UPDATE … SET stock = stock - 1', 360, 300, a, C.acc);
+  trx('事务 B', 'UPDATE … SET stock = stock - 1', 1560, 300, eo(p(t, 1.4, 1.8)), C.blue);
+  box(760, 240, 400, 120, a, {fill:'rgba(255,255,255,.06)', stroke:'rgba(255,255,255,.3)', r:16});
+  txt('商品 1001  库存 = ' + (t > 4.2 ? 8 : t > 1.2 ? 9 : 10), 960, 300, {size:28, weight:800, font:MONO, alpha:a});
+  arrow(625, 300, 750, 300, eo(p(t, .6, 1)), 1, C.acc, 4);
+  lock(960, 205, 1, eback(p(t, 1.0, 1.4)));
+  const w = eo(p(t, 2.0, 2.4));
+  arrow(1295, 300, 1170, 300, w, w, C.blue, 4);
+  if (t > 2.4 && t < 4.0){ spinner(1560, 420, t, 1); txt('等待锁…', 1620, 420, {size:26, weight:800, color:C.gold, align:'left'}); }
+  if (t > 4.0) txt('A 提交，B 拿到锁继续', 960, 430, {size:28, weight:800, color:C.mint, alpha:eo(p(t, 4, 4.3))});
+  rise('同一行数据，两个事务同时改：后来的必须等', W/2, 600, t, 2.6, {size:42, weight:900});
+  const k = p(t, 4.6, 5.2);
+  if (k > 0) txt('MySQL 的锁', W/2, 780, {size:110, weight:900, color:C.acc, glow:40, alpha:clamp(k*2), scale:eback(k)});
+  rise('让并发修改排好队，数据才不会错', W/2, 910, t, 5.4, {size:36, weight:700, color:C.muted});
+}
+
+/* ============ 场景 2 · 锁的粒度 (7–19s) ============ */
+function s2(t){
+  rise('按范围分：锁住多大一块？', W/2, 105, t, 7.2, {size:56, weight:900});
+  [['全局锁', '整个数据库只读', '如全库逻辑备份', 1.0, 'FLUSH TABLES WITH READ LOCK'], ['表级锁', '锁住整张表', '表锁、元数据锁（MDL）、意向锁', .55, 'LOCK TABLES … / 改表结构时自动加 MDL'], ['行级锁', '只锁需要的行', 'InnoDB 的核心，并发度最高', .12, 'UPDATE … WHERE id = 1']].forEach(([h, d1, d2, w, ex], i) => {
+    const st = 7.8 + i*1.4, e = eo(p(t, st, st + .6)), y = 260 + i*210;
+    txt(h, 160, y - 20, {size:40, weight:900, color:C.acc, align:'left', alpha:e});
+    txt(d1, 160, y + 30, {size:24, weight:700, align:'left', alpha:e});
+    for (let k = 0; k < 20; k++){ const locked = k < 20*w;
+      box(560 + k*60, y - 40, 50, 80, e, {fill:locked ? 'rgba(251,113,133,.35)' : 'rgba(255,255,255,.04)', stroke:locked ? C.acc : 'rgba(255,255,255,.15)', r:6}); }
+    txt(d2 + '　·　' + ex, 560, y + 75, {size:20, weight:600, font:FONT, color:C.muted, align:'left', alpha:e});
+  });
+  rise('锁的范围越小，能同时干活的事务越多', W/2, 920, t, 13.4, {size:40, weight:900, color:C.gold});
+}
+
+/* ============ 场景 3 · 共享锁与排他锁 (19–32s) ============ */
+function s3(t){
+  rise('按类型分：共享锁（S）与排他锁（X）', W/2, 105, t, 19.2, {size:54, weight:900});
+  const a = eo(p(t, 19.6, 20.1));
+  [['共享锁 S（读锁）', 'SELECT … FOR SHARE', '大家可以一起读，但不能改', 290], ['排他锁 X（写锁）', 'UPDATE / DELETE / SELECT … FOR UPDATE', '只能我一个人用，别人读写都要等', 530]].forEach(([h, sql, d, y], i) => {
+    const e = eo(p(t, 20 + i*.8, 20.4 + i*.8));
+    box(110, y - 85, 860, 200, e, {fill:'rgba(255,255,255,.03)', stroke:i ? C.acc : C.blue, r:22});
+    txt(h, 150, y - 40, {size:34, weight:900, color:i ? C.acc : C.blue, align:'left', alpha:e});
+    txt(sql, 150, y + 12, {size:22, weight:600, font:MONO, align:'left', alpha:e});
+    txt(d, 150, y + 62, {size:24, weight:700, color:'#d9d2e4', align:'left', alpha:e});
+  });
+  const m = eo(p(t, 22.6, 23.1)), cx = [1300, 1500, 1700];
+  txt('兼容矩阵', 1500, 180, {size:30, weight:900, color:C.acc, alpha:m});
+  txt('已持有 →', 1100, 260, {size:22, weight:700, color:C.muted, alpha:m}); txt('S', cx[1], 260, {size:34, weight:900, color:C.blue, alpha:m}); txt('X', cx[2], 260, {size:34, weight:900, color:C.acc, alpha:m});
+  [['想加 S', ['✓ 兼容', '✗ 等待']], ['想加 X', ['✗ 等待', '✗ 等待']]].forEach(([h, cells], r) => { const y = 350 + r*110;
+    txt(h, 1150, y, {size:28, weight:800, alpha:m});
+    cells.forEach((c, k) => { const e = eback(p(t, 23.4 + r*.6 + k*.3, 23.9 + r*.6 + k*.3)), ok = c.startsWith('✓');
+      box(cx[k + 1] - 85, y - 40, 170, 80, clamp(e), {fill:ok ? 'rgba(110,231,200,.15)' : 'rgba(251,113,133,.15)', stroke:ok ? C.mint : C.acc, r:14});
+      txt(c, cx[k + 1], y, {size:26, weight:900, color:ok ? C.mint : C.acc, alpha:clamp(e)}); }); });
+  rise('只有「读 + 读」能同时进行', 1500, 600, t, 26.0, {size:28, weight:800, color:C.gold});
+  rise('普通的 SELECT 不加锁：它读的是 MVCC 快照，写锁也挡不住它（见本系列 MVCC 一期）', W/2, 800, t, 27.4, {size:32, weight:900});
+  rise('另有「意向锁」：表级的标记，用来快速判断表里有没有行被锁住', W/2, 880, t, 29.0, {size:28, weight:600, color:C.muted});
+}
+
+/* ============ 场景 4 · 记录锁/间隙锁/临键锁 (32–47s) ============ */
+const KEYS = [5, 10, 15, 20];
+const KX = v => 300 + (v/25)*1320;
+function s4(t){
+  rise('行锁的三种形态（InnoDB，可重复读）', W/2, 100, t, 32.2, {size:54, weight:900});
+  const a = eo(p(t, 32.6, 33.1)), y = 330;
+  ctx.save(); al(a*.6); ctx.strokeStyle = 'rgba(255,255,255,.45)'; ctx.lineWidth = 3; ctx.beginPath(); ctx.moveTo(KX(0), y); ctx.lineTo(KX(25), y); ctx.stroke(); ctx.restore();
+  txt('索引上的值：', KX(0) - 20, y - 70, {size:24, weight:700, color:C.muted, align:'left', alpha:a});
+  txt('−∞', KX(0), y + 50, {size:24, weight:700, font:MONO, color:C.muted, alpha:a}); txt('+∞', KX(25), y + 50, {size:24, weight:700, font:MONO, color:C.muted, alpha:a});
+  const phase = t < 36.6 ? 0 : t < 40.6 ? 1 : 2;
+  // 间隙高亮
+  if (phase >= 1){ const e = eo(p(t, phase === 1 ? 36.6 : 40.6, phase === 1 ? 37.1 : 41.1));
+    ctx.save(); al(e*.9); ctx.fillStyle = 'rgba(255,211,138,.25)'; ctx.fillRect(KX(10) + 36, y - 32, KX(15) - KX(10) - 72, 64); ctx.strokeStyle = C.gold; ctx.setLineDash([8, 6]); ctx.lineWidth = 2; ctx.strokeRect(KX(10) + 36, y - 32, KX(15) - KX(10) - 72, 64); ctx.restore(); }
+  KEYS.forEach(v => { const recOn = (phase === 0 && v === 10) || (phase === 2 && v === 15);
+    box(KX(v) - 30, y - 30, 60, 60, a, {fill:recOn ? 'rgba(251,113,133,.35)' : 'rgba(255,255,255,.08)', stroke:recOn ? C.acc : 'rgba(255,255,255,.4)', lw:recOn ? 3 : 2, glow:recOn ? 16 : 0, r:10});
+    txt(String(v), KX(v), y + 1, {size:28, weight:900, font:MONO, alpha:a}); if (recOn) lock(KX(v), y - 66, .8, 1); });
+  if (phase >= 1) lock((KX(10) + KX(15))/2, y - 66, .8, 1, C.gold);
+  const info = [['记录锁 Record Lock', '只锁住索引上的这一条记录', 'UPDATE t SET … WHERE id = 10（id 为主键）', C.acc],
+    ['间隙锁 Gap Lock', '锁住两条记录之间的「空隙」：(10, 15)', '不锁任何已有的记录，只阻止往空隙里插入', C.gold],
+    ['临键锁 Next-Key Lock', '记录锁 + 它前面的间隙：(10, 15]', '可重复读下，加锁读的默认形态', C.mint]][phase];
+  const ia = eo(p(t, [33.2, 36.8, 40.8][phase], [33.7, 37.3, 41.3][phase]));
+  box(240, 470, 1440, 200, ia, {fill:'rgba(255,255,255,.03)', stroke:info[3], r:22});
+  txt(info[0], 280, 515, {size:34, weight:900, color:info[3], align:'left', alpha:ia});
+  txt(info[1], 280, 570, {size:28, weight:700, align:'left', alpha:ia}); txt(info[2], 280, 625, {size:24, weight:600, font:phase === 0 ? MONO : FONT, color:C.muted, align:'left', alpha:ia});
+  if (phase >= 1){ const k = eo(p(t, 38.2, 38.8)), x = (KX(10) + KX(15))/2;
+    pill('INSERT id = 12', x, 185 - (1 - k)*40, k, {size:22, font:MONO, color:C.blue, stroke:C.blue});
+    if (t > 38.8) txt('✗ 被间隙锁挡住', x + 200, 185, {size:24, weight:900, color:C.rose, align:'left', alpha:eo(p(t, 38.8, 39.2))}); }
+  rise('为什么要锁「空隙」？防止别的事务插入新行，造成幻读', W/2, 790, t, 43.0, {size:38, weight:900});
+  rise('读已提交（RC）级别下，一般只加记录锁，没有间隙锁', W/2, 860, t, 44.4, {size:28, weight:600, color:C.muted});
+}
+
+/* ============ 场景 5 · 锁加在索引上 (47–58s) ============ */
+const ROWS = [['1', '张三', '北京'], ['2', '李四', '上海'], ['3', '王五', '北京'], ['4', '赵六', '深圳'], ['5', '孙七', '杭州'], ['6', '周八', '成都']];
+function s5(t){
+  rise('关键：行锁是加在「索引」上的', W/2, 100, t, 47.2, {size:56, weight:900});
+  [[0, "UPDATE user SET … WHERE id = 3", '走主键索引：只锁 1 行', C.mint, 48.0], [1, "UPDATE user SET … WHERE name = '王五'", 'name 没有索引：扫描过的每一行都被锁住', C.rose, 50.6]].forEach(([i, sql, d, c, ts]) => {
+    const x0 = 120 + i*860, e = eo(p(t, ts, ts + .5));
+    box(x0, 180, 820, 640, e, {fill:'rgba(255,255,255,.03)', stroke:c, r:24});
+    txt(sql, x0 + 410, 230, {size:22, weight:700, font:MONO, alpha:e});
+    ROWS.forEach((r, k) => { const y = 300 + k*72, lockOn = i === 0 ? k === 2 : t > ts + .6 + k*.25;
+      box(x0 + 60, y - 28, 700, 58, e, {fill:lockOn ? 'rgba(251,113,133,.22)' : 'rgba(255,255,255,.04)', stroke:lockOn ? C.acc : 'rgba(255,255,255,.12)', r:10});
+      r.forEach((c2, j) => txt(c2, x0 + 140 + j*220, y + 1, {size:24, weight:700, font:j === 0 ? MONO : FONT, alpha:e}));
+      if (lockOn) lock(x0 + 720, y + 2, .55, e); });
+    txt(d, x0 + 410, 780, {size:26, weight:900, color:c, alpha:eo(p(t, ts + 1.6, ts + 2))});
+  });
+  rise('没走索引的更新，效果几乎等于锁整张表：更新语句的条件一定要能用上索引', W/2, 900, t, 54.2, {size:32, weight:900, color:C.gold});
+}
+
+/* ============ 场景 6 · 死锁 (58–70s) ============ */
+function s6(t){
+  rise('死锁：两个事务互相等对方', W/2, 100, t, 58.2, {size:56, weight:900});
+  const a = eo(p(t, 58.6, 59.1));
+  const A = [520, 300], B = [1400, 300], R1 = [520, 620], R2 = [1400, 620];
+  box(A[0] - 200, A[1] - 60, 400, 120, a, {stroke:C.acc, r:20}); txt('事务 1', A[0], A[1], {size:32, weight:900, color:C.acc, alpha:a});
+  box(B[0] - 200, B[1] - 60, 400, 120, a, {stroke:C.blue, r:20}); txt('事务 2', B[0], B[1], {size:32, weight:900, color:C.blue, alpha:a});
+  box(R1[0] - 160, R1[1] - 50, 320, 100, a, {fill:'rgba(255,255,255,.05)', stroke:'rgba(255,255,255,.3)', r:14}); txt('行 A（id = 1）', R1[0], R1[1], {size:26, weight:800, alpha:a});
+  box(R2[0] - 160, R2[1] - 50, 320, 100, a, {fill:'rgba(255,255,255,.05)', stroke:'rgba(255,255,255,.3)', r:14}); txt('行 B（id = 2）', R2[0], R2[1], {size:26, weight:800, alpha:a});
+  const e1 = eo(p(t, 59.4, 59.9)), e2 = eo(p(t, 60.2, 60.7));
+  arrow(A[0], A[1] + 62, R1[0], R1[1] - 52, e1, e1, C.acc, 4); txt('① 锁住了 A', A[0] - 130, 470, {size:24, weight:800, color:C.acc, alpha:e1});
+  arrow(B[0], B[1] + 62, R2[0], R2[1] - 52, e2, e2, C.blue, 4); txt('② 锁住了 B', B[0] + 130, 470, {size:24, weight:800, color:C.blue, alpha:e2});
+  const e3 = eo(p(t, 61.2, 61.9)), e4 = eo(p(t, 62.2, 62.9));
+  if (e3 > 0){ ctx.save(); al(e3); ctx.setLineDash([10, 8]); ctx.strokeStyle = C.acc; ctx.lineWidth = 3; ctx.beginPath(); ctx.moveTo(A[0] + 200, A[1] + 30); ctx.lineTo(lerp(A[0] + 200, R2[0] - 160, e3), lerp(A[1] + 30, R2[1] - 30, e3)); ctx.stroke(); ctx.restore(); }
+  if (e4 > 0){ ctx.save(); al(e4); ctx.setLineDash([10, 8]); ctx.strokeStyle = C.blue; ctx.lineWidth = 3; ctx.beginPath(); ctx.moveTo(B[0] - 200, B[1] + 30); ctx.lineTo(lerp(B[0] - 200, R1[0] + 160, e4), lerp(B[1] + 30, R1[1] - 30, e4)); ctx.stroke(); ctx.restore(); }
+  txt('③ 想要 B → 等待', 830, 270, {size:22, weight:800, color:C.acc, alpha:e3});
+  txt('④ 想要 A → 等待', 1090, 270, {size:22, weight:800, color:C.blue, alpha:e4});
+  if (t > 63) { spinner(A[0] + 240, A[1] - 70, t, 1 - p(t, 64.6, 64.8)); spinner(B[0] - 240, B[1] - 70, t, 1); }
+  const kill = eo(p(t, 64.6, 65.1));
+  if (kill > 0){ txt('✗ 回滚', A[0], A[1] - 100, {size:30, weight:900, color:C.rose, alpha:kill}); }
+  rise('InnoDB 会自动检测死锁，回滚其中一个事务（通常是改动较少的那个），另一个继续', W/2, 790, t, 65.0, {size:30, weight:900});
+  rise('避免：按相同顺序加锁 · 事务尽量短 · 条件走索引、少锁不该锁的行 · 应用层捕获后重试', W/2, 860, t, 66.6, {size:28, weight:800, color:C.gold});
+}
+
+/* ============ 场景 7 · 排查 (70–76s) ============ */
+function s7(t){
+  rise('出了问题怎么查？', W/2, 110, t, 70.2, {size:58, weight:900});
+  [['SHOW ENGINE INNODB STATUS;', '看「LATEST DETECTED DEADLOCK」：最近一次死锁的详情'], ['SELECT * FROM performance_schema.data_locks;', '当前持有和等待的锁（MySQL 8.0）'], ['SELECT * FROM performance_schema.data_lock_waits;', '谁在等谁'], ['innodb_lock_wait_timeout', '等锁超时时间，默认 50 秒，超时后报错']].forEach(([c, d], i) => {
+    const e = eo(p(t, 70.6 + i*.45, 71 + i*.45)), y = 250 + i*150;
+    box(160, y - 58, 1600, 122, e, {fill:'rgba(251,113,133,.05)', stroke:'rgba(251,113,133,.4)', r:20});
+    txt(c, 200, y - 16, {size:28, weight:700, font:MONO, color:C.acc, align:'left', alpha:e}); txt(d, 200, y + 30, {size:24, weight:600, color:'#d9d2e4', align:'left', alpha:e});
+  });
+}
+
+/* ============ 场景 8 · 收尾 (76–80s) ============ */
+function s8(t){
+  [['S / X', '读读兼容，其余互斥'], ['记录·间隙·临键', '可重复读防幻读'], ['锁在索引上', '没索引就锁一片'], ['死锁', '同序加锁·短事务']].forEach(([a, b], i) => {
+    const st = 76.2 + i*.25, e = eback(p(t, st, st + .5)); if (e <= 0) return;
+    const x = 330 + i*420, y = 330;
+    ctx.save(); ctx.translate(x, y); ctx.scale(e, e); ctx.translate(-x, -y);
+    box(x - 190, y - 90, 380, 180, clamp(e), {fill:'rgba(251,113,133,.08)', stroke:'rgba(251,113,133,.5)', r:26}); ctx.restore();
+    txt(a, x, y - 22, {size:38, weight:900, color:C.acc, alpha:clamp(e)}); txt(b, x, y + 40, {size:24, weight:600, color:C.muted, alpha:clamp(e)});
+  });
+  rise('这就是 MySQL 的锁', W/2, 600, t, 77.0, {size:84, weight:900, glow:22});
+  rise('关注拾星，一起搞懂后端', W/2, 760, t, 77.6, {size:36, weight:500, color:C.muted});
+}
+
+/* ============ 总调度 ============ */
+const SCENES = [[s1,-1,7],[s2,7,19],[s3,19,32],[s4,32,47],[s5,47,58],[s6,58,70],[s7,70,76],[s8,76,80]];
+function draw(t){
+  t = clamp(t, 0, DUR);
+  ctx.save(); ctx.globalAlpha = 1; ctx.clearRect(0,0,W,H); background(t);
+  for (const [fn,a,b] of SCENES){
+    if (t < a || t > b) continue;
+    SA = sceneA(t, a, b, b === DUR ? .8 : .5);
+    if (SA > 0){ ctx.save(); fn(t); ctx.restore(); }
+  }
+  SA = 1; vignette();
+  const fo = p(t, DUR - .8, DUR);
+  if (fo > 0){ ctx.globalAlpha = fo; ctx.fillStyle = '#000'; ctx.fillRect(0,0,W,H); }
+  ctx.restore();
+}
+
+/* ============ 播放器 / 逐帧渲染接口 ============ */
+const isRender = new URLSearchParams(location.search).has('render');
+window.DURATION = DUR;
+window.renderFrame = t => draw(t);
+const btn = document.getElementById('btn'), seek = document.getElementById('seek'), timeEl = document.getElementById('time');
+const fmt = s => `${Math.floor(s/60)}:${String(Math.floor(s%60)).padStart(2,'0')}`;
+function fit(){
+  if (isRender){ cv.style.width = W+'px'; cv.style.height = H+'px'; return; }
+  const w = Math.min(innerWidth - 32, (innerHeight - 84)*16/9);
+  cv.style.width = w + 'px'; cv.style.height = w*9/16 + 'px';
+}
+addEventListener('resize', fit); fit();
+
+let cur = 0, playing = !isRender, last = null;
+function toggle(){ if (cur >= DUR) cur = 0; playing = !playing; }
+btn.onclick = toggle; cv.onclick = toggle;
+addEventListener('keydown', e => { if (e.code === 'Space'){ e.preventDefault(); toggle(); } });
+seek.oninput = () => { cur = +seek.value; draw(cur); };
+function loop(ts){
+  if (playing && last != null){ cur += (ts - last)/1000; if (cur >= DUR){ cur = DUR; playing = false; } }
+  last = ts; draw(cur);
+  seek.value = cur; timeEl.textContent = `${fmt(cur)} / ${fmt(DUR)}`;
+  btn.textContent = playing ? '❚❚' : (cur >= DUR ? '↺' : '▶');
+  requestAnimationFrame(loop);
+}
+document.fonts.ready.then(() => {
+  window.ready = true;
+  if (isRender) draw(0); else requestAnimationFrame(loop);
+});
+</script>
+</body>
+</html>

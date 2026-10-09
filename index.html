@@ -80,7 +80,8 @@ const VIDEOS = [
   {cat:'ai', title:"Function Calling 与 MCP", desc:"工具调用五步、工具设计、MCP 架构与安全", path:'function-calling-mcp/landscape.html', dur:80, color:'#f472b6'},
   {cat:'cs', title:"CAP 与 BASE", desc:"分区时 C 与 A 二选一、三选二的误解、最终一致", path:'cap-theorem/landscape.html', dur:80, color:'#14b8a6'},
   {cat:'cs', title:"限流算法", desc:"固定窗口、滑动窗口、漏桶、令牌桶，分布式限流", path:'rate-limiting/landscape.html', dur:80, color:'#c084fc'},
-  {cat:'ai', title:"Prompt 工程与结构化输出", desc:"好提示词的结构、少样本、思维链、JSON 输出与校验", path:'prompt-engineering/landscape.html', dur:80, color:'#fdba74'}
+  {cat:'ai', title:"Prompt 工程与结构化输出", desc:"好提示词的结构、少样本、思维链、JSON 输出与校验", path:'prompt-engineering/landscape.html', dur:80, color:'#fdba74'},
+  {cat:'cs', title:"MySQL 的锁", desc:"S/X 锁、记录锁·间隙锁·临键锁、死锁", path:'mysql-lock/landscape.html', dur:80, color:'#fb7185'}
 ];
 const fmt = s => `${Math.floor(s/60)}:${String(s%60).padStart(2,'0')}`;
 const esc = s => s.replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
