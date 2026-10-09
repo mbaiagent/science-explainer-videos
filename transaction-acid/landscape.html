@@ -1,0 +1,348 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>事务与 ACID</title>
+<style>
+  :root{--bg:#07080f;--fg:#f4ede4;--muted:#9a93a8;--acc:#34d399}
+  html,body{margin:0;height:100%;background:var(--bg);color:var(--fg);
+    font-family:-apple-system,"PingFang SC","Noto Sans SC","Noto Sans CJK SC","Microsoft YaHei",sans-serif}
+  body{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;overflow:hidden}
+  #stage{display:block;background:#07080f;border-radius:12px;box-shadow:0 20px 60px rgba(0,0,0,.55);cursor:pointer}
+  #bar{display:flex;align-items:center;gap:12px;width:min(calc(100vw - 32px),640px)}
+  #btn{width:40px;height:40px;border-radius:50%;border:1px solid rgba(52,211,153,.5);background:transparent;
+    color:var(--acc);font-size:16px;cursor:pointer;flex:none}
+  #seek{flex:1;accent-color:var(--acc)}
+  #time{font-variant-numeric:tabular-nums;font-size:13px;color:var(--muted);min-width:84px;text-align:right}
+  body.render{display:block}
+  body.render #bar{display:none}
+  body.render #stage{border-radius:0;box-shadow:none}
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="bar">
+  <button id="btn" aria-label="播放/暂停">❚❚</button>
+  <input id="seek" type="range" min="0" max="80" step="0.01" value="0">
+  <span id="time">0:00 / 1:20</span>
+</div>
+<script>
+/* ============ 基础设置（横屏 1920×1080） ============ */
+const W = 1920, H = 1080, DUR = 80;
+const cv = document.getElementById('stage'), ctx = cv.getContext('2d');
+cv.width = W; cv.height = H;
+const FONT = '"PingFang SC","Noto Sans SC","Noto Sans CJK SC","Source Han Sans SC","Microsoft YaHei",sans-serif';
+const MONO = '"JetBrains Mono","SF Mono",Menlo,Consolas,"DejaVu Sans Mono","Noto Sans Mono CJK SC","PingFang SC","Microsoft YaHei",monospace';
+const C = {acc:'#34d399', mint:'#6ee7c8', gold:'#ffd38a', coral:'#ff9e7a', rose:'#ff8a8a', blue:'#9cc3ff', text:'#f4ede4', muted:'#9a93a8', dim:'#4a4558', panel:'#0f0e1f'};
+
+const clamp = (x,a=0,b=1) => Math.max(a, Math.min(b, x));
+const lerp = (a,b,t) => a + (b-a)*t;
+const p = (t,a,b) => clamp((t-a)/(b-a));
+const eo = x => 1 - Math.pow(1-x, 3);
+const eio = x => x < .5 ? 4*x*x*x : 1 - Math.pow(-2*x+2, 3)/2;
+const eback = x => { const c1=1.70158, c3=c1+1; return 1 + c3*Math.pow(x-1,3) + c1*Math.pow(x-1,2); };
+function rnd(seed){ let s = seed>>>0; return () => { s = (s*1664525 + 1013904223)>>>0; return s/4294967296; }; }
+
+let SA = 1;
+const al = a => { ctx.globalAlpha = clamp(SA*a); };
+const sceneA = (t,a,b,f=.5) => Math.min(p(t,a,a+f), 1 - p(t,b-f,b));
+
+function txt(s, x, y, o = {}){
+  const {size=64, weight=700, color=C.text, alpha=1, align='center', glow=0, scale=1, font=FONT} = o;
+  if (alpha <= 0) return;
+  ctx.save(); al(alpha);
+  ctx.font = `${weight} ${size}px ${font}`;
+  ctx.textAlign = align; ctx.textBaseline = 'middle'; ctx.fillStyle = color;
+  if (glow){ ctx.shadowColor = color; ctx.shadowBlur = glow; }
+  if (scale !== 1){ ctx.translate(x, y); ctx.scale(scale, scale); ctx.fillText(s, 0, 0); }
+  else ctx.fillText(s, x, y);
+  ctx.restore();
+}
+function rise(s, x, y, t, t0, o = {}, d = .7){
+  const e = eo(p(t, t0, t0+d));
+  if (e <= 0) return;
+  txt(s, x, y + (1-e)*36, {...o, alpha:(o.alpha ?? 1)*e});
+}
+function rr(x,y,w,h,r){ ctx.beginPath(); ctx.roundRect(x,y,w,h,r); }
+function box(x, y, w, h, a, o = {}){
+  const {fill='rgba(255,255,255,.05)', stroke='rgba(52,211,153,.35)', lw=2, glow=0, r=18, dash=null} = o;
+  if (a <= 0) return;
+  ctx.save(); al(a); rr(x, y, w, h, r); ctx.fillStyle = fill; ctx.fill();
+  if (dash) ctx.setLineDash(dash);
+  ctx.strokeStyle = stroke; ctx.lineWidth = lw; if (glow){ ctx.shadowColor = stroke; ctx.shadowBlur = glow; } ctx.stroke(); ctx.restore();
+}
+function arrow(x1, y1, x2, y2, e, a, color = C.acc, lw = 3){
+  if (e <= 0 || a <= 0) return;
+  const x = lerp(x1, x2, e), y = lerp(y1, y2, e), ang = Math.atan2(y2 - y1, x2 - x1);
+  ctx.save(); al(a); ctx.strokeStyle = color; ctx.fillStyle = color; ctx.lineWidth = lw; ctx.lineCap = 'round';
+  ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x, y); ctx.stroke();
+  if (e > .85){ ctx.translate(x, y); ctx.rotate(ang); ctx.beginPath(); ctx.moveTo(4, 0); ctx.lineTo(-14, -9); ctx.lineTo(-14, 9); ctx.closePath(); ctx.fill(); }
+  ctx.restore();
+}
+function panel(x, y, w, h, title, a){
+  box(x, y, w, h, a, {fill:C.panel, stroke:'rgba(255,255,255,.1)', r:20});
+  if (a <= 0) return;
+  ctx.save(); al(a); ctx.strokeStyle = 'rgba(255,255,255,.07)'; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(x, y + 52); ctx.lineTo(x + w, y + 52); ctx.stroke();
+  ['#ff6b6b','#ffd166','#6ee7a0'].forEach((c, i) => { ctx.fillStyle = c; ctx.globalAlpha = clamp(SA*a*.8); ctx.beginPath(); ctx.arc(x + 30 + i*24, y + 26, 7, 0, 6.283); ctx.fill(); });
+  ctx.restore();
+  txt(title, x + w/2, y + 27, {size:22, weight:500, color:C.muted, font:MONO, alpha:a});
+}
+
+/* ============ 背景 ============ */
+const PARTS = (() => { const r = rnd(137); return Array.from({length:100}, () => ({
+  x:r()*W, y:r()*H, s:r()*2.2+.5, v:r()*12+4, ph:r()*6.283, c:r()<.25})); })();
+function background(t){
+  const g = ctx.createLinearGradient(0,0,W,H);
+  g.addColorStop(0,'#0a0916'); g.addColorStop(.55,'#110f24'); g.addColorStop(1,'#18122c');
+  ctx.globalAlpha = 1; ctx.fillStyle = g; ctx.fillRect(0,0,W,H);
+  const gx = W*.5 + Math.sin(t*.27)*140;
+  const rg = ctx.createRadialGradient(gx, H*.45, 0, gx, H*.45, 950);
+  rg.addColorStop(0,'rgba(52,211,153,0.09)'); rg.addColorStop(1,'rgba(52,211,153,0)');
+  ctx.fillStyle = rg; ctx.fillRect(0,0,W,H);
+  ctx.fillStyle = C.acc;
+  for (let x = 40; x < W; x += 80) for (let y = 40; y < H; y += 80){ ctx.globalAlpha = .06; ctx.fillRect(x, y, 2, 2); }
+  for (const q of PARTS){
+    const y = ((q.y - t*q.v) % H + H) % H, x = q.x + Math.sin(t*.35 + q.ph)*12;
+    ctx.globalAlpha = .2 + .3*(.5 + .5*Math.sin(t*1.2 + q.ph));
+    ctx.fillStyle = q.c ? C.acc : '#d8d0ff';
+    ctx.beginPath(); ctx.arc(x, y, q.s, 0, 6.283); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+}
+function vignette(){
+  const v = ctx.createRadialGradient(W/2, H/2, W*.28, W/2, H/2, W*.62);
+  v.addColorStop(0,'rgba(0,0,0,0)'); v.addColorStop(1,'rgba(0,0,0,.55)');
+  ctx.globalAlpha = 1; ctx.fillStyle = v; ctx.fillRect(0,0,W,H);
+}
+function codeLine(s, x, y, size, a, kw = /\b(public|class|static|void|new|return)\b/){
+  const parts = s.split(/("[^"]*"|\b(?:public|class|static|void|new|return|getstatic|ldc|invokevirtual)\b)/g);
+  ctx.save(); al(a); ctx.font = `500 ${size}px ${MONO}`; ctx.textBaseline = 'middle'; ctx.textAlign = 'left';
+  let xx = x;
+  for (const seg of parts){ if (!seg) continue;
+    ctx.fillStyle = seg.startsWith('"') ? C.mint : /^(public|class|static|void|new|return|getstatic|ldc|invokevirtual)$/.test(seg) ? C.acc : C.text;
+    ctx.fillText(seg, xx, y); xx += ctx.measureText(seg).width; }
+  ctx.restore();
+}
+
+function pill(s, x, y, a, o = {}){
+  const {size=30, color=C.text, stroke='rgba(255,255,255,.2)', fill='rgba(255,255,255,.05)', font=FONT, weight=700} = o;
+  if (a <= 0) return;
+  ctx.save(); ctx.font = `${weight} ${size}px ${font}`; const w = ctx.measureText(s).width + 52; ctx.restore();
+  box(x - w/2, y - size*.9, w, size*1.8, a, {fill, stroke, r:size*.9});
+  txt(s, x, y, {size, weight, color, font, alpha:a});
+}
+function acct(name, val, x, y, a, o = {}){
+  const {hl=null} = o;
+  box(x - 200, y - 90, 400, 180, a, {fill:'rgba(255,255,255,.05)', stroke:hl || 'rgba(52,211,153,.5)', lw:hl ? 3 : 2, glow:hl ? 18 : 0, r:22});
+  txt('账户 ' + name, x, y - 42, {size:30, weight:800, color:C.muted, alpha:a});
+  txt(val + ' 元', x, y + 22, {size:56, weight:900, font:MONO, color:hl || C.text, alpha:a});
+}
+function flash(t, t0, a = .35){ const k = Math.sin(Math.PI*clamp((t - t0)/.5)); if (k > 0){ ctx.save(); ctx.globalAlpha = SA*k*a; ctx.fillStyle = C.rose; ctx.fillRect(0, 0, W, H); ctx.restore(); } }
+
+/* ============ 场景 1 · 钩子 (0–7s) ============ */
+function s1(t){
+  const a = eo(p(t, 0, .4)), dec = t > 1.0;
+  rise('A 给 B 转账 100 元', W/2, 140, t, .1, {size:48, weight:900});
+  acct('A', dec ? 900 : 1000, 560, 360, a, {hl:dec && t < 2 ? C.gold : null});
+  acct('B', 1000, 1360, 360, a);
+  pill('① A 减 100', 560, 520, eo(p(t, .8, 1.1)), {size:26, color:C.gold, stroke:C.gold});
+  pill('② B 加 100', 1360, 520, eo(p(t, 1.6, 1.9)), {size:26, color:C.muted});
+  flash(t, 1.9, .3);
+  txt('💥 系统崩溃', 960, 360, {size:40, weight:900, color:C.rose, alpha:eo(p(t, 1.9, 2.2)), scale:eback(p(t, 1.9, 2.3))});
+  rise('总额：1900 元——100 元凭空消失了', W/2, 650, t, 2.6, {size:44, weight:900, color:C.rose});
+  const k = p(t, 4.0, 4.6);
+  if (k > 0) txt('事务', W/2, 800, {size:120, weight:900, color:C.acc, glow:40, alpha:clamp(k*2), scale:eback(k)});
+  rise('要么全部成功，要么全部不做', W/2, 930, t, 4.8, {size:44, weight:800});
+}
+
+/* ============ 场景 2 · ACID 总览 (7–19s) ============ */
+const ACID = [['A', '原子性', 'Atomicity', ['要么全做', '要么全不做'], 'undo log'], ['C', '一致性', 'Consistency', ['数据始终', '满足规则'], '约束 + A·I·D'], ['I', '隔离性', 'Isolation', ['并发事务', '互不干扰'], '锁 + MVCC'], ['D', '持久性', 'Durability', ['提交了', '就不会丢'], 'redo log']];
+function s2(t){
+  rise('事务的四个特性：ACID', W/2, 110, t, 7.2, {size:60, weight:900});
+  ACID.forEach(([l, zh, en, d, mech], i) => {
+    const st = 7.8 + i*.7, e = eback(p(t, st, st + .6)); if (e <= 0) return;
+    const x = 135 + i*430, cx = x + 200, a = clamp(e), goal = i === 1;
+    ctx.save(); ctx.translate(cx, 460); ctx.scale(e, e); ctx.translate(-cx, -460);
+    box(x, 220, 400, 480, a, {fill:goal ? 'rgba(255,211,138,.07)' : 'rgba(52,211,153,.06)', stroke:goal ? 'rgba(255,211,138,.6)' : 'rgba(52,211,153,.5)', r:28}); ctx.restore();
+    txt(l, cx, 320, {size:110, weight:900, font:MONO, color:goal ? C.gold : C.acc, glow:24, alpha:a});
+    txt(zh, cx, 425, {size:44, weight:900, alpha:a}); txt(en, cx, 470, {size:22, weight:500, font:MONO, color:C.muted, alpha:a});
+    txt(d[0], cx, 540, {size:28, weight:600, alpha:a}); txt(d[1], cx, 580, {size:28, weight:600, alpha:a});
+    pill(mech, cx, 650, eo(p(t, 12.4 + i*.3, 12.8 + i*.3)), {size:22, font:i === 0 || i === 3 ? MONO : FONT, color:goal ? C.gold : C.acc, stroke:goal ? C.gold : C.acc});
+  });
+  rise('其中 C 是目的，A、I、D 是实现它的手段', W/2, 810, t, 14.6, {size:44, weight:900, color:C.gold});
+  rise('下面一个个看，InnoDB 是怎么做到的', W/2, 885, t, 15.8, {size:32, weight:600, color:C.muted});
+}
+
+/* ============ 场景 3 · 原子性 (19–33s) ============ */
+const TX = ['BEGIN;', "UPDATE account SET balance = balance - 100 WHERE name = 'A';", "UPDATE account SET balance = balance + 100 WHERE name = 'B';", 'COMMIT;'];
+function s3(t){
+  rise('原子性：靠 undo log「撤销」', W/2, 105, t, 19.2, {size:58, weight:900});
+  const pa = eo(p(t, 19.8, 20.3));
+  panel(90, 190, 1100, 330, 'transfer.sql', pa);
+  const run = t < 21.4 ? -1 : t < 22.6 ? 0 : t < 24.6 ? 1 : 2;
+  TX.forEach((s, i) => {
+    const y = 280 + i*58, on = i === run;
+    if (on){ ctx.save(); al(1); ctx.fillStyle = i === 2 && t > 24.6 ? 'rgba(255,138,138,.15)' : 'rgba(52,211,153,.13)'; rr(108, y - 26, 1064, 52, 8); ctx.fill(); ctx.restore(); }
+    txt(s, 130, y, {size:24, weight:600, font:MONO, color:i === 3 && t > 24.6 ? C.dim : C.text, align:'left', alpha:eo(p(t, 20.2 + i*.2, 20.6 + i*.2))});
+  });
+  if (t > 24.6) txt('✗ 执行到这里出错 / 崩溃', 1160, 454, {size:26, weight:900, color:C.rose, align:'right', alpha:eo(p(t, 24.6, 24.9))});
+  flash(t, 24.6, .22);
+  const ua = eo(p(t, 23.0, 23.5));
+  box(1250, 190, 570, 330, ua, {fill:'rgba(255,211,138,.05)', stroke:'rgba(255,211,138,.5)', r:18});
+  txt('undo log', 1535, 230, {size:28, weight:800, font:MONO, color:C.gold, alpha:ua});
+  txt('修改前，先记下旧值', 1535, 275, {size:22, weight:600, color:C.muted, alpha:ua});
+  pill("A 原来是 1000", 1535, 360, eback(p(t, 23.0, 23.5)), {size:28, font:FONT, color:C.gold, stroke:C.gold});
+  const rb = eo(p(t, 26.0, 27.0));
+  if (rb > 0){ ctx.save(); al(1); ctx.strokeStyle = C.gold; ctx.lineWidth = 4; ctx.setLineDash([10, 8]); ctx.beginPath(); ctx.moveTo(1420, 360); ctx.quadraticCurveTo(1300, 600, lerp(1420, 760, rb), lerp(360, 640, rb)); ctx.stroke(); ctx.restore();
+    txt('ROLLBACK：按 undo log 恢复', 1600, 470, {size:26, weight:800, color:C.gold, alpha:rb}); }
+  const aval = t > 27 ? 1000 : t > 22.6 ? 900 : 1000;
+  acct('A', aval, 560, 690, eo(p(t, 20.6, 21)), {hl:t > 27 ? C.mint : t > 22.6 ? C.gold : null});
+  acct('B', 1000, 1360, 690, eo(p(t, 20.6, 21)));
+  rise('出错时，按 undo log 把改过的数据一一改回去，就像什么都没发生', W/2, 880, t, 28.0, {size:38, weight:900});
+  rise('undo log 还有另一个用途：为 MVCC 提供历史版本', W/2, 950, t, 29.6, {size:30, weight:600, color:C.muted});
+}
+
+/* ============ 场景 4 · 持久性 (33–49s) ============ */
+function s4(t){
+  rise('持久性：先写日志，再写数据（WAL）', W/2, 105, t, 33.2, {size:58, weight:900});
+  const a = eo(p(t, 33.6, 34.1)), crash = t > 38.6 && t < 40.2, rec = t > 40.2;
+  box(140, 200, 520, 340, a, {fill:'rgba(124,199,255,.05)', stroke:'rgba(124,199,255,.5)', r:20});
+  txt('内存（Buffer Pool）', 400, 240, {size:28, weight:800, color:C.blue, alpha:a});
+  txt('读写都在这里，速度快', 400, 280, {size:22, weight:500, color:C.muted, alpha:a});
+  const memA = crash ? '' : t > 34.6 ? 'A = 900' : 'A = 1000';
+  if (memA) pill(memA + (t > 34.6 && t < 44.4 ? '（脏页）' : ''), 400, 400, a*(rec ? eo(p(t, 40.8, 41.2)) : 1), {size:30, font:FONT, color:t > 34.6 ? C.gold : C.text, stroke:t > 34.6 ? C.gold : 'rgba(255,255,255,.2)'});
+  if (crash) txt('断电，内存清空', 400, 400, {size:30, weight:900, color:C.rose, alpha:1});
+  box(720, 200, 480, 340, a, {fill:'rgba(52,211,153,.05)', stroke:'rgba(52,211,153,.6)', r:20});
+  txt('redo log', 960, 240, {size:28, weight:800, font:MONO, color:C.acc, alpha:a});
+  txt('顺序追加，很快', 960, 280, {size:22, weight:500, color:C.muted, alpha:a});
+  ['…', '…', 'A: 1000 → 900'].forEach((s, i) => { const e = i < 2 ? a : eo(p(t, 35.8, 36.3));
+    box(760, 320 + i*62, 400, 48, e, {fill:i === 2 ? 'rgba(52,211,153,.18)' : 'rgba(255,255,255,.04)', stroke:i === 2 ? C.acc : 'rgba(255,255,255,.12)', r:8});
+    txt(s, 960, 344 + i*62, {size:22, weight:700, font:MONO, color:i === 2 ? C.acc : C.muted, alpha:e}); });
+  box(1260, 200, 520, 340, a, {fill:'rgba(255,255,255,.03)', stroke:'rgba(255,255,255,.3)', r:20});
+  txt('磁盘数据文件', 1520, 240, {size:28, weight:800, alpha:a});
+  txt('随机写，较慢', 1520, 280, {size:22, weight:500, color:C.muted, alpha:a});
+  pill(t > 44.4 ? 'A = 900' : 'A = 1000', 1520, 400, a, {size:30, font:FONT, color:t > 44.4 ? C.mint : C.text});
+  arrow(660, 400, 715, 400, eo(p(t, 35.6, 36)), 1, C.acc, 3);
+  pill('COMMIT 成功', 960, 600, Math.min(eback(p(t, 36.6, 37.1)), 1), {size:28, color:C.mint, stroke:C.mint});
+  flash(t, 38.6, .3);
+  pill('重启：重放 redo log', 960, 665, eo(p(t, 40.2, 40.6)), {size:26, color:C.gold, stroke:C.gold});
+  if (t > 40.2){ const k = eo(p(t, 40.2, 40.8)); arrow(760, 470, 560, 430, k, k, C.gold, 3); }
+  txt('数据恢复了 ✓', 400, 480, {size:26, weight:900, color:C.mint, alpha:eo(p(t, 41.2, 41.6))});
+  if (t > 43.4){ const k = eo(p(t, 43.4, 44.4)); ctx.save(); al(k); ctx.strokeStyle = C.blue; ctx.lineWidth = 3; ctx.beginPath(); ctx.moveTo(400, 540); ctx.lineTo(400, 725); ctx.lineTo(1520, 725); ctx.lineTo(1520, 550); ctx.stroke(); ctx.restore();
+    arrow(1520, 600, 1520, 548, k, k, C.blue, 3); txt('稍后，后台再把脏页刷到磁盘', 960, 750, {size:22, weight:700, color:C.blue, alpha:k}); }
+  rise('提交时只需保证 redo log 落盘：顺序写，比随机写数据页快得多', W/2, 800, t, 44.8, {size:36, weight:900});
+  rise('崩溃后用 redo log 重做，已提交的数据就不会丢', W/2, 870, t, 46.0, {size:34, weight:800, color:C.acc});
+  rise('innodb_flush_log_at_trx_commit = 1：每次提交都把 redo log 刷到磁盘（默认）', W/2, 940, t, 47.2, {size:26, weight:600, color:C.muted});
+}
+
+/* ============ 场景 5 · 隔离性 (49–61s) ============ */
+const LV = [['读未提交 RU', ['可能', '可能', '可能']], ['读已提交 RC', ['避免', '可能', '可能']], ['可重复读 RR', ['避免', '避免', '基本避免']], ['串行化', ['避免', '避免', '避免']]];
+function s5(t){
+  rise('隔离性：并发的事务互不干扰', W/2, 105, t, 49.2, {size:58, weight:900});
+  const a = eo(p(t, 49.8, 50.3)), cols = [500, 900, 1180, 1460];
+  ['隔离级别', '脏读', '不可重复读', '幻读'].forEach((h, i) => txt(h, cols[i], 230, {size:30, weight:900, color:C.acc, alpha:a}));
+  LV.forEach(([lv, cells], r) => {
+    const y = 320 + r*95, e = eo(p(t, 50.6 + r*.5, 51 + r*.5)), rr2 = r === 2;
+    box(260, y - 40, 1400, 80, e, {fill:rr2 ? 'rgba(52,211,153,.10)' : 'rgba(255,255,255,.03)', stroke:rr2 ? C.acc : 'rgba(255,255,255,.1)', lw:rr2 ? 3 : 1.5, r:12});
+    txt(lv, cols[0], y, {size:30, weight:800, alpha:e});
+    cells.forEach((c, k) => txt(c, cols[k + 1], y, {size:28, weight:800, color:c === '可能' ? C.rose : c === '避免' ? C.mint : C.gold, alpha:eo(p(t, 51 + r*.5 + k*.12, 51.3 + r*.5 + k*.12))}));
+  });
+  pill('InnoDB 默认', 1760, 510, eo(p(t, 53.2, 53.6)), {size:22, color:C.acc, stroke:C.acc});
+  rise('隔离级别越高，并发性能通常越低：这是一种权衡', W/2, 760, t, 55.0, {size:38, weight:900});
+  rise('InnoDB 的实现：普通读靠 MVCC，写和当前读靠锁（详见本系列 MVCC 一期）', W/2, 835, t, 56.4, {size:32, weight:700, color:C.muted});
+}
+
+/* ============ 场景 6 · 一致性 (61–69s) ============ */
+function s6(t){
+  rise('一致性：数据始终「说得通」', W/2, 105, t, 61.2, {size:58, weight:900});
+  const a = eo(p(t, 61.6, 62.1)), b = eo(p(t, 62.8, 63.3));
+  txt('转账前', 520, 220, {size:30, weight:800, color:C.muted, alpha:a});
+  txt('A 1000 + B 1000 = 2000', 520, 290, {size:38, weight:800, font:MONO, alpha:a});
+  arrow(870, 270, 1040, 270, b, b, C.acc, 4);
+  txt('转账后', 1400, 220, {size:30, weight:800, color:C.muted, alpha:b});
+  txt('A 900 + B 1100 = 2000 ✓', 1400, 290, {size:38, weight:800, font:MONO, color:C.mint, alpha:b});
+  [['余额不能为负数', 'CHECK 约束 / 业务校验'], ['订单必须属于存在的用户', '外键约束'], ['手机号不能重复', '唯一约束']].forEach(([h, d], i) => {
+    const st = 63.6 + i*.5, e = eo(p(t, st, st + .4)), x = 330 + i*630;
+    box(x - 280, 400, 560, 150, e, {fill:'rgba(255,211,138,.06)', stroke:'rgba(255,211,138,.4)', r:20});
+    txt(h, x, 450, {size:30, weight:900, alpha:e}); txt(d, x, 505, {size:24, weight:600, color:C.gold, alpha:e});
+  });
+  rise('数据库负责约束，A、I、D 保证过程不出错', W/2, 680, t, 65.6, {size:40, weight:900});
+  rise('但「总额不变」这类业务规则，最终还要靠代码写对', W/2, 760, t, 66.8, {size:34, weight:700, color:C.gold});
+}
+
+/* ============ 场景 7 · 写代码时的提醒 (69–75s) ============ */
+const TIP = [['01', '事务要尽量短', '别在事务里调远程接口、', '等用户操作'], ['02', '注意回滚条件', '例如 Spring 默认只对', '运行时异常回滚'], ['03', '跨服务不是一个事务', '多个服务或多个库之间，', '需要分布式事务方案']];
+function s7(t){
+  rise('写代码时的 3 个提醒', W/2, 140, t, 69.2, {size:58, weight:900});
+  TIP.forEach(([no, h, l1, l2], i) => {
+    const st = 69.6 + i*.6, e = eback(p(t, st, st + .6)); if (e <= 0) return;
+    const x = 135 + i*570, cx = x + 270, a = clamp(p(t, st, st + .35)), dy = (1 - e)*300;
+    ctx.save(); ctx.translate(0, dy); al(a); rr(x, 260, 540, 420, 30); ctx.fillStyle = 'rgba(255,255,255,.05)'; ctx.fill();
+    ctx.strokeStyle = 'rgba(52,211,153,.45)'; ctx.lineWidth = 2; ctx.stroke(); ctx.restore();
+    txt(no, cx, 340 + dy, {size:72, weight:900, font:MONO, color:C.acc, glow:16, alpha:a});
+    txt(h, cx, 460 + dy, {size:40, weight:900, alpha:a});
+    txt(l1, cx, 540 + dy, {size:28, weight:500, color:C.muted, alpha:a}); txt(l2, cx, 582 + dy, {size:28, weight:500, color:C.muted, alpha:a});
+  });
+}
+
+/* ============ 场景 8 · 收尾 (75–80s) ============ */
+function s8(t){
+  ['A', 'C', 'I', 'D'].forEach((l, i) => {
+    const e = eback(p(t, 75.2 + i*.25, 75.7 + i*.25)), x = 600 + i*240;
+    txt(l, x, 330, {size:150, weight:900, font:MONO, color:i === 1 ? C.gold : C.acc, glow:30, alpha:clamp(e), scale:e});
+  });
+  rise('undo log · 约束 · 锁与 MVCC · redo log', W/2, 500, t, 76.4, {size:40, weight:800, color:C.muted});
+  rise('这就是事务', W/2, 640, t, 76.8, {size:90, weight:900, glow:24});
+  rise('关注我，一起搞懂后端', W/2, 800, t, 77.6, {size:36, weight:500, color:C.muted});
+}
+
+/* ============ 总调度 ============ */
+const SCENES = [[s1,-1,7],[s2,7,19],[s3,19,33],[s4,33,49],[s5,49,61],[s6,61,69],[s7,69,75],[s8,75,80]];
+function draw(t){
+  t = clamp(t, 0, DUR);
+  ctx.save(); ctx.globalAlpha = 1; ctx.clearRect(0,0,W,H); background(t);
+  for (const [fn,a,b] of SCENES){
+    if (t < a || t > b) continue;
+    SA = sceneA(t, a, b, b === DUR ? .8 : .5);
+    if (SA > 0){ ctx.save(); fn(t); ctx.restore(); }
+  }
+  SA = 1; vignette();
+  const fo = p(t, DUR - .8, DUR);
+  if (fo > 0){ ctx.globalAlpha = fo; ctx.fillStyle = '#000'; ctx.fillRect(0,0,W,H); }
+  ctx.restore();
+}
+
+/* ============ 播放器 / 逐帧渲染接口 ============ */
+const isRender = new URLSearchParams(location.search).has('render');
+window.DURATION = DUR;
+window.renderFrame = t => draw(t);
+const btn = document.getElementById('btn'), seek = document.getElementById('seek'), timeEl = document.getElementById('time');
+const fmt = s => `${Math.floor(s/60)}:${String(Math.floor(s%60)).padStart(2,'0')}`;
+function fit(){
+  if (isRender){ cv.style.width = W+'px'; cv.style.height = H+'px'; return; }
+  const w = Math.min(innerWidth - 32, (innerHeight - 84)*16/9);
+  cv.style.width = w + 'px'; cv.style.height = w*9/16 + 'px';
+}
+addEventListener('resize', fit); fit();
+
+let cur = 0, playing = !isRender, last = null;
+function toggle(){ if (cur >= DUR) cur = 0; playing = !playing; }
+btn.onclick = toggle; cv.onclick = toggle;
+addEventListener('keydown', e => { if (e.code === 'Space'){ e.preventDefault(); toggle(); } });
+seek.oninput = () => { cur = +seek.value; draw(cur); };
+function loop(ts){
+  if (playing && last != null){ cur += (ts - last)/1000; if (cur >= DUR){ cur = DUR; playing = false; } }
+  last = ts; draw(cur);
+  seek.value = cur; timeEl.textContent = `${fmt(cur)} / ${fmt(DUR)}`;
+  btn.textContent = playing ? '❚❚' : (cur >= DUR ? '↺' : '▶');
+  requestAnimationFrame(loop);
+}
+document.fonts.ready.then(() => {
+  window.ready = true;
+  if (isRender) draw(0); else requestAnimationFrame(loop);
+});
+</script>
+</body>
+</html>

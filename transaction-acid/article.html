@@ -1,0 +1,377 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>事务与 ACID：InnoDB 是怎么保证数据不出错的 · 图文详解</title>
+<meta name="description" content="原子性靠 undo log，持久性靠 redo log 和 WAL，隔离性靠锁与 MVCC，一致性是最终目的。附 Spring 事务的常见坑和分布式事务入门">
+<link rel="stylesheet" href="../assets/article.css">
+<style>:root{--acc:#34d399}</style>
+</head>
+<body>
+<div class="wrap">
+  <nav class="top"><a href="../index.html">← 全部视频</a><a class="watch" href="landscape.html">▶ 看视频</a></nav>
+  <header class="hero">
+    <div class="tag">计算机与后端 · 图文详解</div>
+    <h1>事务与 ACID：InnoDB 是怎么保证数据不出错的</h1>
+    <p>原子性靠 undo log，持久性靠 redo log 和 WAL，隔离性靠锁与 MVCC，一致性是最终目的。附 Spring 事务的常见坑和分布式事务入门</p>
+    <div class="meta">约 10 分钟读完 · 配套视频 1:20</div>
+  </header>
+  <nav class="toc">
+<ul>
+<li><a href="#_1">为什么需要事务</a></li>
+<li><a href="#acid">ACID 总览</a></li>
+<li><a href="#undo-log">原子性：undo log</a></li>
+<li><a href="#redo-log-wal">持久性：redo log 与 WAL</a></li>
+<li><a href="#mvcc">隔离性：锁与 MVCC</a></li>
+<li><a href="#_11">一致性：最终的目的</a></li>
+<li><a href="#_12">写代码时的提醒</a></li>
+<li><a href="#_13">高频面试题速答</a></li>
+<li><a href="#_14">总结</a></li>
+</ul>
+</nav>
+
+  <article>
+<figure><img src="img/f-3.5.jpg" alt="转账到一半崩溃，100 元凭空消失" loading="lazy"><figcaption>转账到一半崩溃，100 元凭空消失</figcaption></figure>
+<h2 id="_1">为什么需要事务</h2>
+<p>A 给 B 转账 100 元，至少需要两步：</p>
+<pre><code class="language-sql">UPDATE account SET balance = balance - 100 WHERE name = 'A';
+UPDATE account SET balance = balance + 100 WHERE name = 'B';
+</code></pre>
+<p>如果第一步执行完、第二步还没执行时，系统崩溃了，A 的钱少了，B 的钱却没多，100 元凭空消失。</p>
+<p><strong>事务</strong>（transaction）就是把多个操作打包成一个整体：<strong>要么全部成功，要么全部不做</strong>。</p>
+<pre><code class="language-sql">BEGIN;
+UPDATE account SET balance = balance - 100 WHERE name = 'A';
+UPDATE account SET balance = balance + 100 WHERE name = 'B';
+COMMIT;      -- 全部生效；如果中途出错，执行 ROLLBACK 全部撤销
+</code></pre>
+<blockquote>
+<p>MySQL 默认开启 <strong>autocommit</strong>：如果没有显式 <code>BEGIN</code>，每一条语句都自动作为一个独立的事务提交。</p>
+</blockquote>
+<h2 id="acid">ACID 总览</h2>
+<figure><img src="img/f-16.5.jpg" alt="事务的四个特性" loading="lazy"><figcaption>事务的四个特性</figcaption></figure>
+<table>
+<thead>
+<tr>
+<th>特性</th>
+<th>含义</th>
+<th>InnoDB 的实现</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>A</strong> 原子性（Atomicity）</td>
+<td>事务中的操作要么全部完成，要么全部不做</td>
+<td>undo log</td>
+</tr>
+<tr>
+<td><strong>C</strong> 一致性（Consistency）</td>
+<td>事务前后，数据都满足预定的规则</td>
+<td>数据库约束 + A、I、D + 应用逻辑</td>
+</tr>
+<tr>
+<td><strong>I</strong> 隔离性（Isolation）</td>
+<td>并发执行的事务互不干扰</td>
+<td>锁 + MVCC</td>
+</tr>
+<tr>
+<td><strong>D</strong> 持久性（Durability）</td>
+<td>事务一旦提交，修改就不会丢失</td>
+<td>redo log</td>
+</tr>
+</tbody>
+</table>
+<p>一个常被忽略的关键点：<strong>C 是目的，A、I、D 是手段。</strong> 原子性、隔离性、持久性共同保证数据始终处于一致的状态。</p>
+<h2 id="undo-log">原子性：undo log</h2>
+<figure><img src="img/f-29.jpg" alt="原子性：出错时按 undo log 撤销" loading="lazy"><figcaption>原子性：出错时按 undo log 撤销</figcaption></figure>
+<h3 id="_2">原理</h3>
+<p>InnoDB 在修改数据之前，会先把修改前的旧值记录到 <strong>undo log</strong> 里：</p>
+<table>
+<thead>
+<tr>
+<th>操作</th>
+<th>undo log 记录的内容</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>INSERT</code></td>
+<td>新插入行的主键（回滚时删除它）</td>
+</tr>
+<tr>
+<td><code>DELETE</code></td>
+<td>被删除行的完整内容（回滚时恢复它）</td>
+</tr>
+<tr>
+<td><code>UPDATE</code></td>
+<td>被修改列的旧值（回滚时改回去）</td>
+</tr>
+</tbody>
+</table>
+<p>如果事务执行过程中出错，或者用户主动执行 <code>ROLLBACK</code>，InnoDB 就按照 undo log <strong>反向</strong>执行，把数据恢复到事务开始前的样子。</p>
+<h3 id="_3">保存点</h3>
+<p>事务中还可以设置<strong>保存点</strong>，只回滚到某个位置，而不是全部撤销：</p>
+<pre><code class="language-sql">BEGIN;
+UPDATE ...;
+SAVEPOINT s1;
+UPDATE ...;
+ROLLBACK TO s1;   -- 只撤销 s1 之后的操作
+COMMIT;
+</code></pre>
+<h3 id="undo-log_1">undo log 的另一个用途</h3>
+<p>undo log 中保存的旧版本，同时也构成了 MVCC 的「版本链」，让快照读能看到历史版本。详见本系列《MySQL 的 MVCC》。</p>
+<h2 id="redo-log-wal">持久性：redo log 与 WAL</h2>
+<figure><img src="img/f-46.5.jpg" alt="先写日志，再写数据" loading="lazy"><figcaption>先写日志，再写数据</figcaption></figure>
+<h3 id="_4">为什么不直接把数据写到磁盘</h3>
+<p>InnoDB 修改数据时，先改的是内存中的数据页（Buffer Pool），被改过但还没写回磁盘的页叫<strong>脏页</strong>。如果每次提交都把相关的数据页写回磁盘：</p>
+<ul>
+<li>数据页分散在磁盘各处，是<strong>随机写</strong>，很慢；</li>
+<li>一个页 16KB，可能只改了几个字节，却要整页写入。</li>
+</ul>
+<h3 id="wal">WAL：先写日志</h3>
+<p>InnoDB 采用 <strong>WAL</strong>（Write-Ahead Logging，预写日志）策略：</p>
+<ol>
+<li>修改数据时，先改内存中的数据页；</li>
+<li>同时把「对哪个页做了什么修改」记录到 <strong>redo log</strong>；</li>
+<li>事务提交时，只需保证 <strong>redo log 写入磁盘</strong>，就可以返回成功；</li>
+<li>脏页由后台线程在合适的时机，慢慢刷回磁盘。</li>
+</ol>
+<p>redo log 是<strong>顺序追加</strong>写入的，比随机写数据页快得多，而且记录的内容很紧凑。</p>
+<h3 id="_5">崩溃恢复</h3>
+<p>如果在脏页刷回磁盘之前系统崩溃了，内存中的修改全部丢失。重启时，InnoDB 读取 redo log，把已经提交、但还没写进数据文件的修改<strong>重做</strong>一遍，数据就恢复了。这就是持久性的来源。</p>
+<h3 id="_6">刷盘策略</h3>
+<p>参数 <code>innodb_flush_log_at_trx_commit</code> 控制提交时 redo log 的刷盘方式：</p>
+<table>
+<thead>
+<tr>
+<th>取值</th>
+<th>行为</th>
+<th>可能丢失的数据</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>1</code>（默认）</td>
+<td>每次提交都写入并刷到磁盘</td>
+<td>不丢失</td>
+</tr>
+<tr>
+<td><code>2</code></td>
+<td>每次提交写入操作系统缓存，约每秒刷一次盘</td>
+<td>操作系统崩溃或断电时，可能丢最近约 1 秒的事务</td>
+</tr>
+<tr>
+<td><code>0</code></td>
+<td>约每秒写入并刷盘一次</td>
+<td>MySQL 进程崩溃也可能丢最近约 1 秒的事务</td>
+</tr>
+</tbody>
+</table>
+<p>对数据安全要求高的场景，通常配合 <code>sync_binlog = 1</code> 一起使用，也就是常说的「<strong>双 1 配置</strong>」。</p>
+<h3 id="redo-log-binlog">redo log 和 binlog 的关系</h3>
+<p>MySQL 还有一种日志叫 <strong>binlog</strong>，由 Server 层记录，用于主从复制和数据恢复。为了保证 redo log 和 binlog 的内容一致，提交时使用了<strong>两阶段提交</strong>：</p>
+<ol>
+<li>写 redo log，标记为 prepare 状态；</li>
+<li>写 binlog；</li>
+<li>把 redo log 标记为 commit 状态。</li>
+</ol>
+<p>崩溃恢复时，如果某个事务的 redo log 处于 prepare 状态，就检查 binlog 中是否有完整的记录，以此决定提交还是回滚。</p>
+<h2 id="mvcc">隔离性：锁与 MVCC</h2>
+<figure><img src="img/f-58.jpg" alt="四种隔离级别" loading="lazy"><figcaption>四种隔离级别</figcaption></figure>
+<h3 id="_7">并发事务会带来什么问题</h3>
+<table>
+<thead>
+<tr>
+<th>问题</th>
+<th>描述</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>脏读</td>
+<td>读到了其他事务未提交的数据</td>
+</tr>
+<tr>
+<td>不可重复读</td>
+<td>同一事务内两次读同一行，结果不同</td>
+</tr>
+<tr>
+<td>幻读</td>
+<td>同一事务内两次范围查询，行数不同</td>
+</tr>
+<tr>
+<td>丢失更新</td>
+<td>两个事务都基于旧值修改，后提交的覆盖了先提交的</td>
+</tr>
+</tbody>
+</table>
+<h3 id="_8">四种隔离级别</h3>
+<table>
+<thead>
+<tr>
+<th>隔离级别</th>
+<th>脏读</th>
+<th>不可重复读</th>
+<th>幻读</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>读未提交</td>
+<td>可能</td>
+<td>可能</td>
+<td>可能</td>
+</tr>
+<tr>
+<td>读已提交（RC）</td>
+<td>避免</td>
+<td>可能</td>
+<td>可能</td>
+</tr>
+<tr>
+<td>可重复读（RR，InnoDB 默认）</td>
+<td>避免</td>
+<td>避免</td>
+<td>InnoDB 中基本避免</td>
+</tr>
+<tr>
+<td>串行化</td>
+<td>避免</td>
+<td>避免</td>
+<td>避免</td>
+</tr>
+</tbody>
+</table>
+<p>隔离级别越高，数据越「安全」，但并发性能通常越差。</p>
+<h3 id="innodb">InnoDB 怎么实现</h3>
+<ul>
+<li><strong>普通 SELECT（快照读）</strong>：通过 <strong>MVCC</strong> 读取历史版本，不加锁，读写不阻塞；</li>
+<li><strong>写操作和当前读</strong>（<code>UPDATE</code>、<code>DELETE</code>、<code>SELECT ... FOR UPDATE</code>）：通过<strong>锁</strong>来协调，包括<strong>记录锁</strong>（锁住一行）、<strong>间隙锁</strong>（锁住两条记录之间的空隙，防止插入）和两者结合的<strong>临键锁</strong>。</li>
+</ul>
+<h3 id="_9">防止丢失更新</h3>
+<p>「先查余额，再在代码里计算，最后写回」是一个经典的坑：</p>
+<pre><code class="language-sql">-- 有问题：两个事务可能同时读到 1000，各自减 100 后都写回 900
+SELECT balance FROM account WHERE id = 1;
+UPDATE account SET balance = 900 WHERE id = 1;
+</code></pre>
+<p>正确的做法：</p>
+<pre><code class="language-sql">-- 方法一：让数据库原子地计算，并检查余额
+UPDATE account SET balance = balance - 100 WHERE id = 1 AND balance &gt;= 100;
+
+-- 方法二：加锁读（悲观锁）
+SELECT balance FROM account WHERE id = 1 FOR UPDATE;
+
+-- 方法三：版本号（乐观锁）
+UPDATE account SET balance = 900, version = version + 1 WHERE id = 1 AND version = 7;
+</code></pre>
+<h3 id="_10">死锁</h3>
+<p>两个事务互相等待对方持有的锁，就会形成<strong>死锁</strong>。InnoDB 会自动检测死锁，并回滚其中代价较小的一个事务。应用代码应该捕获这类错误并重试；同时，尽量让不同事务<strong>按相同的顺序</strong>访问资源，可以大幅减少死锁。</p>
+<h2 id="_11">一致性：最终的目的</h2>
+<figure><img src="img/f-68.jpg" alt="一致性：数据始终「说得通」" loading="lazy"><figcaption>一致性：数据始终「说得通」</figcaption></figure>
+<p>一致性指的是：事务开始前和结束后，数据都满足所有预定的规则。这些规则分两类：</p>
+<ol>
+<li><strong>数据库能保证的</strong>：主键唯一、非空、外键、唯一约束、<code>CHECK</code> 约束（MySQL 8.0.16 起生效）等；</li>
+<li><strong>只有业务知道的</strong>：比如「转账前后总额不变」「库存不能超卖」。</li>
+</ol>
+<p>数据库通过原子性、隔离性、持久性，保证事务的执行过程不会破坏数据；但如果代码本身写错了，比如转账时只扣钱不加钱，数据库也无能为力。所以一致性是数据库和应用<strong>共同</strong>的责任。</p>
+<h2 id="_12">写代码时的提醒</h2>
+<figure><img src="img/f-73.jpg" alt="写代码时的 3 个提醒" loading="lazy"><figcaption>写代码时的 3 个提醒</figcaption></figure>
+<h3 id="1">1. 事务要尽量短</h3>
+<p>事务越长，持有锁的时间就越长，阻塞其他事务；还会阻止 undo log 被清理。<strong>不要在事务里调用远程接口、发送消息、等待用户操作</strong>。</p>
+<h3 id="2-spring-transactional">2. Spring <code>@Transactional</code> 的常见坑</h3>
+<table>
+<thead>
+<tr>
+<th>现象</th>
+<th>原因</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>同一个类里的方法 A 调用带 <code>@Transactional</code> 的方法 B，B 的事务没生效</td>
+<td>Spring 事务基于代理，类内部通过 <code>this</code> 调用会绕过代理</td>
+</tr>
+<tr>
+<td>抛出受检异常（如 <code>IOException</code>）后没有回滚</td>
+<td>默认只对 <code>RuntimeException</code> 和 <code>Error</code> 回滚，需要设置 <code>rollbackFor</code></td>
+</tr>
+<tr>
+<td>异常被 <code>try-catch</code> 吞掉了，事务照常提交</td>
+<td>事务管理器没感知到异常</td>
+</tr>
+<tr>
+<td>在新线程里执行的数据库操作不在事务里</td>
+<td>事务绑定在当前线程上</td>
+</tr>
+<tr>
+<td>方法不是 <code>public</code>，注解不生效</td>
+<td>基于代理的事务默认只作用于 public 方法</td>
+</tr>
+</tbody>
+</table>
+<h3 id="3">3. 跨服务不是一个本地事务</h3>
+<p>当一个业务操作涉及多个服务或多个数据库时，本地事务就无能为力了，需要<strong>分布式事务</strong>方案：</p>
+<table>
+<thead>
+<tr>
+<th>方案</th>
+<th>思路</th>
+<th>特点</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>两阶段提交（2PC/XA）</td>
+<td>协调者先让所有参与者准备，都成功后再统一提交</td>
+<td>强一致，但性能较差，协调者故障时可能阻塞</td>
+</tr>
+<tr>
+<td>TCC</td>
+<td>每个操作拆成 Try、Confirm、Cancel 三步</td>
+<td>灵活，但业务改造成本高</td>
+</tr>
+<tr>
+<td>Saga</td>
+<td>拆成一串本地事务，失败时按反方向执行补偿操作</td>
+<td>适合长流程，保证最终一致</td>
+</tr>
+<tr>
+<td>本地消息表 / Outbox</td>
+<td>业务数据和「待发送消息」在同一个本地事务里写入，再异步可靠投递</td>
+<td>实现简单，最终一致，非常常用</td>
+</tr>
+</tbody>
+</table>
+<p>互联网业务中，大多数场景选择的是<strong>最终一致性</strong>：允许短时间内不一致，但保证最终达到一致。</p>
+<h2 id="_13">高频面试题速答</h2>
+<p><strong>Q：ACID 分别靠什么实现？</strong>
+原子性靠 undo log；持久性靠 redo log；隔离性靠锁和 MVCC；一致性是目的，由前三者和数据库约束、应用逻辑共同保证。</p>
+<p><strong>Q：redo log 和 undo log 有什么区别？</strong>
+redo log 记录「修改后是什么样」，用于崩溃后重做，保证持久性；undo log 记录「修改前是什么样」，用于回滚和 MVCC，保证原子性和隔离性。</p>
+<p><strong>Q：为什么不在提交时直接把数据页写入磁盘？</strong>
+数据页是随机写，代价高；redo log 是顺序写，代价低。先写日志，崩溃时也能通过日志恢复，这就是 WAL。</p>
+<p><strong>Q：什么是「双 1 配置」？</strong>
+<code>innodb_flush_log_at_trx_commit = 1</code> 和 <code>sync_binlog = 1</code>，每次提交都把 redo log 和 binlog 刷到磁盘，最大程度保证数据不丢。</p>
+<h2 id="_14">总结</h2>
+<figure><img src="img/f-78.jpg" alt="ACID" loading="lazy"><figcaption>ACID</figcaption></figure>
+<ul>
+<li><strong>原子性</strong>：undo log 记录旧值，出错就撤销；</li>
+<li><strong>持久性</strong>：WAL，先写 redo log，崩溃后重做；</li>
+<li><strong>隔离性</strong>：快照读靠 MVCC，写和当前读靠锁；</li>
+<li><strong>一致性</strong>：最终目的，需要数据库和代码共同保证；</li>
+<li>写代码时：<strong>事务要短，注意回滚条件，跨服务要用分布式事务方案</strong>。</li>
+</ul>
+<div class="refs">
+<h3 id="_15">参考资料</h3>
+<ul>
+<li>MySQL 8.0 Reference Manual: InnoDB and the ACID Model；Redo Log；Undo Logs；InnoDB Locking；Transaction Isolation Levels.</li>
+<li>Spring Framework Reference: Transaction Management（Declarative transaction management）.</li>
+<li>Kleppmann, M. (2017). <em>Designing Data-Intensive Applications</em>, Chapter 7: Transactions.（中译本：《数据密集型应用系统设计》）</li>
+<li>Garcia-Molina, H., &amp; Salem, K. (1987). Sagas. <em>ACM SIGMOD</em>.</li>
+</ul>
+</div>
+  </article>
+  <div class="foot"><a href="../index.html">← 返回首页</a><a href="landscape.html">▶ 看配套视频</a></div>
+</div>
+</body>
+</html>

@@ -65,7 +65,8 @@ const VIDEOS = [
   {cat:'cs', title:"MySQL 的 MVCC", desc:"隐藏列、undo 版本链、ReadView、RC 与 RR", path:'mysql-mvcc/landscape.html', dur:80, color:'#4dd0e1'},
   {cat:'cs', title:"按下回车后发生了什么", desc:"DNS、TCP 与 TLS 握手、HTTP 请求响应、浏览器渲染", path:'http-request/landscape.html', dur:80, color:'#e879f9'},
   {cat:'cs', title:"TCP 三次握手", desc:"为什么是三次、四次挥手、重传与窗口、SYN 洪水", path:'tcp-handshake/landscape.html', dur:80, color:'#facc15'},
-  {cat:'cs', title:"数据库索引：为什么是 B+ 树", desc:"磁盘 IO、B+ 树查找、回表与覆盖索引、最左前缀", path:'bplus-tree/landscape.html', dur:80, color:'#fb923c'}
+  {cat:'cs', title:"数据库索引：为什么是 B+ 树", desc:"磁盘 IO、B+ 树查找、回表与覆盖索引、最左前缀", path:'bplus-tree/landscape.html', dur:80, color:'#fb923c'},
+  {cat:'cs', title:"事务与 ACID", desc:"undo log、redo log 与 WAL、隔离级别、一致性", path:'transaction-acid/landscape.html', dur:80, color:'#34d399'}
 ];
 const fmt = s => `${Math.floor(s/60)}:${String(s%60).padStart(2,'0')}`;
 const esc = s => s.replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
