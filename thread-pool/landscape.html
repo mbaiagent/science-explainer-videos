@@ -1,0 +1,354 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>线程池是什么</title>
+<style>
+  :root{--bg:#07080f;--fg:#f4ede4;--muted:#9a93a8;--acc:#a3e36b}
+  html,body{margin:0;height:100%;background:var(--bg);color:var(--fg);
+    font-family:-apple-system,"PingFang SC","Noto Sans SC","Noto Sans CJK SC","Microsoft YaHei",sans-serif}
+  body{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;overflow:hidden}
+  #stage{display:block;background:#07080f;border-radius:12px;box-shadow:0 20px 60px rgba(0,0,0,.55);cursor:pointer}
+  #bar{display:flex;align-items:center;gap:12px;width:min(calc(100vw - 32px),640px)}
+  #btn{width:40px;height:40px;border-radius:50%;border:1px solid rgba(163,227,107,.5);background:transparent;
+    color:var(--acc);font-size:16px;cursor:pointer;flex:none}
+  #seek{flex:1;accent-color:var(--acc)}
+  #time{font-variant-numeric:tabular-nums;font-size:13px;color:var(--muted);min-width:84px;text-align:right}
+  body.render{display:block}
+  body.render #bar{display:none}
+  body.render #stage{border-radius:0;box-shadow:none}
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="bar">
+  <button id="btn" aria-label="播放/暂停">❚❚</button>
+  <input id="seek" type="range" min="0" max="80" step="0.01" value="0">
+  <span id="time">0:00 / 1:20</span>
+</div>
+<script>
+/* ============ 基础设置（横屏 1920×1080） ============ */
+const W = 1920, H = 1080, DUR = 80;
+const cv = document.getElementById('stage'), ctx = cv.getContext('2d');
+cv.width = W; cv.height = H;
+const FONT = '"PingFang SC","Noto Sans SC","Noto Sans CJK SC","Source Han Sans SC","Microsoft YaHei",sans-serif';
+const MONO = '"JetBrains Mono","SF Mono",Menlo,Consolas,"DejaVu Sans Mono","Noto Sans Mono CJK SC","PingFang SC","Microsoft YaHei",monospace';
+const C = {acc:'#a3e36b', mint:'#6ee7c8', gold:'#ffd38a', coral:'#ff9e7a', rose:'#ff8a8a', blue:'#9cc3ff', text:'#f4ede4', muted:'#9a93a8', dim:'#4a4558', panel:'#0f0e1f'};
+
+const clamp = (x,a=0,b=1) => Math.max(a, Math.min(b, x));
+const lerp = (a,b,t) => a + (b-a)*t;
+const p = (t,a,b) => clamp((t-a)/(b-a));
+const eo = x => 1 - Math.pow(1-x, 3);
+const eio = x => x < .5 ? 4*x*x*x : 1 - Math.pow(-2*x+2, 3)/2;
+const eback = x => { const c1=1.70158, c3=c1+1; return 1 + c3*Math.pow(x-1,3) + c1*Math.pow(x-1,2); };
+function rnd(seed){ let s = seed>>>0; return () => { s = (s*1664525 + 1013904223)>>>0; return s/4294967296; }; }
+
+let SA = 1;
+const al = a => { ctx.globalAlpha = clamp(SA*a); };
+const sceneA = (t,a,b,f=.5) => Math.min(p(t,a,a+f), 1 - p(t,b-f,b));
+
+function txt(s, x, y, o = {}){
+  const {size=64, weight=700, color=C.text, alpha=1, align='center', glow=0, scale=1, font=FONT} = o;
+  if (alpha <= 0) return;
+  ctx.save(); al(alpha);
+  ctx.font = `${weight} ${size}px ${font}`;
+  ctx.textAlign = align; ctx.textBaseline = 'middle'; ctx.fillStyle = color;
+  if (glow){ ctx.shadowColor = color; ctx.shadowBlur = glow; }
+  if (scale !== 1){ ctx.translate(x, y); ctx.scale(scale, scale); ctx.fillText(s, 0, 0); }
+  else ctx.fillText(s, x, y);
+  ctx.restore();
+}
+function rise(s, x, y, t, t0, o = {}, d = .7){
+  const e = eo(p(t, t0, t0+d));
+  if (e <= 0) return;
+  txt(s, x, y + (1-e)*36, {...o, alpha:(o.alpha ?? 1)*e});
+}
+function rr(x,y,w,h,r){ ctx.beginPath(); ctx.roundRect(x,y,w,h,r); }
+function box(x, y, w, h, a, o = {}){
+  const {fill='rgba(255,255,255,.05)', stroke='rgba(163,227,107,.35)', lw=2, glow=0, r=18, dash=null} = o;
+  if (a <= 0) return;
+  ctx.save(); al(a); rr(x, y, w, h, r); ctx.fillStyle = fill; ctx.fill();
+  if (dash) ctx.setLineDash(dash);
+  ctx.strokeStyle = stroke; ctx.lineWidth = lw; if (glow){ ctx.shadowColor = stroke; ctx.shadowBlur = glow; } ctx.stroke(); ctx.restore();
+}
+function arrow(x1, y1, x2, y2, e, a, color = C.acc, lw = 3){
+  if (e <= 0 || a <= 0) return;
+  const x = lerp(x1, x2, e), y = lerp(y1, y2, e), ang = Math.atan2(y2 - y1, x2 - x1);
+  ctx.save(); al(a); ctx.strokeStyle = color; ctx.fillStyle = color; ctx.lineWidth = lw; ctx.lineCap = 'round';
+  ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x, y); ctx.stroke();
+  if (e > .85){ ctx.translate(x, y); ctx.rotate(ang); ctx.beginPath(); ctx.moveTo(4, 0); ctx.lineTo(-14, -9); ctx.lineTo(-14, 9); ctx.closePath(); ctx.fill(); }
+  ctx.restore();
+}
+function panel(x, y, w, h, title, a){
+  box(x, y, w, h, a, {fill:C.panel, stroke:'rgba(255,255,255,.1)', r:20});
+  if (a <= 0) return;
+  ctx.save(); al(a); ctx.strokeStyle = 'rgba(255,255,255,.07)'; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(x, y + 52); ctx.lineTo(x + w, y + 52); ctx.stroke();
+  ['#ff6b6b','#ffd166','#6ee7a0'].forEach((c, i) => { ctx.fillStyle = c; ctx.globalAlpha = clamp(SA*a*.8); ctx.beginPath(); ctx.arc(x + 30 + i*24, y + 26, 7, 0, 6.283); ctx.fill(); });
+  ctx.restore();
+  txt(title, x + w/2, y + 27, {size:22, weight:500, color:C.muted, font:MONO, alpha:a});
+}
+
+/* ============ 背景 ============ */
+const PARTS = (() => { const r = rnd(71); return Array.from({length:100}, () => ({
+  x:r()*W, y:r()*H, s:r()*2.2+.5, v:r()*12+4, ph:r()*6.283, c:r()<.25})); })();
+function background(t){
+  const g = ctx.createLinearGradient(0,0,W,H);
+  g.addColorStop(0,'#0a0916'); g.addColorStop(.55,'#110f24'); g.addColorStop(1,'#18122c');
+  ctx.globalAlpha = 1; ctx.fillStyle = g; ctx.fillRect(0,0,W,H);
+  const gx = W*.5 + Math.sin(t*.27)*140;
+  const rg = ctx.createRadialGradient(gx, H*.45, 0, gx, H*.45, 950);
+  rg.addColorStop(0,'rgba(163,227,107,0.09)'); rg.addColorStop(1,'rgba(163,227,107,0)');
+  ctx.fillStyle = rg; ctx.fillRect(0,0,W,H);
+  ctx.fillStyle = C.acc;
+  for (let x = 40; x < W; x += 80) for (let y = 40; y < H; y += 80){ ctx.globalAlpha = .06; ctx.fillRect(x, y, 2, 2); }
+  for (const q of PARTS){
+    const y = ((q.y - t*q.v) % H + H) % H, x = q.x + Math.sin(t*.35 + q.ph)*12;
+    ctx.globalAlpha = .2 + .3*(.5 + .5*Math.sin(t*1.2 + q.ph));
+    ctx.fillStyle = q.c ? C.acc : '#d8d0ff';
+    ctx.beginPath(); ctx.arc(x, y, q.s, 0, 6.283); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+}
+function vignette(){
+  const v = ctx.createRadialGradient(W/2, H/2, W*.28, W/2, H/2, W*.62);
+  v.addColorStop(0,'rgba(0,0,0,0)'); v.addColorStop(1,'rgba(0,0,0,.55)');
+  ctx.globalAlpha = 1; ctx.fillStyle = v; ctx.fillRect(0,0,W,H);
+}
+function codeLine(s, x, y, size, a, kw = /\b(public|class|static|void|new|return)\b/){
+  const parts = s.split(/("[^"]*"|\b(?:public|class|static|void|new|return|getstatic|ldc|invokevirtual)\b)/g);
+  ctx.save(); al(a); ctx.font = `500 ${size}px ${MONO}`; ctx.textBaseline = 'middle'; ctx.textAlign = 'left';
+  let xx = x;
+  for (const seg of parts){ if (!seg) continue;
+    ctx.fillStyle = seg.startsWith('"') ? C.mint : /^(public|class|static|void|new|return|getstatic|ldc|invokevirtual)$/.test(seg) ? C.acc : C.text;
+    ctx.fillText(seg, xx, y); xx += ctx.measureText(seg).width; }
+  ctx.restore();
+}
+
+/* ============ 场景 1 · 钩子 (0–7s) ============ */
+function s1(t){
+  const a = eo(p(t, 0, .4));
+  box(460, 130, 1000, 470, a, {fill:'rgba(255,255,255,.03)', stroke:'rgba(255,255,255,.15)', r:24});
+  txt('服务器', 490, 165, {size:26, weight:700, color:C.muted, align:'left', alpha:a});
+  const n = Math.floor(clamp((t - .4)/3.2)*60);
+  for (let i = 0; i < 6; i++){                      // 请求箭头
+    const u = ((t*.9 + i/6) % 1);
+    arrow(160 + u*120, 220 + i*65, 200 + u*240, 220 + i*65, 1, a*(1 - u)*.8, C.acc, 3);
+  }
+  for (let i = 0; i < n; i++){
+    const col = i % 15, row = Math.floor(i/15), e = eo(p(t, .4 + i*.053, .7 + i*.053));
+    box(510 + col*62, 220 + row*92, 26, 64, e, {fill:'rgba(163,227,107,.25)', stroke:C.acc, r:13});
+  }
+  txt(`new Thread() × ${n}`, 960, 650, {size:30, weight:700, font:MONO, color:n > 40 ? C.rose : C.acc, alpha:a});
+  const fill = n/60, red = fill > .7;
+  box(1540, 150, 70, 450, a, {fill:'rgba(255,255,255,.04)', stroke:'rgba(255,255,255,.2)', r:14});
+  if (fill > 0){ ctx.save(); al(a); rr(1546, 594 - 438*fill, 58, 438*fill, 10); ctx.fillStyle = red ? C.rose : C.acc; ctx.shadowColor = ctx.fillStyle; ctx.shadowBlur = red ? 24 : 0; ctx.fill(); ctx.restore(); }
+  txt('内存', 1575, 625, {size:26, weight:700, color:red ? C.rose : C.muted, alpha:a});
+  rise('来一个请求就新建一个线程？服务器很快扛不住', W/2, 730, t, 3.6, {size:48, weight:900});
+  const k = p(t, 4.6, 5.2);
+  if (k > 0) txt('线程池', W/2, 860, {size:110, weight:900, color:C.acc, glow:36, alpha:clamp(k*2), scale:eback(k)});
+  rise('提前建好一批线程，反复使用', W/2, 960, t, 5.4, {size:36, weight:600, color:C.muted});
+}
+
+/* ============ 场景 2 · 银行柜台 (7–19s) ============ */
+function s2(t){
+  rise('线程池，就像银行柜台', W/2, 115, t, 7.2, {size:60, weight:900});
+  [0,1,2,3].forEach(i => {
+    const core = i < 2, st = 7.8 + i*.3, e = eback(p(t, st, st + .5)); if (e <= 0) return;
+    const x = 360 + i*300, open = core || t > 11.2;
+    ctx.save(); ctx.translate(x + 120, 330); ctx.scale(e, e); ctx.translate(-(x + 120), -330);
+    box(x, 260, 240, 140, clamp(e), core ? {fill:'rgba(163,227,107,.15)', stroke:C.acc, lw:3} : {fill:open ? 'rgba(163,227,107,.08)' : 'rgba(255,255,255,.03)', stroke:open ? 'rgba(163,227,107,.6)' : 'rgba(255,255,255,.25)', dash:[8, 8]});
+    ctx.restore();
+    txt(core ? '常驻柜员' : '临时柜员', x + 120, 312, {size:32, weight:800, color:core || open ? C.text : C.muted, alpha:clamp(e)});
+    txt(core ? '一直在岗' : open ? '忙时加开' : '（未开放）', x + 120, 360, {size:24, weight:500, color:C.muted, alpha:clamp(e)});
+  });
+  for (let i = 0; i < 5; i++){
+    const e = eo(p(t, 9.0 + i*.15, 9.4 + i*.15)), x = 520 + i*170;
+    box(x, 540, 130, 90, e, {fill:'rgba(255,255,255,.05)', stroke:'rgba(255,211,138,.45)', r:14});
+    if (t > 10 + i*.2){ ctx.save(); al(eo(p(t, 10 + i*.2, 10.4 + i*.2))); ctx.fillStyle = C.gold; ctx.beginPath(); ctx.arc(x + 65, 585, 18, 0, 6.283); ctx.fill(); ctx.restore(); }
+  }
+  txt('等候区', 960, 670, {size:28, weight:800, color:C.gold, alpha:eo(p(t, 9, 9.5))});
+  const ga = eo(p(t, 12.0, 12.6));
+  box(1580, 500, 220, 170, ga, {fill:'rgba(255,138,138,.08)', stroke:C.rose, dash:[8, 8]});
+  txt('门口保安', 1690, 560, {size:30, weight:800, color:C.rose, alpha:ga}); txt('满了就劝退', 1690, 610, {size:24, weight:500, color:C.muted, alpha:ga});
+  [['常驻柜员 → 核心线程', C.acc], ['临时柜员 → 非核心线程', C.acc], ['等候区 → 任务队列', C.gold], ['劝退 → 拒绝策略', C.rose]].forEach(([s, c], i) => {
+    const x = 260 + i*440;
+    rise(s, x + 140, 820, t, 13.6 + i*.6, {size:32, weight:800, color:c});
+  });
+  rise('顾客 = 任务，柜员 = 线程', W/2, 930, t, 16.2, {size:36, weight:600, color:C.muted});
+}
+
+/* ============ 场景 3 · 任务流转 (19–39s) ============ */
+const STEPS = [['① 核心线程没满？', '新建核心线程来执行'], ['② 核心线程满了？', '放进队列排队'], ['③ 队列也满了？', '加开非核心线程'], ['④ 线程数到上限了？', '执行拒绝策略']];
+const CORE = [[970, 305], [1130, 305]], EXTRA = [[1330, 305], [1490, 305]], QUEUE = [0,1,2,3].map(i => [965 + i*150, 525]);
+const SPAWN = [1000, 825], REJ = [1670, 825];
+const DEST = [CORE[0], CORE[1], QUEUE[0], QUEUE[1], QUEUE[2], QUEUE[3], EXTRA[0], EXTRA[1], REJ];
+const stepOf = i => i < 2 ? 0 : i < 6 ? 1 : i < 8 ? 2 : 3;
+const T0 = 21.4, DT = 1.6;
+function s3(t){
+  rise('一个任务进来，会经历什么？', W/2, 100, t, 19.2, {size:56, weight:900});
+  const arrived = Math.floor((t - T0)/DT);
+  const cur = arrived >= 0 ? stepOf(Math.min(arrived, 8)) : -1;
+  STEPS.forEach(([a, b], i) => {
+    const e = eo(p(t, 19.8 + i*.25, 20.3 + i*.25)), y = 240 + i*150, on = i === cur;
+    box(100, y - 55, 660, 110, e, on ? {fill:i === 3 ? 'rgba(255,138,138,.14)' : 'rgba(163,227,107,.14)', stroke:i === 3 ? C.rose : C.acc, lw:3, glow:20} : {stroke:'rgba(255,255,255,.12)'});
+    txt(a, 140, y - 18, {size:32, weight:900, align:'left', alpha:e*(on ? 1 : .6)});
+    txt('→ ' + b, 140, y + 26, {size:28, weight:600, color:on ? (i === 3 ? C.rose : C.acc) : C.muted, align:'left', alpha:e});
+  });
+  const pa = eo(p(t, 20.2, 20.8));
+  txt('核心线程', 900, 225, {size:26, weight:800, color:C.acc, align:'left', alpha:pa});
+  txt('非核心线程', 1260, 225, {size:26, weight:800, color:C.acc, align:'left', alpha:pa});
+  txt('最多 4 个线程', 1810, 225, {size:22, weight:600, color:C.muted, align:'right', alpha:pa});
+  CORE.forEach(([x, y]) => box(x - 70, y - 55, 140, 110, pa, {fill:'rgba(163,227,107,.08)', stroke:'rgba(163,227,107,.6)'}));
+  EXTRA.forEach(([x, y], i) => { const on = arrived >= 6 + i; box(x - 70, y - 55, 140, 110, pa, {fill:on ? 'rgba(163,227,107,.08)' : 'rgba(255,255,255,.02)', stroke:on ? 'rgba(163,227,107,.6)' : 'rgba(255,255,255,.25)', dash:on ? null : [8, 8]}); });
+  txt('任务队列（容量 4）', 900, 455, {size:26, weight:800, color:C.gold, align:'left', alpha:pa});
+  QUEUE.forEach(([x, y]) => box(x - 65, y - 45, 130, 90, pa, {fill:'rgba(255,211,138,.05)', stroke:'rgba(255,211,138,.45)'}));
+  box(SPAWN[0] - 100, SPAWN[1] - 55, 200, 110, pa, {stroke:'rgba(255,255,255,.2)', dash:[8, 8]}); txt('新任务', SPAWN[0], SPAWN[1] + 80, {size:24, weight:600, color:C.muted, alpha:pa});
+  box(REJ[0] - 110, REJ[1] - 55, 220, 110, pa, {fill:'rgba(255,138,138,.06)', stroke:'rgba(255,138,138,.6)', dash:[8, 8]}); txt('拒绝', REJ[0], REJ[1] + 80, {size:24, weight:800, color:C.rose, alpha:pa});
+  for (let i = 0; i < 9; i++){
+    const ts = T0 + i*DT; if (t < ts) break;
+    const m = eio(p(t, ts + .3, ts + 1.0)), [dx, dy] = DEST[i];
+    const x = lerp(SPAWN[0], dx, m), y = lerp(SPAWN[1], dy, m), rej = i === 8;
+    const sc = eback(p(t, ts, ts + .3));
+    ctx.save(); ctx.translate(x, y); ctx.scale(sc, sc); al(1);
+    rr(-34, -34, 68, 68, 12); ctx.fillStyle = rej && m > .9 ? 'rgba(255,138,138,.35)' : 'rgba(163,227,107,.3)'; ctx.fill();
+    ctx.strokeStyle = rej && m > .9 ? C.rose : C.acc; ctx.lineWidth = 3; ctx.stroke(); ctx.restore();
+    txt('#' + (i + 1), x, y, {size:24, weight:800, font:MONO, alpha:clamp(sc)});
+    const running = m >= 1 && (i < 2 || i === 6 || i === 7);
+    if (running){ ctx.save(); al(.9); ctx.strokeStyle = C.acc; ctx.lineWidth = 4; ctx.lineCap = 'round';
+      ctx.beginPath(); ctx.arc(x, y, 48, t*4 + i, t*4 + i + 1.6); ctx.stroke(); ctx.restore(); }
+    if (rej && m >= 1){ const k = eo(p(t, ts + 1, ts + 1.3)); ctx.save(); al(k); ctx.strokeStyle = C.rose; ctx.lineWidth = 6; ctx.lineCap = 'round';
+      ctx.beginPath(); ctx.moveTo(x - 22, y - 22); ctx.lineTo(x + 22, y + 22); ctx.moveTo(x + 22, y - 22); ctx.lineTo(x - 22, y + 22); ctx.stroke(); ctx.restore(); }
+  }
+  rise('注意顺序：先排队，队列满了才加线程', W/2, 975, t, 36.0, {size:42, weight:900, color:C.gold, glow:14});
+}
+
+/* ============ 场景 4 · 7 个参数 (39–53s) ============ */
+const PCODE = [
+  ['new ThreadPoolExecutor(', ''],
+  ['    2,', '// corePoolSize'],
+  ['    4,', '// maximumPoolSize'],
+  ['    60, TimeUnit.SECONDS,', '// keepAliveTime'],
+  ['    new ArrayBlockingQueue<>(4),', '// workQueue'],
+  ['    threadFactory,', '// threadFactory'],
+  ['    new ThreadPoolExecutor.AbortPolicy()', '// handler'],
+  [');', '']];
+const PDESC = [['核心线程数', '常驻，默认不会被回收'], ['最大线程数', '核心 + 非核心的总上限'], ['空闲存活时间', '非核心线程闲多久就回收'], ['任务队列', '用有界队列，防止无限堆积'], ['线程工厂', '给线程起名，出问题好排查'], ['拒绝策略', '全满了怎么处理']];
+function s4(t){
+  rise('ThreadPoolExecutor 的 7 个参数', W/2, 105, t, 39.2, {size:56, weight:900});
+  const pa = eo(p(t, 39.8, 40.3));
+  panel(100, 180, 1060, 640, 'ThreadPool.java', pa);
+  const k = Math.floor((t - 41.0)/1.8), cur = t >= 41 ? Math.min(k, 5) : -1;
+  if (cur >= 0){ const y = 290 + (cur + 1)*62; ctx.save(); al(1); ctx.fillStyle = 'rgba(163,227,107,.12)'; rr(118, y - 30, 1024, 60, 10); ctx.fill();
+    ctx.fillStyle = C.acc; ctx.fillRect(118, y - 30, 5, 60); ctx.restore(); }
+  PCODE.forEach(([code, cm], i) => {
+    const e = eo(p(t, 40.2 + i*.12, 40.6 + i*.12)), y = 290 + i*62;
+    codeLine(code, 140, y, 27, e);
+    if (cm) txt(cm, 830, y, {size:24, weight:500, color:C.muted, font:MONO, align:'left', alpha:e*(cur === i - 1 ? 1 : .6)});
+  });
+  PDESC.forEach(([a, b], i) => {
+    const st = 41 + i*1.8, e = eo(p(t, st, st + .4)), y = 230 + i*100, on = i === cur;
+    box(1200, y - 42, 620, 84, e, on ? {fill:'rgba(163,227,107,.12)', stroke:C.acc, lw:3, glow:16} : {stroke:'rgba(255,255,255,.1)'});
+    txt(a, 1230, y, {size:32, weight:900, color:on ? C.acc : C.text, align:'left', alpha:e});
+    txt(b, 1800, y, {size:24, weight:500, color:C.muted, align:'right', alpha:e});
+  });
+  rise('数值对应上一页：核心 2、最多 4、队列容量 4', W/2, 905, t, 51.4, {size:34, weight:600, color:C.muted});
+}
+
+/* ============ 场景 5 · 拒绝策略 (53–63s) ============ */
+const POL = [['AbortPolicy', '直接抛异常（默认）'], ['CallerRunsPolicy', '让提交任务的线程自己跑，顺便降速'], ['DiscardPolicy', '悄悄丢掉，什么也不说'], ['DiscardOldestPolicy', '丢掉队列里最老的，再试一次']];
+function s5(t){
+  rise('全满了怎么办？4 种拒绝策略', W/2, 130, t, 53.2, {size:58, weight:900});
+  POL.forEach(([n, d], i) => {
+    const st = 54.0 + i*.7, e = eback(p(t, st, st + .6)); if (e <= 0) return;
+    const x = 160 + (i % 2)*820, y = 240 + Math.floor(i/2)*260, a = clamp(p(t, st, st + .35)), warn = i === 2;
+    ctx.save(); ctx.translate(x + 380, y + 110); ctx.scale(e, e); ctx.translate(-(x + 380), -(y + 110));
+    box(x, y, 760, 220, a, {fill:'rgba(255,255,255,.05)', stroke:warn ? 'rgba(255,138,138,.5)' : 'rgba(163,227,107,.35)', r:28}); ctx.restore();
+    txt(n, x + 50, y + 80, {size:38, weight:700, font:MONO, color:warn ? C.rose : C.acc, align:'left', alpha:a});
+    txt(d, x + 50, y + 150, {size:32, weight:600, align:'left', alpha:a});
+  });
+  rise('重要任务千万别用「悄悄丢掉」', W/2, 860, t, 58.4, {size:42, weight:900, color:C.gold, glow:14});
+  rise('也可以自己实现：记日志、存起来稍后重试', W/2, 935, t, 59.8, {size:32, weight:600, color:C.muted});
+}
+
+/* ============ 场景 6 · 三个忠告 (63–73s) ============ */
+const TIPS = [['01', '别用 Executors 快捷创建', 'Fixed / Single 用的是无界队列', '任务一堆积，内存就爆'], ['02', 'Cached 线程数没上限', '流量一猛，线程数暴涨', '机器直接被拖垮'], ['03', '线程数靠压测来定', 'CPU 密集 ≈ 核数 + 1', 'IO 密集可以多开一些']];
+function s6(t){
+  rise('生产环境的三个忠告', W/2, 160, t, 63.2, {size:60, weight:900});
+  TIPS.forEach(([no, main, l1, l2], i) => {
+    const st = 64.0 + i*1.2, e = eback(p(t, st, st + .7)); if (e <= 0) return;
+    const x = 135 + i*570, y = 300, dy = (1 - e)*320, cx = x + 270, a = clamp(p(t, st, st + .4));
+    ctx.save(); ctx.translate(0, dy); al(a);
+    rr(x, y, 540, 440, 32); ctx.fillStyle = 'rgba(255,255,255,.05)'; ctx.fill();
+    ctx.strokeStyle = i < 2 ? 'rgba(255,138,138,.35)' : 'rgba(163,227,107,.45)'; ctx.lineWidth = 2; ctx.stroke(); ctx.restore();
+    txt(no, cx, y + 100 + dy, {size:80, weight:900, color:i < 2 ? C.rose : C.acc, font:MONO, alpha:a, glow:18});
+    txt(main, cx, y + 225 + dy, {size:40, weight:900, alpha:a});
+    txt(l1, cx, y + 305 + dy, {size:30, weight:500, color:C.muted, alpha:a});
+    txt(l2, cx, y + 350 + dy, {size:30, weight:500, color:C.muted, alpha:a});
+  });
+  rise('手动 new ThreadPoolExecutor，参数自己心里有数', W/2, 860, t, 68.4, {size:40, weight:800, color:C.acc});
+}
+
+/* ============ 场景 7 · 收尾 (73–80s) ============ */
+function s7(t){
+  [['复用线程', '省掉反复创建的开销'], ['排队缓冲', '扛住突发流量'], ['兜底拒绝', '保护系统不被压垮']].forEach(([a, b], i) => {
+    const st = 73.2 + i*.5, e = eback(p(t, st, st + .6)); if (e <= 0) return;
+    const x = 400 + i*560, y = 330;
+    ctx.save(); ctx.translate(x, y); ctx.scale(e, e); ctx.translate(-x, -y);
+    box(x - 240, y - 100, 480, 200, clamp(e), {fill:'rgba(163,227,107,.08)', stroke:'rgba(163,227,107,.5)', r:28}); ctx.restore();
+    txt(a, x, y - 26, {size:52, weight:900, color:C.acc, alpha:clamp(e)});
+    txt(b, x, y + 44, {size:28, weight:500, color:C.muted, alpha:clamp(e)});
+  });
+  rise('这就是线程池', W/2, 620, t, 74.8, {size:96, weight:900, glow:24});
+  rise('关注我，一起搞懂后端', W/2, 800, t, 76.0, {size:36, weight:500, color:C.muted});
+}
+
+/* ============ 总调度 ============ */
+const SCENES = [[s1,-1,7],[s2,7,19],[s3,19,39],[s4,39,53],[s5,53,63],[s6,63,73],[s7,73,80]];
+function draw(t){
+  t = clamp(t, 0, DUR);
+  ctx.save(); ctx.globalAlpha = 1; ctx.clearRect(0,0,W,H); background(t);
+  for (const [fn,a,b] of SCENES){
+    if (t < a || t > b) continue;
+    SA = sceneA(t, a, b, b === DUR ? .8 : .5);
+    if (SA > 0){ ctx.save(); fn(t); ctx.restore(); }
+  }
+  SA = 1; vignette();
+  const fo = p(t, DUR - .8, DUR);
+  if (fo > 0){ ctx.globalAlpha = fo; ctx.fillStyle = '#000'; ctx.fillRect(0,0,W,H); }
+  ctx.restore();
+}
+
+/* ============ 播放器 / 逐帧渲染接口 ============ */
+const isRender = new URLSearchParams(location.search).has('render');
+window.DURATION = DUR;
+window.renderFrame = t => draw(t);
+const btn = document.getElementById('btn'), seek = document.getElementById('seek'), timeEl = document.getElementById('time');
+const fmt = s => `${Math.floor(s/60)}:${String(Math.floor(s%60)).padStart(2,'0')}`;
+function fit(){
+  if (isRender){ cv.style.width = W+'px'; cv.style.height = H+'px'; return; }
+  const w = Math.min(innerWidth - 32, (innerHeight - 84)*16/9);
+  cv.style.width = w + 'px'; cv.style.height = w*9/16 + 'px';
+}
+addEventListener('resize', fit); fit();
+
+let cur = 0, playing = !isRender, last = null;
+function toggle(){ if (cur >= DUR) cur = 0; playing = !playing; }
+btn.onclick = toggle; cv.onclick = toggle;
+addEventListener('keydown', e => { if (e.code === 'Space'){ e.preventDefault(); toggle(); } });
+seek.oninput = () => { cur = +seek.value; draw(cur); };
+function loop(ts){
+  if (playing && last != null){ cur += (ts - last)/1000; if (cur >= DUR){ cur = DUR; playing = false; } }
+  last = ts; draw(cur);
+  seek.value = cur; timeEl.textContent = `${fmt(cur)} / ${fmt(DUR)}`;
+  btn.textContent = playing ? '❚❚' : (cur >= DUR ? '↺' : '▶');
+  requestAnimationFrame(loop);
+}
+document.fonts.ready.then(() => {
+  window.ready = true;
+  if (isRender) draw(0); else requestAnimationFrame(loop);
+});
+</script>
+</body>
+</html>
