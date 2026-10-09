@@ -3,7 +3,8 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>科普动画视频</title>
+<title>拾星 · 用代码画出看得懂的原理</title>
+<meta name="description" content="拾星：用代码绘制的科普动画与图文详解，覆盖 AI、计算机与后端、心理学。">
 <style>
   :root{--bg:#0b0c17;--card:#14142a;--fg:#f4ede4;--muted:#9a93a8;--line:rgba(255,255,255,.08);--chip:#1b1b33}
   *{box-sizing:border-box}
@@ -11,7 +12,10 @@
     font-family:-apple-system,"PingFang SC","Noto Sans SC","Microsoft YaHei",sans-serif;
     min-height:100vh;padding:48px 16px 64px}
   main{max-width:960px;margin:0 auto}
-  h1{font-size:32px;margin:0 0 8px}
+  .brand{display:flex;align-items:center;gap:16px;margin-bottom:14px}
+  .logo{width:64px;height:64px;flex:none}
+  h1{font-size:38px;margin:0;letter-spacing:.08em}
+  .slogan{margin:2px 0 0;color:#ffd38a;font-size:16px;letter-spacing:.04em}
   p.sub{color:var(--muted);margin:0 0 28px;line-height:1.6}
   .tabs{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px}
   .tab{border:1px solid var(--line);background:var(--chip);color:var(--muted);padding:8px 16px;border-radius:999px;
@@ -39,11 +43,14 @@
 </head>
 <body>
 <main>
-  <h1>科普动画视频</h1>
-  <p class="sub">用代码绘制的科普短片，每部都配一篇图文详解。视频为横屏 1920×1080，点击画面或按空格键暂停，底部可以拖动进度。</p>
+  <header class="brand">
+    <svg class="logo" viewBox="0 0 64 64" aria-hidden="true"><defs><radialGradient id="g" cx="50%" cy="50%" r="50%"><stop offset="0" stop-color="#fff3d6"/><stop offset=".45" stop-color="#ffd38a"/><stop offset="1" stop-color="#ffb36b" stop-opacity="0"/></radialGradient></defs><circle cx="32" cy="32" r="30" fill="url(#g)" opacity=".35"/><path d="M32 8 L37 27 L56 32 L37 37 L32 56 L27 37 L8 32 L27 27 Z" fill="#ffd38a"/><circle cx="32" cy="32" r="5" fill="#fff8e7"/></svg>
+    <div><h1>拾星</h1><p class="slogan">用代码，画出看得懂的原理</p></div>
+  </header>
+  <p class="sub">每一部都是用代码一帧一帧画出来的科普动画，并配一篇图文详解。点击画面或按空格键暂停，底部可以拖动进度。</p>
   <div class="tabs" id="tabs"></div>
   <div id="list"></div>
-  <footer>导出 MP4：<code>node render.mjs &lt;html&gt; &lt;out.mp4&gt;</code>，详见 README。</footer>
+  <footer>拾星 · 用代码，画出看得懂的原理<br>导出 MP4：<code>node render.mjs &lt;html&gt; &lt;out.mp4&gt;</code>，详见 README。</footer>
 </main>
 <script>
 const CATS = [
@@ -70,7 +77,8 @@ const VIDEOS = [
   {cat:'cs', title:"Redis 缓存", desc:"为什么快、数据类型、旁路缓存、穿透击穿雪崩", path:'redis-cache/landscape.html', dur:80, color:'#ef5350'},
   {cat:'ai', title:"Embedding 向量", desc:"语义空间、向量运算、对比学习、余弦相似度", path:'embedding/landscape.html', dur:80, color:'#818cf8'},
   {cat:'cs', title:"消息队列", desc:"解耦异步削峰、Kafka 分区、不丢不重有序", path:'message-queue/landscape.html', dur:84, color:'#38bdf8'},
-  {cat:'ai', title:"Function Calling 与 MCP", desc:"工具调用五步、工具设计、MCP 架构与安全", path:'function-calling-mcp/landscape.html', dur:80, color:'#f472b6'}
+  {cat:'ai', title:"Function Calling 与 MCP", desc:"工具调用五步、工具设计、MCP 架构与安全", path:'function-calling-mcp/landscape.html', dur:80, color:'#f472b6'},
+  {cat:'cs', title:"CAP 与 BASE", desc:"分区时 C 与 A 二选一、三选二的误解、最终一致", path:'cap-theorem/landscape.html', dur:80, color:'#14b8a6'}
 ];
 const fmt = s => `${Math.floor(s/60)}:${String(s%60).padStart(2,'0')}`;
 const esc = s => s.replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));

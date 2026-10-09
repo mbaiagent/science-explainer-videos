@@ -1,0 +1,322 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>CAP 与 BASE · 拾星</title>
+<style>
+  :root{--bg:#07080f;--fg:#f4ede4;--muted:#9a93a8;--acc:#14b8a6}
+  html,body{margin:0;height:100%;background:var(--bg);color:var(--fg);
+    font-family:-apple-system,"PingFang SC","Noto Sans SC","Noto Sans CJK SC","Microsoft YaHei",sans-serif}
+  body{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;overflow:hidden}
+  #stage{display:block;background:#07080f;border-radius:12px;box-shadow:0 20px 60px rgba(0,0,0,.55);cursor:pointer}
+  #bar{display:flex;align-items:center;gap:12px;width:min(calc(100vw - 32px),640px)}
+  #btn{width:40px;height:40px;border-radius:50%;border:1px solid rgba(20,184,166,.5);background:transparent;
+    color:var(--acc);font-size:16px;cursor:pointer;flex:none}
+  #seek{flex:1;accent-color:var(--acc)}
+  #time{font-variant-numeric:tabular-nums;font-size:13px;color:var(--muted);min-width:84px;text-align:right}
+  body.render{display:block}
+  body.render #bar{display:none}
+  body.render #stage{border-radius:0;box-shadow:none}
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="bar">
+  <button id="btn" aria-label="播放/暂停">❚❚</button>
+  <input id="seek" type="range" min="0" max="80" step="0.01" value="0">
+  <span id="time">0:00 / 1:20</span>
+</div>
+<script>
+/* ============ 基础设置（横屏 1920×1080） ============ */
+const W = 1920, H = 1080, DUR = 80;
+const cv = document.getElementById('stage'), ctx = cv.getContext('2d');
+cv.width = W; cv.height = H;
+const FONT = '"PingFang SC","Noto Sans SC","Noto Sans CJK SC","Source Han Sans SC","Microsoft YaHei",sans-serif';
+const MONO = '"JetBrains Mono","SF Mono",Menlo,Consolas,"DejaVu Sans Mono","Noto Sans Mono CJK SC","PingFang SC","Microsoft YaHei",monospace';
+const C = {acc:'#14b8a6', mint:'#6ee7c8', gold:'#ffd38a', coral:'#ff9e7a', rose:'#ff8a8a', blue:'#9cc3ff', text:'#f4ede4', muted:'#9a93a8', dim:'#4a4558', panel:'#0f0e1f'};
+
+const clamp = (x,a=0,b=1) => Math.max(a, Math.min(b, x));
+const lerp = (a,b,t) => a + (b-a)*t;
+const p = (t,a,b) => clamp((t-a)/(b-a));
+const eo = x => 1 - Math.pow(1-x, 3);
+const eio = x => x < .5 ? 4*x*x*x : 1 - Math.pow(-2*x+2, 3)/2;
+const eback = x => { const c1=1.70158, c3=c1+1; return 1 + c3*Math.pow(x-1,3) + c1*Math.pow(x-1,2); };
+function rnd(seed){ let s = seed>>>0; return () => { s = (s*1664525 + 1013904223)>>>0; return s/4294967296; }; }
+
+let SA = 1;
+const al = a => { ctx.globalAlpha = clamp(SA*a); };
+const sceneA = (t,a,b,f=.5) => Math.min(p(t,a,a+f), 1 - p(t,b-f,b));
+
+function txt(s, x, y, o = {}){
+  const {size=64, weight=700, color=C.text, alpha=1, align='center', glow=0, scale=1, font=FONT} = o;
+  if (alpha <= 0) return;
+  ctx.save(); al(alpha);
+  ctx.font = `${weight} ${size}px ${font}`;
+  ctx.textAlign = align; ctx.textBaseline = 'middle'; ctx.fillStyle = color;
+  if (glow){ ctx.shadowColor = color; ctx.shadowBlur = glow; }
+  if (scale !== 1){ ctx.translate(x, y); ctx.scale(scale, scale); ctx.fillText(s, 0, 0); }
+  else ctx.fillText(s, x, y);
+  ctx.restore();
+}
+function rise(s, x, y, t, t0, o = {}, d = .7){
+  const e = eo(p(t, t0, t0+d));
+  if (e <= 0) return;
+  txt(s, x, y + (1-e)*36, {...o, alpha:(o.alpha ?? 1)*e});
+}
+function rr(x,y,w,h,r){ ctx.beginPath(); ctx.roundRect(x,y,w,h,r); }
+function box(x, y, w, h, a, o = {}){
+  const {fill='rgba(255,255,255,.05)', stroke='rgba(20,184,166,.35)', lw=2, glow=0, r=18, dash=null} = o;
+  if (a <= 0) return;
+  ctx.save(); al(a); rr(x, y, w, h, r); ctx.fillStyle = fill; ctx.fill();
+  if (dash) ctx.setLineDash(dash);
+  ctx.strokeStyle = stroke; ctx.lineWidth = lw; if (glow){ ctx.shadowColor = stroke; ctx.shadowBlur = glow; } ctx.stroke(); ctx.restore();
+}
+function arrow(x1, y1, x2, y2, e, a, color = C.acc, lw = 3){
+  if (e <= 0 || a <= 0) return;
+  const x = lerp(x1, x2, e), y = lerp(y1, y2, e), ang = Math.atan2(y2 - y1, x2 - x1);
+  ctx.save(); al(a); ctx.strokeStyle = color; ctx.fillStyle = color; ctx.lineWidth = lw; ctx.lineCap = 'round';
+  ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x, y); ctx.stroke();
+  if (e > .85){ ctx.translate(x, y); ctx.rotate(ang); ctx.beginPath(); ctx.moveTo(4, 0); ctx.lineTo(-14, -9); ctx.lineTo(-14, 9); ctx.closePath(); ctx.fill(); }
+  ctx.restore();
+}
+function panel(x, y, w, h, title, a){
+  box(x, y, w, h, a, {fill:C.panel, stroke:'rgba(255,255,255,.1)', r:20});
+  if (a <= 0) return;
+  ctx.save(); al(a); ctx.strokeStyle = 'rgba(255,255,255,.07)'; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(x, y + 52); ctx.lineTo(x + w, y + 52); ctx.stroke();
+  ['#ff6b6b','#ffd166','#6ee7a0'].forEach((c, i) => { ctx.fillStyle = c; ctx.globalAlpha = clamp(SA*a*.8); ctx.beginPath(); ctx.arc(x + 30 + i*24, y + 26, 7, 0, 6.283); ctx.fill(); });
+  ctx.restore();
+  txt(title, x + w/2, y + 27, {size:22, weight:500, color:C.muted, font:MONO, alpha:a});
+}
+
+/* ============ 背景 ============ */
+const PARTS = (() => { const r = rnd(167); return Array.from({length:100}, () => ({
+  x:r()*W, y:r()*H, s:r()*2.2+.5, v:r()*12+4, ph:r()*6.283, c:r()<.25})); })();
+function background(t){
+  const g = ctx.createLinearGradient(0,0,W,H);
+  g.addColorStop(0,'#0a0916'); g.addColorStop(.55,'#110f24'); g.addColorStop(1,'#18122c');
+  ctx.globalAlpha = 1; ctx.fillStyle = g; ctx.fillRect(0,0,W,H);
+  const gx = W*.5 + Math.sin(t*.27)*140;
+  const rg = ctx.createRadialGradient(gx, H*.45, 0, gx, H*.45, 950);
+  rg.addColorStop(0,'rgba(20,184,166,0.09)'); rg.addColorStop(1,'rgba(20,184,166,0)');
+  ctx.fillStyle = rg; ctx.fillRect(0,0,W,H);
+  ctx.fillStyle = C.acc;
+  for (let x = 40; x < W; x += 80) for (let y = 40; y < H; y += 80){ ctx.globalAlpha = .06; ctx.fillRect(x, y, 2, 2); }
+  for (const q of PARTS){
+    const y = ((q.y - t*q.v) % H + H) % H, x = q.x + Math.sin(t*.35 + q.ph)*12;
+    ctx.globalAlpha = .2 + .3*(.5 + .5*Math.sin(t*1.2 + q.ph));
+    ctx.fillStyle = q.c ? C.acc : '#d8d0ff';
+    ctx.beginPath(); ctx.arc(x, y, q.s, 0, 6.283); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+}
+function vignette(){
+  const v = ctx.createRadialGradient(W/2, H/2, W*.28, W/2, H/2, W*.62);
+  v.addColorStop(0,'rgba(0,0,0,0)'); v.addColorStop(1,'rgba(0,0,0,.55)');
+  ctx.globalAlpha = 1; ctx.fillStyle = v; ctx.fillRect(0,0,W,H);
+}
+function codeLine(s, x, y, size, a, kw = /\b(public|class|static|void|new|return)\b/){
+  const parts = s.split(/("[^"]*"|\b(?:public|class|static|void|new|return|getstatic|ldc|invokevirtual)\b)/g);
+  ctx.save(); al(a); ctx.font = `500 ${size}px ${MONO}`; ctx.textBaseline = 'middle'; ctx.textAlign = 'left';
+  let xx = x;
+  for (const seg of parts){ if (!seg) continue;
+    ctx.fillStyle = seg.startsWith('"') ? C.mint : /^(public|class|static|void|new|return|getstatic|ldc|invokevirtual)$/.test(seg) ? C.acc : C.text;
+    ctx.fillText(seg, xx, y); xx += ctx.measureText(seg).width; }
+  ctx.restore();
+}
+
+function pill(s, x, y, a, o = {}){
+  const {size=30, color=C.text, stroke='rgba(255,255,255,.2)', fill='rgba(255,255,255,.05)', font=FONT, weight=700} = o;
+  if (a <= 0) return;
+  ctx.save(); ctx.font = `${weight} ${size}px ${font}`; const w = ctx.measureText(s).width + 52; ctx.restore();
+  box(x - w/2, y - size*.9, w, size*1.8, a, {fill, stroke, r:size*.9});
+  txt(s, x, y, {size, weight, color, font, alpha:a});
+}
+function dbNode(name, val, x, y, a, o = {}){
+  const {hl=null, sub=''} = o;
+  box(x - 170, y - 95, 340, 190, a, {fill:'rgba(20,184,166,.07)', stroke:hl || 'rgba(20,184,166,.6)', lw:hl ? 3 : 2, glow:hl ? 18 : 0, r:22});
+  txt(name, x, y - 50, {size:28, weight:800, color:C.muted, alpha:a});
+  txt(val, x, y + 10, {size:50, weight:900, font:MONO, color:hl || C.text, alpha:a});
+  if (sub) txt(sub, x, y + 62, {size:22, weight:700, color:hl || C.muted, alpha:a});
+}
+function cut(x, y1, y2, a){ if (a <= 0) return; ctx.save(); al(a); ctx.strokeStyle = C.rose; ctx.lineWidth = 6; ctx.lineCap = 'round';
+  ctx.beginPath(); for (let y = y1, k = 0; y <= y2; y += 30, k++) { const xx = x + (k % 2 ? 14 : -14); k ? ctx.lineTo(xx, y) : ctx.moveTo(xx, y); } ctx.stroke(); ctx.restore(); }
+
+/* ============ 场景 1 · 钩子 (0–7s) ============ */
+function s1(t){
+  rise('为了不怕宕机，数据存了两份', W/2, 130, t, .2, {size:50, weight:900});
+  const a = eo(p(t, .6, 1.1)), broken = t > 2.4;
+  dbNode('北京机房', 'X = 1', 560, 420, a); dbNode('上海机房', 'X = 1', 1360, 420, a);
+  if (!broken){ for (let k = 0; k < 4; k++){ const u = ((t*.8 + k/4) % 1); ctx.save(); al(a); ctx.fillStyle = C.acc; ctx.beginPath(); ctx.arc(lerp(740, 1180, u), 420, 7, 0, 6.283); ctx.fill(); ctx.restore(); } }
+  ctx.save(); al(a*.5); ctx.strokeStyle = broken ? C.rose : C.acc; ctx.setLineDash([10, 8]); ctx.lineWidth = 3; ctx.beginPath(); ctx.moveTo(735, 420); ctx.lineTo(1185, 420); ctx.stroke(); ctx.restore();
+  txt('同步数据', 960, 385, {size:24, weight:700, color:C.acc, alpha:a*(broken ? 0 : 1)});
+  cut(960, 330, 510, eo(p(t, 2.4, 2.7)));
+  txt('网络断了！', 960, 560, {size:34, weight:900, color:C.rose, alpha:eo(p(t, 2.5, 2.9))});
+  rise('这时有人在北京写入 X = 2，又有人去上海读 X……', W/2, 700, t, 3.2, {size:40, weight:900});
+  const k = p(t, 4.6, 5.2);
+  if (k > 0) txt('CAP 定理', W/2, 860, {size:110, weight:900, color:C.acc, glow:40, alpha:clamp(k*2), scale:eback(k)});
+}
+
+/* ============ 场景 2 · 定义 (7–19s) ============ */
+const CAPD = [['C', '一致性', 'Consistency', '任何时刻读到的，都是最新写入的值'], ['A', '可用性', 'Availability', '每个正常的节点，收到请求都能及时响应'], ['P', '分区容错', 'Partition tolerance', '节点之间的网络断开时，系统还能继续工作']];
+function s2(t){
+  rise('C、A、P 分别是什么', W/2, 110, t, 7.2, {size:58, weight:900});
+  CAPD.forEach(([l, zh, en, d], i) => {
+    const st = 7.8 + i*1.2, e = eback(p(t, st, st + .6)); if (e <= 0) return;
+    const x = 135 + i*570, cx = x + 270, a = clamp(e);
+    ctx.save(); ctx.translate(cx, 470); ctx.scale(e, e); ctx.translate(-cx, -470);
+    box(x, 230, 540, 480, a, {fill:'rgba(20,184,166,.06)', stroke:'rgba(20,184,166,.5)', r:28}); ctx.restore();
+    txt(l, cx, 330, {size:110, weight:900, font:MONO, color:C.acc, glow:24, alpha:a});
+    txt(zh, cx, 440, {size:46, weight:900, alpha:a}); txt(en, cx, 490, {size:22, weight:500, font:MONO, color:C.muted, alpha:a});
+    const w = d.split('，').map((s, k, arr) => s + (k < arr.length - 1 ? '，' : ''));
+    w.forEach((s, k) => txt(s, cx, 580 + k*42, {size:28, weight:600, color:'#d9d2e4', alpha:a}));
+  });
+  rise('2000 年由 Eric Brewer 提出，2002 年被严格证明', W/2, 820, t, 12.6, {size:34, weight:800, color:C.gold});
+  rise('核心结论：网络分区发生时，一致性和可用性不能同时满足', W/2, 900, t, 14.0, {size:40, weight:900});
+}
+
+/* ============ 场景 3 · 二选一 (19–35s) ============ */
+function s3(t){
+  rise('网络断开时，只能二选一', W/2, 100, t, 19.2, {size:58, weight:900});
+  const a = eo(p(t, 19.6, 20.1));
+  [[0, 'CP：选一致性', C.acc, 21.0], [1, 'AP：选可用性', C.gold, 26.4]].forEach(([i, h, c, ts]) => {
+    const x0 = 120 + i*860, e = eo(p(t, ts - .6, ts - .1));
+    box(x0, 180, 820, 640, e, {fill:'rgba(255,255,255,.02)', stroke:c, r:26});
+    txt(h, x0 + 410, 230, {size:40, weight:900, color:c, alpha:e});
+    const n1 = x0 + 210, n2 = x0 + 610;
+    const wrote = t > ts + .6;
+    box(n1 - 140, 300, 280, 150, e, {fill:'rgba(255,255,255,.04)', stroke:'rgba(255,255,255,.3)', r:18}); txt('北京', n1, 335, {size:24, weight:700, color:C.muted, alpha:e}); txt(wrote ? 'X = 2' : 'X = 1', n1, 395, {size:40, weight:900, font:MONO, color:wrote ? C.mint : C.text, alpha:e});
+    box(n2 - 140, 300, 280, 150, e, {fill:'rgba(255,255,255,.04)', stroke:'rgba(255,255,255,.3)', r:18}); txt('上海', n2, 335, {size:24, weight:700, color:C.muted, alpha:e}); txt('X = 1', n2, 395, {size:40, weight:900, font:MONO, alpha:e});
+    cut(x0 + 410, 290, 460, e);
+    pill('写入 X = 2', n1, 520, eo(p(t, ts, ts + .4)), {size:24, color:C.mint, stroke:C.mint});
+    pill('读取 X', n2, 520, eo(p(t, ts + 1.2, ts + 1.6)), {size:24, color:C.text});
+    const r = eo(p(t, ts + 2, ts + 2.5));
+    if (i === 0){ txt('「同步不了，暂时不能提供服务」', n2 - 40, 620, {size:26, weight:900, color:C.rose, alpha:r});
+      txt('宁可不回答，也不返回旧数据', x0 + 410, 700, {size:28, weight:800, color:C.acc, alpha:eo(p(t, ts + 2.8, ts + 3.2))});
+      txt('牺牲了：可用性', x0 + 410, 760, {size:26, weight:700, color:C.muted, alpha:eo(p(t, ts + 3.2, ts + 3.6))}); }
+    else { txt('「X = 1」（旧值）', n2, 620, {size:28, weight:900, color:C.gold, alpha:r});
+      txt('先返回能拿到的数据，网络恢复后再同步', x0 + 410, 700, {size:28, weight:800, color:C.gold, alpha:eo(p(t, ts + 2.8, ts + 3.2))});
+      txt('牺牲了：一致性（暂时）', x0 + 410, 760, {size:26, weight:700, color:C.muted, alpha:eo(p(t, ts + 3.2, ts + 3.6))}); }
+  });
+  rise('分布式系统里，网络分区迟早会发生，P 是必须的；真正的选择是 C 还是 A', W/2, 900, t, 31.0, {size:34, weight:900, color:C.acc});
+}
+
+/* ============ 场景 4 · 典型系统 (35–46s) ============ */
+function s4(t){
+  rise('常见系统的取舍', W/2, 110, t, 35.2, {size:58, weight:900});
+  [['偏 CP', C.acc, [['ZooKeeper', '协调服务、分布式锁'], ['etcd', 'Kubernetes 的配置存储'], ['HBase', '强一致的分布式存储']]], ['偏 AP', C.gold, [['Cassandra', '高可用的分布式数据库'], ['Eureka', '服务注册中心'], ['DNS', '全球分布，允许短暂不一致']]]].forEach(([h, c, items], i) => {
+    const x0 = 160 + i*820, e = eo(p(t, 35.8 + i*.6, 36.3 + i*.6));
+    box(x0, 200, 780, 540, e, {fill:'rgba(255,255,255,.03)', stroke:c, r:26});
+    txt(h, x0 + 390, 260, {size:44, weight:900, color:c, alpha:e});
+    items.forEach(([n, d], k) => { const ek = eo(p(t, 36.6 + i*.6 + k*.4, 37 + i*.6 + k*.4)), y = 370 + k*120;
+      box(x0 + 40, y - 45, 700, 95, ek, {fill:'rgba(255,255,255,.04)', stroke:'rgba(255,255,255,.15)', r:16});
+      txt(n, x0 + 80, y + 2, {size:34, weight:900, font:MONO, align:'left', alpha:ek}); txt(d, x0 + 710, y + 2, {size:24, weight:600, color:C.muted, align:'right', alpha:ek}); });
+  });
+  rise('很多系统可以按需调节：同一个数据库，不同的读写配置，取舍也不同', W/2, 830, t, 40.4, {size:34, weight:800});
+  rise('分类只是大致倾向，以实际配置为准', W/2, 900, t, 41.6, {size:28, weight:600, color:C.muted});
+}
+
+/* ============ 场景 5 · 常见误解 (46–56s) ============ */
+function s5(t){
+  rise('常见误解：「CAP 三选二」', W/2, 110, t, 46.2, {size:58, weight:900});
+  const a = eo(p(t, 46.8, 47.3));
+  box(160, 210, 1600, 200, a, {fill:'rgba(255,138,138,.05)', stroke:'rgba(255,138,138,.4)', r:24});
+  txt('✗  可以自由地挑两个，放弃一个', 220, 270, {size:36, weight:900, color:C.rose, align:'left', alpha:a});
+  txt('不能放弃 P：网络故障不是你能选择不发生的', 220, 345, {size:30, weight:600, align:'left', alpha:a});
+  const b = eo(p(t, 48.6, 49.1));
+  box(160, 450, 1600, 300, b, {fill:'rgba(20,184,166,.06)', stroke:'rgba(20,184,166,.5)', r:24});
+  txt('✓  只有「网络分区发生时」，才需要在 C 和 A 之间取舍', 220, 510, {size:36, weight:900, color:C.acc, align:'left', alpha:b});
+  txt('网络正常时，C 和 A 完全可以兼得', 220, 580, {size:30, weight:600, align:'left', alpha:b});
+  txt('这时的取舍变成：延迟 vs 一致性（等所有副本确认，就会更慢）', 220, 640, {size:30, weight:600, color:C.gold, align:'left', alpha:eo(p(t, 50, 50.4))});
+  txt('这个扩展观点叫 PACELC', 220, 700, {size:26, weight:600, color:C.muted, align:'left', alpha:eo(p(t, 50.8, 51.2))});
+  rise('C、A 也都不是非黑即白：一致性有强弱之分，可用性也有程度之分', W/2, 860, t, 52.0, {size:34, weight:800});
+}
+
+/* ============ 场景 6 · BASE (56–68s) ============ */
+function s6(t){
+  rise('BASE：大多数互联网业务的选择', W/2, 110, t, 56.2, {size:56, weight:900});
+  [['BA', '基本可用', 'Basically Available', '出故障时，允许损失部分功能或性能，核心功能可用'], ['S', '软状态', 'Soft state', '允许数据存在「同步中」的中间状态'], ['E', '最终一致', 'Eventually consistent', '经过一段时间后，所有副本最终会一致']].forEach(([l, zh, en, d], i) => {
+    const st = 56.8 + i*.8, e = eo(p(t, st, st + .5)), y = 240 + i*150;
+    box(160, y - 60, 1600, 125, e, {fill:'rgba(255,211,138,.05)', stroke:'rgba(255,211,138,.45)', r:22});
+    txt(l, 250, y + 2, {size:56, weight:900, font:MONO, color:C.gold, alpha:e});
+    txt(zh, 360, y - 20, {size:34, weight:900, align:'left', alpha:e}); txt(en, 360, y + 25, {size:22, weight:500, font:MONO, color:C.muted, align:'left', alpha:e});
+    txt(d, 1720, y + 2, {size:26, weight:600, color:'#d9d2e4', align:'right', alpha:e});
+  });
+  const ea = eo(p(t, 59.8, 60.3));
+  txt('例子：下单成功了，积分几秒钟后才到账', W/2, 720, {size:34, weight:800, color:C.acc, alpha:ea});
+  const k = clamp((t - 60.4)/4);
+  bar2(560, 790, 800, 40, k, ea);
+  txt(k < 1 ? '同步中…' : '已一致 ✓', W/2, 870, {size:28, weight:800, color:k < 1 ? C.gold : C.mint, alpha:ea});
+}
+function bar2(x, y, w, h, v, a){ box(x, y, w, h, a, {fill:'rgba(255,255,255,.04)', stroke:'rgba(255,255,255,.2)', r:20}); if (v > 0){ ctx.save(); al(a); ctx.fillStyle = v < 1 ? C.gold : C.mint; rr(x + 4, y + 4, (w - 8)*v, h - 8, 16); ctx.fill(); ctx.restore(); } }
+
+/* ============ 场景 7 · 怎么选 (68–75s) ============ */
+function s7(t){
+  rise('业务上怎么选？', W/2, 110, t, 68.2, {size:58, weight:900});
+  [['要强一致', C.acc, ['账户余额、支付', '库存扣减', '分布式锁']], ['可以最终一致', C.gold, ['点赞数、浏览量', '动态信息流', '积分、通知']]].forEach(([h, c, items], i) => {
+    const x0 = 160 + i*820, e = eo(p(t, 68.6 + i*.6, 69.1 + i*.6));
+    box(x0, 200, 780, 480, e, {fill:'rgba(255,255,255,.03)', stroke:c, r:26});
+    txt(h, x0 + 390, 260, {size:44, weight:900, color:c, alpha:e});
+    items.forEach((s, k) => txt('· ' + s, x0 + 390, 370 + k*80, {size:34, weight:700, alpha:eo(p(t, 69.2 + i*.6 + k*.3, 69.6 + i*.6 + k*.3))}));
+  });
+  rise('最终一致的系统，要配合：重试 + 幂等 + 对账补偿', W/2, 790, t, 71.6, {size:40, weight:900, color:C.mint});
+}
+
+/* ============ 场景 8 · 收尾 (75–80s) ============ */
+function s8(t){
+  ['C', 'A', 'P'].forEach((l, i) => { const e = eback(p(t, 75.2 + i*.25, 75.7 + i*.25)), x = 720 + i*240;
+    txt(l, x, 320, {size:150, weight:900, font:MONO, color:i === 2 ? C.muted : C.acc, glow:30, alpha:clamp(e), scale:e}); });
+  rise('P 必须有；分区时，在 C 和 A 之间取舍', W/2, 490, t, 76.0, {size:44, weight:900});
+  rise('多数业务：BASE，最终一致', W/2, 580, t, 76.6, {size:40, weight:800, color:C.gold});
+  rise('关注拾星，一起搞懂后端', W/2, 760, t, 77.4, {size:36, weight:500, color:C.muted});
+}
+
+/* ============ 总调度 ============ */
+const SCENES = [[s1,-1,7],[s2,7,19],[s3,19,35],[s4,35,46],[s5,46,56],[s6,56,68],[s7,68,75],[s8,75,80]];
+function draw(t){
+  t = clamp(t, 0, DUR);
+  ctx.save(); ctx.globalAlpha = 1; ctx.clearRect(0,0,W,H); background(t);
+  for (const [fn,a,b] of SCENES){
+    if (t < a || t > b) continue;
+    SA = sceneA(t, a, b, b === DUR ? .8 : .5);
+    if (SA > 0){ ctx.save(); fn(t); ctx.restore(); }
+  }
+  SA = 1; vignette();
+  const fo = p(t, DUR - .8, DUR);
+  if (fo > 0){ ctx.globalAlpha = fo; ctx.fillStyle = '#000'; ctx.fillRect(0,0,W,H); }
+  ctx.restore();
+}
+
+/* ============ 播放器 / 逐帧渲染接口 ============ */
+const isRender = new URLSearchParams(location.search).has('render');
+window.DURATION = DUR;
+window.renderFrame = t => draw(t);
+const btn = document.getElementById('btn'), seek = document.getElementById('seek'), timeEl = document.getElementById('time');
+const fmt = s => `${Math.floor(s/60)}:${String(Math.floor(s%60)).padStart(2,'0')}`;
+function fit(){
+  if (isRender){ cv.style.width = W+'px'; cv.style.height = H+'px'; return; }
+  const w = Math.min(innerWidth - 32, (innerHeight - 84)*16/9);
+  cv.style.width = w + 'px'; cv.style.height = w*9/16 + 'px';
+}
+addEventListener('resize', fit); fit();
+
+let cur = 0, playing = !isRender, last = null;
+function toggle(){ if (cur >= DUR) cur = 0; playing = !playing; }
+btn.onclick = toggle; cv.onclick = toggle;
+addEventListener('keydown', e => { if (e.code === 'Space'){ e.preventDefault(); toggle(); } });
+seek.oninput = () => { cur = +seek.value; draw(cur); };
+function loop(ts){
+  if (playing && last != null){ cur += (ts - last)/1000; if (cur >= DUR){ cur = DUR; playing = false; } }
+  last = ts; draw(cur);
+  seek.value = cur; timeEl.textContent = `${fmt(cur)} / ${fmt(DUR)}`;
+  btn.textContent = playing ? '❚❚' : (cur >= DUR ? '↺' : '▶');
+  requestAnimationFrame(loop);
+}
+document.fonts.ready.then(() => {
+  window.ready = true;
+  if (isRender) draw(0); else requestAnimationFrame(loop);
+});
+</script>
+</body>
+</html>

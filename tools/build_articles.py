@@ -16,16 +16,16 @@ TPL = '''<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>{title} · 图文详解</title>
+<title>{title} · 拾星</title>
 <meta name="description" content="{subtitle_attr}">
 <link rel="stylesheet" href="../assets/article.css">
 <style>:root{{--acc:{color}}}</style>
 </head>
 <body>
 <div class="wrap">
-  <nav class="top"><a href="../index.html">← 全部视频</a><a class="watch" href="landscape.html">▶ 看视频</a></nav>
+  <nav class="top"><a href="../index.html">← 拾星 · 全部内容</a><a class="watch" href="landscape.html">▶ 看视频</a></nav>
   <header class="hero">
-    <div class="tag">{tag} · 图文详解</div>
+    <div class="tag">拾星 · {tag}</div>
     <h1>{title}</h1>
     <p>{subtitle}</p>
     <div class="meta">约 {minutes} 分钟读完 · 配套视频 {dur}</div>
@@ -34,7 +34,7 @@ TPL = '''<!doctype html>
   <article>
 {body}
   </article>
-  <div class="foot"><a href="../index.html">← 返回首页</a><a href="landscape.html">▶ 看配套视频</a></div>
+  <div class="foot"><a href="../index.html">← 拾星首页</a><a href="landscape.html">▶ 看配套视频</a></div>
 </div>
 </body>
 </html>

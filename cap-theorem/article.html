@@ -1,0 +1,251 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>CAP 与 BASE：分布式系统绕不开的取舍 · 拾星</title>
+<meta name="description" content="C、A、P 的准确含义，为什么网络分区时只能二选一，「三选二」错在哪，PACELC，BASE 与最终一致性，以及业务上怎么选">
+<link rel="stylesheet" href="../assets/article.css">
+<style>:root{--acc:#14b8a6}</style>
+</head>
+<body>
+<div class="wrap">
+  <nav class="top"><a href="../index.html">← 拾星 · 全部内容</a><a class="watch" href="landscape.html">▶ 看视频</a></nav>
+  <header class="hero">
+    <div class="tag">拾星 · 计算机与后端</div>
+    <h1>CAP 与 BASE：分布式系统绕不开的取舍</h1>
+    <p>C、A、P 的准确含义，为什么网络分区时只能二选一，「三选二」错在哪，PACELC，BASE 与最终一致性，以及业务上怎么选</p>
+    <div class="meta">约 8 分钟读完 · 配套视频 1:20</div>
+  </header>
+  <nav class="toc">
+<ul>
+<li><a href="#_1">从一个场景开始</a></li>
+<li><a href="#cap">C、A、P 分别是什么</a></li>
+<li><a href="#_3">为什么只能二选一</a></li>
+<li><a href="#_4">常见系统的取舍</a></li>
+<li><a href="#_5">常见误解：「三选二」</a></li>
+<li><a href="#base">BASE：大多数互联网业务的选择</a></li>
+<li><a href="#_7">业务上怎么选</a></li>
+<li><a href="#_8">高频面试题速答</a></li>
+<li><a href="#_9">总结</a></li>
+</ul>
+</nav>
+
+  <article>
+<figure><img src="img/f-6.jpg" alt="数据存了两份，网络却断了" loading="lazy"><figcaption>数据存了两份，网络却断了</figcaption></figure>
+<h2 id="_1">从一个场景开始</h2>
+<p>为了防止单台机器宕机导致服务不可用，我们把数据复制到了北京和上海两个机房，两边实时同步。</p>
+<p>某一天，两个机房之间的网络断了。这时：</p>
+<ul>
+<li>有用户在北京写入了 <code>X = 2</code>；</li>
+<li>另一个用户去上海读取 <code>X</code>。</li>
+</ul>
+<p>上海该怎么回答？</p>
+<ul>
+<li>如果返回 <code>X = 1</code>，用户拿到的是<strong>旧数据</strong>；</li>
+<li>如果为了保证数据正确而拒绝回答，用户就<strong>无法使用服务</strong>。</li>
+</ul>
+<p>这个两难，就是分布式系统中最著名的 <strong>CAP 定理</strong>要说的事。</p>
+<h2 id="cap">C、A、P 分别是什么</h2>
+<figure><img src="img/f-16.jpg" alt="C、A、P 的含义" loading="lazy"><figcaption>C、A、P 的含义</figcaption></figure>
+<table>
+<thead>
+<tr>
+<th>字母</th>
+<th>名称</th>
+<th>含义</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>C</strong></td>
+<td>一致性（Consistency）</td>
+<td>任何一次读取，都能读到最近一次写入的值，就像只有一份数据一样</td>
+</tr>
+<tr>
+<td><strong>A</strong></td>
+<td>可用性（Availability）</td>
+<td>每一个没有故障的节点，收到请求后都必须在合理的时间内给出响应（不能是错误或超时）</td>
+</tr>
+<tr>
+<td><strong>P</strong></td>
+<td>分区容错（Partition tolerance）</td>
+<td>节点之间的网络发生分区（消息丢失或延迟到无法通信）时，系统仍然能够继续运行</td>
+</tr>
+</tbody>
+</table>
+<p>需要注意，这里的「一致性」和数据库事务 ACID 里的「一致性」<strong>不是同一个意思</strong>：</p>
+<ul>
+<li>ACID 的 C：事务前后，数据满足业务规则和约束；</li>
+<li>CAP 的 C：多个副本之间的数据是否相同，严格来说指的是<strong>线性一致性</strong>（linearizability）。</li>
+</ul>
+<h3 id="_2">来历</h3>
+<p>CAP 最早由加州大学伯克利分校的 Eric Brewer 在 2000 年的一次演讲中作为猜想提出。2002 年，MIT 的 Seth Gilbert 和 Nancy Lynch 给出了形式化的证明，它从此被称为 CAP 定理。</p>
+<h2 id="_3">为什么只能二选一</h2>
+<figure><img src="img/f-33.jpg" alt="网络断开时，CP 与 AP 的不同选择" loading="lazy"><figcaption>网络断开时，CP 与 AP 的不同选择</figcaption></figure>
+<p>回到开头的场景。网络已经断开，上海收到了读请求：</p>
+<p><strong>选择 C（CP 系统）</strong>：上海意识到自己可能没有最新数据，于是拒绝请求或等待，直到网络恢复。数据保证正确，但这段时间里服务<strong>不可用</strong>。</p>
+<p><strong>选择 A（AP 系统）</strong>：上海直接返回自己手上的 <code>X = 1</code>。服务一直<strong>可用</strong>，但用户可能读到旧数据；等网络恢复后，再把两边的数据同步一致。</p>
+<p>不存在第三种办法：两个节点无法通信，上海不可能既「立刻回答」又「保证答案是最新的」。</p>
+<h3 id="p">为什么 P 必须要有</h3>
+<p>网络故障在分布式系统中<strong>一定会发生</strong>：交换机故障、光缆被挖断、机房断电、网络拥塞导致超时……这些都不是你能选择不发生的。</p>
+<p>如果一个系统「不支持分区容错」，就意味着一旦网络出问题，系统就会出现不可预期的行为，这在生产环境中是不可接受的。所以，<strong>对于真正的分布式系统，P 不是一个选项，而是一个前提</strong>。真正的选择只有：分区发生时，要 C 还是要 A。</p>
+<h2 id="_4">常见系统的取舍</h2>
+<figure><img src="img/f-44.jpg" alt="常见系统的大致倾向" loading="lazy"><figcaption>常见系统的大致倾向</figcaption></figure>
+<table>
+<thead>
+<tr>
+<th>倾向</th>
+<th>系统</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>偏 CP</td>
+<td>ZooKeeper、etcd、Consul</td>
+<td>基于共识算法，少数派节点在分区时不提供写服务，常用于分布式锁、配置和选主</td>
+</tr>
+<tr>
+<td>偏 CP</td>
+<td>HBase</td>
+<td>每块数据由单个节点负责，节点故障转移期间那部分数据暂时不可用</td>
+</tr>
+<tr>
+<td>偏 AP</td>
+<td>Cassandra、DynamoDB 风格的数据库</td>
+<td>分区时各节点继续读写，之后再合并冲突</td>
+</tr>
+<tr>
+<td>偏 AP</td>
+<td>Eureka</td>
+<td>服务注册中心，宁可返回可能过期的服务列表，也不让服务调用整体失败</td>
+</tr>
+<tr>
+<td>偏 AP</td>
+<td>DNS</td>
+<td>全球分布、层层缓存，修改记录后需要一段时间才能生效</td>
+</tr>
+</tbody>
+</table>
+<p>这只是大致的倾向。很多系统可以通过配置调节：比如 Cassandra 可以设置每次读写需要多少个副本确认，读写确认数之和超过副本总数时，就能读到最新写入的数据，但可用性会相应下降。MySQL 主从复制则取决于同步方式和故障切换策略。</p>
+<h2 id="_5">常见误解：「三选二」</h2>
+<figure><img src="img/f-54.jpg" alt="「CAP 三选二」的误解" loading="lazy"><figcaption>「CAP 三选二」的误解</figcaption></figure>
+<p>「CAP 三个只能选两个」是流传最广的说法，但它很容易让人误解：</p>
+<p><strong>误解一：可以选 CA，放弃 P。</strong>
+不能。网络分区不是你能放弃的。所谓「CA 系统」，其实只能是单机系统，或者假设网络永远不出问题的系统。</p>
+<p><strong>误解二：系统必须永远在 C 和 A 之间牺牲一个。</strong>
+不对。CAP 讨论的只是<strong>分区发生时</strong>的情况。网络正常时，系统完全可以同时提供一致性和可用性。</p>
+<p><strong>误解三：C 和 A 是非黑即白的。</strong>
+实际上，一致性有很多级别（线性一致、顺序一致、因果一致、最终一致……），可用性也是一个程度问题。设计系统时，往往是在不同程度之间做细致的权衡。</p>
+<p>Eric Brewer 本人在 2012 年也专门写文章澄清了这些误解。</p>
+<h3 id="pacelc">PACELC：更完整的描述</h3>
+<p>计算机科学家 Daniel Abadi 提出了 <strong>PACELC</strong> 的说法，补上了「没有分区时」的那一半：</p>
+<blockquote>
+<p>如果发生分区（<strong>P</strong>），要在可用性（<strong>A</strong>）和一致性（<strong>C</strong>）之间取舍；否则（<strong>E</strong>lse），要在延迟（<strong>L</strong>atency）和一致性（<strong>C</strong>）之间取舍。</p>
+</blockquote>
+<p>网络正常时也有取舍：要保证强一致，一次写入就要等多个副本都确认，必然更慢；想要更快，就只能接受副本之间短暂的不一致。</p>
+<h2 id="base">BASE：大多数互联网业务的选择</h2>
+<figure><img src="img/f-66.jpg" alt="BASE：基本可用、软状态、最终一致" loading="lazy"><figcaption>BASE：基本可用、软状态、最终一致</figcaption></figure>
+<p>对于大多数互联网业务，「服务不可用」的代价往往比「数据短暂不一致」更大。于是出现了一套与 ACID 相对的设计理念：<strong>BASE</strong>。</p>
+<table>
+<thead>
+<tr>
+<th>字母</th>
+<th>含义</th>
+<th>解释</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>BA</strong></td>
+<td>基本可用（Basically Available）</td>
+<td>出现故障时，允许损失部分功能或性能，但保证核心功能可用。比如大促时关闭非核心的推荐功能，响应时间从 0.5 秒变成 2 秒</td>
+</tr>
+<tr>
+<td><strong>S</strong></td>
+<td>软状态（Soft state）</td>
+<td>允许系统中的数据存在中间状态，比如「同步中」「处理中」，并且这个中间状态不影响整体可用性</td>
+</tr>
+<tr>
+<td><strong>E</strong></td>
+<td>最终一致（Eventually consistent）</td>
+<td>在没有新的更新时，经过一段时间后，所有副本的数据最终会达到一致</td>
+</tr>
+</tbody>
+</table>
+<p>一个直观的例子：下单成功后，积分没有立刻到账，而是几秒钟后才出现。这几秒钟里，订单数据和积分数据是「不一致」的，但最终会一致，而且用户的下单体验没有受到影响。</p>
+<h3 id="_6">怎么做到「最终一致」</h3>
+<p>最终一致不是放任不管，而是要有可靠的机制保证「最终」一定会到达：</p>
+<ul>
+<li><strong>可靠消息</strong>：通过消息队列异步通知下游，配合本地消息表保证消息一定发出（见本系列《消息队列》）；</li>
+<li><strong>重试</strong>：失败了就重试，直到成功；</li>
+<li><strong>幂等</strong>：重试和重复投递不会导致数据错误；</li>
+<li><strong>对账与补偿</strong>：定期比对各系统的数据，发现不一致时自动或人工修正；</li>
+<li><strong>Saga 等补偿型事务</strong>：某一步失败时，执行之前步骤的反向操作。</li>
+</ul>
+<h2 id="_7">业务上怎么选</h2>
+<figure><img src="img/f-73.jpg" alt="业务上怎么选" loading="lazy"><figcaption>业务上怎么选</figcaption></figure>
+<table>
+<thead>
+<tr>
+<th>需要强一致</th>
+<th>可以最终一致</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>账户余额、支付扣款</td>
+<td>点赞数、浏览量、评论数</td>
+</tr>
+<tr>
+<td>库存扣减（防超卖）</td>
+<td>动态信息流、推荐列表</td>
+</tr>
+<tr>
+<td>分布式锁、选主</td>
+<td>积分到账、消息通知</td>
+</tr>
+<tr>
+<td>唯一性约束（用户名、订单号）</td>
+<td>搜索索引、数据报表</td>
+</tr>
+</tbody>
+</table>
+<p>判断的思路是：<strong>如果读到旧数据，会造成什么后果？</strong> 后果严重（钱算错了、东西超卖了），就要强一致；后果轻微、可以接受短暂延迟，就用最终一致换取更高的可用性和性能。</p>
+<p>同一个系统里，不同的数据完全可以选择不同的策略。</p>
+<h2 id="_8">高频面试题速答</h2>
+<p><strong>Q：什么是 CAP 定理？</strong>
+在一个分布式系统中，发生网络分区时，无法同时保证一致性和可用性，必须二选一。</p>
+<p><strong>Q：为什么说 P 一定要选？</strong>
+网络分区在分布式系统中无法避免，系统必须能够在分区时继续运行，所以真正的取舍是在 C 和 A 之间。</p>
+<p><strong>Q：ZooKeeper 是 CP 还是 AP？</strong>
+通常认为是 CP：它基于 ZAB 共识协议，只有多数派节点能够正常处理写请求，少数派在分区时不对外提供写服务。</p>
+<p><strong>Q：BASE 和 ACID 有什么区别？</strong>
+ACID 追求强一致，适合单机数据库事务；BASE 通过牺牲强一致性换取可用性，追求最终一致，适合大规模分布式系统。</p>
+<h2 id="_9">总结</h2>
+<figure><img src="img/f-78.jpg" alt="P 必须有；分区时在 C 和 A 之间取舍" loading="lazy"><figcaption>P 必须有；分区时在 C 和 A 之间取舍</figcaption></figure>
+<ul>
+<li><strong>CAP</strong>：一致性、可用性、分区容错，分区发生时 C 和 A 只能二选一；</li>
+<li><strong>P 必须有</strong>，真正的选择是 CP 还是 AP；</li>
+<li>「三选二」是简化的说法，网络正常时 C 和 A 可以兼得，此时的取舍是<strong>延迟和一致性</strong>（PACELC）；</li>
+<li><strong>BASE</strong>：基本可用、软状态、最终一致，是大多数互联网业务的选择；</li>
+<li>最终一致要配合<strong>可靠消息、重试、幂等、对账补偿</strong>；</li>
+<li>选型时问自己：<strong>读到旧数据，后果有多严重？</strong></li>
+</ul>
+<div class="refs">
+<h3 id="_10">参考资料</h3>
+<ul>
+<li>Brewer, E. (2000). Towards Robust Distributed Systems. <em>PODC Keynote</em>.</li>
+<li>Gilbert, S., &amp; Lynch, N. (2002). Brewer's Conjecture and the Feasibility of Consistent, Available, Partition-Tolerant Web Services. <em>ACM SIGACT News</em>.</li>
+<li>Brewer, E. (2012). CAP Twelve Years Later: How the "Rules" Have Changed. <em>IEEE Computer</em>.</li>
+<li>Abadi, D. (2012). Consistency Tradeoffs in Modern Distributed Database System Design (PACELC). <em>IEEE Computer</em>.</li>
+<li>Pritchett, D. (2008). BASE: An Acid Alternative. <em>ACM Queue</em>.</li>
+<li>Kleppmann, M. (2017). <em>Designing Data-Intensive Applications</em>, Chapter 9.</li>
+</ul>
+</div>
+  </article>
+  <div class="foot"><a href="../index.html">← 拾星首页</a><a href="landscape.html">▶ 看配套视频</a></div>
+</div>
+</body>
+</html>

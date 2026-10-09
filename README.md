@@ -1,4 +1,6 @@
-# 科普动画视频
+# 拾星
+
+> 用代码，画出看得懂的原理
 
 用代码做的科普短片：每部片是一个独立的 HTML 文件，用 Canvas 逐帧绘制，可以直接在浏览器播放，也可以渲染成 MP4。
 
@@ -25,6 +27,7 @@
 | Embedding 向量 | `embedding/landscape.html` | 横屏 1920×1080 | 80s |
 | 消息队列 | `message-queue/landscape.html` | 横屏 1920×1080 | 84s |
 | Function Calling 与 MCP | `function-calling-mcp/landscape.html` | 横屏 1920×1080 | 80s |
+| CAP 与 BASE | `cap-theorem/landscape.html` | 横屏 1920×1080 | 80s |
 
 ### 幸福的科学
 钩子 → 享乐适应（快乐曲线 + 跑步机）→ 哈佛成人发展研究（关系网络）→ 心流（挑战 × 技能坐标图）→ 今晚就能做的 3 件事 → 收尾
@@ -79,6 +82,9 @@
 
 ### Function Calling 与 MCP
 模型只会说不会做 → Function Calling 五步 → 工具定义 → M×N 到 M+N → MCP 架构 → 一次 JSON-RPC 交互 → 安全 → 收尾
+
+### CAP 与 BASE
+数据两份网络断了 → C、A、P 的定义 → CP 与 AP 的选择 → 常见系统取舍 → 「三选二」的误解与 PACELC → BASE → 业务怎么选 → 收尾
 
 ## 预览
 
