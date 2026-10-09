@@ -52,6 +52,17 @@
 
 也可以用浏览器直接打开任意 HTML 文件。点击画面或按空格键暂停，底部进度条可以拖动。
 
+## 图文文章
+
+每部视频的目录下都有一篇配套的详解文章：`article.md` 是源文件，`article.html` 是生成的网页，`img/` 里是从视频截取的配图。
+
+```bash
+# 从视频截取配图（秒数可写多个）
+node tools/snap.mjs llm/landscape.html llm/img 6 11.5 45
+# 把所有 article.md 编译成 article.html
+python3 tools/build_articles.py
+```
+
 ## 导出 MP4
 
 需要 Node.js 18+ 和 ffmpeg。

@@ -1,0 +1,45 @@
+:root{--bg:#0b0c17;--fg:#ece6dd;--muted:#9a93a8;--line:rgba(255,255,255,.09);--card:#14142a;--code:#101024;--acc:#ffb36b}
+*{box-sizing:border-box}
+html{scroll-behavior:smooth}
+body{margin:0;background:var(--bg);color:var(--fg);
+  font-family:-apple-system,"PingFang SC","Noto Sans SC","Microsoft YaHei",sans-serif;
+  font-size:17px;line-height:1.9;-webkit-font-smoothing:antialiased}
+.wrap{max-width:780px;margin:0 auto;padding:28px 18px 80px}
+.top{display:flex;justify-content:space-between;align-items:center;gap:12px;font-size:14px;margin-bottom:28px}
+.top a{color:var(--muted);text-decoration:none}
+.top a:hover{color:var(--fg)}
+.watch{display:inline-flex;align-items:center;gap:6px;padding:8px 16px;border-radius:999px;border:1px solid var(--acc);color:var(--acc)!important;font-weight:600}
+header.hero{margin-bottom:28px;padding-bottom:24px;border-bottom:1px solid var(--line)}
+header.hero .tag{color:var(--acc);font-size:14px;font-weight:700;letter-spacing:.08em}
+header.hero h1{font-size:34px;line-height:1.3;margin:8px 0 12px}
+header.hero p{color:var(--muted);margin:0;font-size:17px}
+.meta{margin-top:12px;font-size:13px;color:var(--muted)}
+.toc{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:14px 20px;margin:0 0 32px;font-size:15px}
+.toc::before{content:"目录";display:block;font-weight:700;color:var(--acc);margin-bottom:4px}
+.toc ul{margin:0;padding-left:20px}
+.toc a{color:var(--fg);text-decoration:none}
+.toc a:hover{color:var(--acc)}
+h2{font-size:25px;margin:48px 0 14px;padding-left:14px;border-left:4px solid var(--acc);line-height:1.4}
+h3{font-size:20px;margin:32px 0 10px;color:var(--acc)}
+p{margin:0 0 16px}
+a{color:var(--acc)}
+strong{color:#fff}
+ul,ol{padding-left:24px;margin:0 0 16px}
+li{margin:4px 0}
+figure{margin:24px 0}
+figure img,figure svg{width:100%;height:auto;display:block;border-radius:12px;border:1px solid var(--line);background:#0f0e1c}
+figcaption{font-size:14px;color:var(--muted);text-align:center;margin-top:8px}
+blockquote{margin:20px 0;padding:14px 18px;background:color-mix(in srgb,var(--acc) 9%,transparent);border-left:4px solid var(--acc);border-radius:0 12px 12px 0}
+blockquote p:last-child{margin:0}
+code{font-family:"JetBrains Mono","SF Mono",Menlo,Consolas,monospace;font-size:.88em;background:var(--code);padding:2px 6px;border-radius:6px;color:#ffd8b8}
+pre{background:var(--code);border:1px solid var(--line);border-radius:12px;padding:16px 18px;overflow-x:auto;line-height:1.6;margin:0 0 18px}
+pre code{background:none;padding:0;color:#e9e4f5;font-size:14px}
+table{width:100%;border-collapse:collapse;margin:0 0 20px;font-size:15px;display:block;overflow-x:auto}
+th,td{border:1px solid var(--line);padding:9px 12px;text-align:left;vertical-align:top}
+th{background:var(--card);color:var(--acc);white-space:nowrap}
+td:first-child{white-space:nowrap;font-weight:600}
+hr{border:none;border-top:1px solid var(--line);margin:40px 0}
+.refs{font-size:14px;color:var(--muted)}
+.foot{margin-top:56px;padding-top:20px;border-top:1px solid var(--line);display:flex;justify-content:space-between;gap:12px;font-size:14px}
+.foot a{color:var(--muted);text-decoration:none}
+@media (max-width:600px){body{font-size:16px}header.hero h1{font-size:28px}h2{font-size:22px}}
