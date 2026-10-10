@@ -1,0 +1,886 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>分布式 ID：雪花算法，以及它要解决的那些麻烦 · 拾星</title>
+<meta name="description" content="分库分表后自增主键为何冲突、合格 ID 的五条要求、UUID / 步长 / 号段 / Redis / 雪花五种方案对比，雪花算法 64 位结构、序列号溢出、时钟回拨与机器 ID 分配、前端精度丢失，附 Java 21 实现与四组实测">
+<link rel="stylesheet" href="../assets/article.css">
+<style>:root{--acc:#bae6fd}</style>
+</head>
+<body>
+<div class="wrap">
+  <nav class="top"><a href="../index.html">← 拾星 · 全部内容</a><a class="watch" href="landscape.html">▶ 看视频</a></nav>
+  <header class="hero">
+    <div class="tag">拾星 · 计算机与后端</div>
+    <h1>分布式 ID：雪花算法，以及它要解决的那些麻烦</h1>
+    <p>分库分表后自增主键为何冲突、合格 ID 的五条要求、UUID / 步长 / 号段 / Redis / 雪花五种方案对比，雪花算法 64 位结构、序列号溢出、时钟回拨与机器 ID 分配、前端精度丢失，附 Java 21 实现与四组实测</p>
+    <div class="meta">约 41 分钟读完 · 配套视频 1:24</div>
+  </header>
+  <nav class="toc">
+<ul>
+<li><a href="#_1">自增主键为什么不够用了</a></li>
+<li><a href="#id">合格的分布式 ID 要满足什么</a></li>
+<li><a href="#_3">常见方案一览</a></li>
+<li><a href="#64">雪花算法：把 64 位拆成四段</a></li>
+<li><a href="#_9">生成过程：一毫秒之内靠序列号</a></li>
+<li><a href="#_11">最大的坑：时钟回拨</a></li>
+<li><a href="#id_1">落地：机器 ID 分配与前端精度</a></li>
+<li><a href="#_15">动手实验</a></li>
+<li><a href="#_17">工程实践与选型</a></li>
+<li><a href="#_21">高频面试题速答</a></li>
+<li><a href="#_22">总结</a></li>
+</ul>
+</nav>
+
+  <article>
+<figure><img src="img/f-6.5.jpg" alt="分库分表后，两个库里的订单 id 都是 1001" loading="lazy"><figcaption>分库分表后，两个库里的订单 id 都是 1001</figcaption></figure>
+<h2 id="_1">自增主键为什么不够用了</h2>
+<p>单库单表的时候，主键几乎不用操心：建表时写一句 <code>id BIGINT AUTO_INCREMENT PRIMARY KEY</code>，数据库帮你从 1 开始往上数，绝不重复。</p>
+<p>当订单表涨到几亿行、单库扛不住写入时，就要<strong>分库分表</strong>（见本系列《分库分表与读写分离》）：把一张 <code>orders</code> 拆成 <code>db_0.orders</code>、<code>db_1.orders</code>……每个库各自维护自己的自增计数器，于是：</p>
+<ul>
+<li><code>db_0</code> 里有一条 <code>id = 1001</code> 的订单；</li>
+<li><code>db_1</code> 里也有一条 <code>id = 1001</code> 的订单。</li>
+</ul>
+<p>只要这两条数据还待在各自的库里，看起来相安无事。可一旦遇到下面这些情况，问题立刻暴露：</p>
+<ul>
+<li>数据同步到数据仓库、搜索引擎做汇总分析，两条记录<strong>主键冲突</strong>；</li>
+<li>用户拿着订单号来查询，系统根本不知道是哪一条；</li>
+<li>扩容时要把数据从一个库迁移到另一个库，主键撞车，迁移失败；</li>
+<li>订单号要传给支付、物流等下游系统，对方要求全局唯一。</li>
+</ul>
+<p>数据库的自增主键只在<strong>一张表里</strong>唯一。拆分之后，我们需要一个<strong>跨库、跨表、跨机器都不会重复</strong>的 ID，这就是<strong>分布式 ID</strong>。</p>
+<blockquote>
+<p>不只是分库分表。微服务里的消息 ID、链路追踪的 Trace ID、幂等请求的请求号，凡是「多个节点同时在生成编号」的地方，都需要分布式 ID。</p>
+</blockquote>
+<h2 id="id">合格的分布式 ID 要满足什么</h2>
+<figure><img src="img/f-18.5.jpg" alt="一个合格的分布式 ID 要满足的五条要求" loading="lazy"><figcaption>一个合格的分布式 ID 要满足的五条要求</figcaption></figure>
+<table>
+<thead>
+<tr>
+<th>要求</th>
+<th>含义</th>
+<th>不满足会怎样</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>全局唯一</strong></td>
+<td>任何时候、任何节点生成的 ID 都不重复</td>
+<td>主键冲突、数据错乱，这是底线</td>
+</tr>
+<tr>
+<td><strong>趋势递增</strong></td>
+<td>整体上后生成的 ID 更大</td>
+<td>数据库索引写入变慢、空间浪费</td>
+</tr>
+<tr>
+<td><strong>高性能</strong></td>
+<td>生成快，能扛住下单高峰</td>
+<td>发号成为整个链路的瓶颈</td>
+</tr>
+<tr>
+<td><strong>高可用</strong></td>
+<td>发号服务不能轻易挂</td>
+<td>发号一挂，下单、支付全部失败</td>
+</tr>
+<tr>
+<td><strong>不易暴露业务量</strong></td>
+<td>别人不能从 ID 推算出订单量</td>
+<td>竞争对手隔天各下一单，两个订单号一减就知道你一天卖了多少</td>
+</tr>
+</tbody>
+</table>
+<p>其中最容易被忽略的是第二条：<strong>为什么 ID 最好是递增的？</strong></p>
+<h3 id="b">有序主键对 B+ 树更友好</h3>
+<p>MySQL 的 InnoDB 存储引擎把整张表的数据按主键组织成一棵 <strong>B+ 树</strong>（聚簇索引，见本系列《B+ 树》）。数据存放在 16KB 大小的叶子页里，页与页之间按主键顺序排列。</p>
+<ul>
+<li><strong>主键递增</strong>：新数据永远比已有数据大，只需要追加到最右边的那一页。这一页写满了就开一个新页，前面的页再也不用动。写入是顺序的，页几乎都是满的；</li>
+<li><strong>主键随机</strong>（比如 UUID）：新数据可能要插到任意一页的中间。目标页满了，就要<strong>页分裂</strong>：把一页拆成两页，各放一半数据。结果是写入位置到处跳、需要的页更可能不在内存里（要读磁盘），而且大量页只有一半满，浪费空间。</li>
+</ul>
+<p>MySQL 官方文档对此有明确的描述：按顺序插入时，聚簇索引的页大约能填到 <strong>15/16</strong>；按随机顺序插入时，页的填充率在 <strong>1/2 到 15/16</strong> 之间。</p>
+<p>另外，InnoDB 的<strong>二级索引</strong>叶子节点里存的是主键值。主键越长，每个二级索引都跟着变大。一个 36 个字符的 UUID 字符串，比 8 字节的 BIGINT 长 4 倍多。</p>
+<p>后面的「动手实验」里有一组实测：同样插入 30 万行，随机 UUID 主键比递增主键慢了一个数量级。</p>
+<h3 id="_2">趋势递增，不是严格递增</h3>
+<p>要求的是「<strong>趋势</strong>递增」：整体上越来越大即可，不要求每个 ID 都比上一个大，更不要求连续。</p>
+<p>严格递增、连续的 ID 反而有坏处：它要求所有节点共享一个计数器，难以做到高性能和高可用；而且连续的 ID 很容易被人推算出业务量，这正是第五条要求要避免的。</p>
+<h2 id="_3">常见方案一览</h2>
+<figure><img src="img/f-31.5.jpg" alt="五种常见方案对比" loading="lazy"><figcaption>五种常见方案对比</figcaption></figure>
+<h3 id="uuid">方案一：UUID</h3>
+<p>UUID（通用唯一识别码）是一个 128 位的数，通常写成 36 个字符的字符串，比如 <code>550e8400-e29b-41d4-a716-446655440000</code>。最常用的版本 4（UUIDv4）里有 122 位是随机数，任何机器都可以在本地直接生成，不需要协调。</p>
+<pre><code class="language-java">String id = java.util.UUID.randomUUID().toString();
+</code></pre>
+<ul>
+<li>优点：简单、本地生成、性能好、不依赖任何服务；</li>
+<li>缺点：<strong>无序</strong>，作为 InnoDB 主键时写入性能差（上一节）；<strong>太长</strong>，用字符串存要 36 字节，占空间，二级索引也跟着变大；不是数字，无法直接比较先后。</li>
+</ul>
+<p>UUID 适合做请求号、文件名、Trace ID 这类不当数据库主键的场景。</p>
+<blockquote>
+<p><strong>UUIDv7</strong>：2024 年发布的 RFC 9562 定义了新的 UUID 版本 7，开头 48 位是 Unix 毫秒时间戳，后面是随机数。它是<strong>按时间有序</strong>的，解决了「无序」这个最大的问题，但长度仍是 128 位。如果团队想用标准化、不需要分配机器号的方案，UUIDv7 值得考虑。</p>
+</blockquote>
+<h3 id="_4">方案二：数据库自增 + 步长</h3>
+<p>让多个数据库的自增计数器<strong>起点不同、步长相同</strong>。MySQL 提供了两个系统变量：</p>
+<pre><code class="language-sql">-- 库 1：1, 3, 5, 7, ...
+SET @@auto_increment_offset = 1;
+SET @@auto_increment_increment = 2;
+-- 库 2：2, 4, 6, 8, ...
+SET @@auto_increment_offset = 2;
+SET @@auto_increment_increment = 2;
+</code></pre>
+<ul>
+<li>优点：简单，单个库内有序；</li>
+<li>缺点：每次取号都要访问数据库，性能受限于数据库；<strong>扩容困难</strong>，从 2 个库变成 3 个库，步长要从 2 改成 3，已经发出去的号段要小心避开。</li>
+</ul>
+<p>还有一种更朴素的做法：单独搞一个「发号库」，用一张只有自增主键的表，每次插入一行拿到 id。它的问题是单点，性能也上不去。</p>
+<h3 id="_5">方案三：号段模式</h3>
+<p>数据库方案的瓶颈在于「每个 ID 都访问一次数据库」。号段模式的思路是<strong>批发</strong>：一次从数据库领一段号，比如 <code>1001～2000</code>，放在内存里慢慢发，用完了再去领下一段。</p>
+<p>数据库里只需要一张表，记录每种业务当前分配到哪里了：</p>
+<pre><code class="language-sql">CREATE TABLE id_alloc (
+  biz_tag VARCHAR(64) PRIMARY KEY,   -- 业务标识，如 order、user
+  max_id  BIGINT NOT NULL,           -- 已经分配出去的最大 id
+  step    INT NOT NULL               -- 每次领多少个
+);
+
+-- 领号段：一条 UPDATE 原子完成，多个服务实例并发领也不会重复
+UPDATE id_alloc SET max_id = max_id + step WHERE biz_tag = 'order';
+SELECT max_id, step FROM id_alloc WHERE biz_tag = 'order';
+-- 本实例可以使用 (max_id - step, max_id] 这一段
+</code></pre>
+<p>步长 1000，就意味着数据库的访问次数降到原来的千分之一。美团开源的 <strong>Leaf</strong> 在号段模式上又做了两点改进：</p>
+<ul>
+<li><strong>双 Buffer</strong>：当前号段消耗到一定比例（美团文章中是 10%）时，就异步去领下一段，放在第二个 Buffer 里。当前号段用完时直接切换，取号永远不用等数据库；</li>
+<li><strong>数据库短暂故障也能撑一会</strong>：内存里还有号段，数据库宕机几分钟，发号不受影响。</li>
+</ul>
+<p>号段模式的缺点：</p>
+<ul>
+<li>服务重启时，内存里没发完的号段<strong>直接作废</strong>，ID 不连续（通常这不是问题）；</li>
+<li>同一个实例发出的 ID 是连续的，多个实例交替领段，<strong>ID 仍然容易被推算</strong>出业务量，不适合直接做对外的订单号；</li>
+<li>依然依赖数据库，只是依赖得少了。</li>
+</ul>
+<h3 id="redis-incr">方案四：Redis INCR</h3>
+<p>Redis 的 <code>INCR</code> 命令是原子的，天然适合当计数器：</p>
+<pre><code class="language-text">127.0.0.1:6379&gt; INCR id:order
+(integer) 1001
+127.0.0.1:6379&gt; INCR id:order
+(integer) 1002
+</code></pre>
+<ul>
+<li>优点：性能好，ID 有序；</li>
+<li>缺点：引入了对 Redis 的依赖；更要命的是<strong>持久化</strong>：RDB 快照会丢失最近一次快照后的写入，AOF 按每秒刷盘也可能丢最后一秒。Redis 宕机恢复后，计数器可能<strong>回退</strong>到之前的值，于是发出重复的 ID。需要配合 AOF <code>always</code>、主从等措施，或者在 ID 里再拼上日期前缀。</li>
+</ul>
+<h3 id="_6">方案五：雪花算法</h3>
+<p>前面四种方案，要么无序，要么每次取号都依赖一个中心化的存储。<strong>雪花算法</strong>（Snowflake）是 Twitter 在 2010 年开源的方案，换了一个思路：<strong>不需要协调，每台机器根据「当前时间 + 自己的编号 + 本地计数」在本地拼出一个 64 位整数</strong>。</p>
+<h3 id="_7">五种方案对比</h3>
+<table>
+<thead>
+<tr>
+<th>方案</th>
+<th>唯一性来源</th>
+<th>有序性</th>
+<th>性能</th>
+<th>依赖</th>
+<th>主要问题</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>UUIDv4</td>
+<td>122 位随机数</td>
+<td>无序</td>
+<td>本地生成，很高</td>
+<td>无</td>
+<td>太长、无序、索引性能差</td>
+</tr>
+<tr>
+<td>数据库自增 + 步长</td>
+<td>不同起点、相同步长</td>
+<td>单库内有序</td>
+<td>受限于数据库</td>
+<td>数据库</td>
+<td>扩容难、每次访问数据库</td>
+</tr>
+<tr>
+<td>号段模式</td>
+<td>数据库原子更新 max_id</td>
+<td>趋势递增</td>
+<td>很高</td>
+<td>数据库（弱）</td>
+<td>重启浪费号段、ID 较连续</td>
+</tr>
+<tr>
+<td>Redis INCR</td>
+<td>Redis 原子自增</td>
+<td>严格递增</td>
+<td>高</td>
+<td>Redis</td>
+<td>宕机恢复可能回退</td>
+</tr>
+<tr>
+<td>雪花算法</td>
+<td>时间 + 机器 ID + 序列号</td>
+<td>趋势递增</td>
+<td>本地生成，极高</td>
+<td>时钟、机器 ID 分配</td>
+<td>时钟回拨</td>
+</tr>
+</tbody>
+</table>
+<p>实践中最常用的是<strong>号段模式</strong>和<strong>雪花算法</strong>，美团 Leaf 就同时提供了这两种模式。</p>
+<h2 id="64">雪花算法：把 64 位拆成四段</h2>
+<figure><img src="img/f-44.5.jpg" alt="雪花算法的 64 位结构" loading="lazy"><figcaption>雪花算法的 64 位结构</figcaption></figure>
+<p>雪花 ID 是一个 64 位的整数（Java 的 <code>long</code>、MySQL 的 <code>BIGINT</code>），从高位到低位分成四段：</p>
+<table>
+<thead>
+<tr>
+<th>段</th>
+<th>位数</th>
+<th>内容</th>
+<th>能表示的范围</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>符号位</td>
+<td>1</td>
+<td>恒为 0</td>
+<td>保证 ID 是正数</td>
+</tr>
+<tr>
+<td>时间戳</td>
+<td>41</td>
+<td>当前毫秒数 − 自定义起始时间（epoch）</td>
+<td>2^41 毫秒 ≈ <strong>69.7 年</strong></td>
+</tr>
+<tr>
+<td>机器 ID</td>
+<td>10</td>
+<td>生成这个 ID 的节点编号</td>
+<td>2^10 = <strong>1024</strong> 个节点</td>
+</tr>
+<tr>
+<td>序列号</td>
+<td>12</td>
+<td>同一毫秒内的自增计数</td>
+<td>每毫秒 2^12 = <strong>4096</strong> 个</td>
+</tr>
+</tbody>
+</table>
+<p>拼接方式就是位运算：</p>
+<pre><code class="language-text">id = (当前毫秒 - EPOCH) &lt;&lt; 22  |  机器ID &lt;&lt; 12  |  序列号
+       └─ 左移 10+12 位 ─┘        └─ 左移 12 位 ┘
+</code></pre>
+<p>几个值得细想的设计：</p>
+<ul>
+<li><strong>为什么时间戳放在最高位？</strong> 整数比大小是从高位开始比的。时间放在最高位，后生成的 ID 就一定更大（只要时钟不回退），这就是「趋势递增」的来源；</li>
+<li><strong>为什么要自定义起始时间？</strong> 如果直接用 1970 年以来的毫秒数，41 位只能用到 2039 年左右。从系统上线的时间（比如 2024-01-01）开始算，就能再用将近 70 年。Twitter 用的起始时间是 2010 年 11 月；</li>
+<li><strong>为什么符号位是 0？</strong> Java 没有无符号 long，最高位是 1 就成了负数。留着它为 0，ID 永远是正数，排序、存储都不出意外；</li>
+<li><strong>单台机器的理论上限</strong>：每毫秒 4096 个，也就是每秒约 409.6 万个。绝大多数业务远远用不到。</li>
+</ul>
+<h3 id="_8">各段的位数可以调整</h3>
+<p>41 / 10 / 12 不是定律，而是 Twitter 当时的选择。各家会按自己的需要重新分配：</p>
+<table>
+<thead>
+<tr>
+<th>实现</th>
+<th>时间</th>
+<th>机器</th>
+<th>序列号</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Twitter Snowflake</td>
+<td>41 位，毫秒</td>
+<td>10 位（5 位机房 + 5 位机器）</td>
+<td>12 位</td>
+<td>原版</td>
+</tr>
+<tr>
+<td>Sonyflake（默认配置）</td>
+<td>39 位，10 毫秒为单位</td>
+<td>16 位</td>
+<td>8 位</td>
+<td>时间跨度更长（约 174 年），单机吞吐更低</td>
+</tr>
+<tr>
+<td>百度 UidGenerator（默认配置）</td>
+<td>28 位，<strong>秒</strong></td>
+<td>22 位</td>
+<td>13 位</td>
+<td>机器 ID 位数多，每次启动都分配新 ID</td>
+</tr>
+</tbody>
+</table>
+<p>如果机器很少、单机并发很高，就多给序列号几位；如果是容器化部署、实例频繁重建，就多给机器 ID 几位。<strong>总位数守住 63 位</strong>（保留符号位）即可。</p>
+<h2 id="_9">生成过程：一毫秒之内靠序列号</h2>
+<figure><img src="img/f-55.5.jpg" alt="同一毫秒、下一毫秒、序列号用完" loading="lazy"><figcaption>同一毫秒、下一毫秒、序列号用完</figcaption></figure>
+<p>生成 ID 的逻辑只有十几行：</p>
+<figure>
+<svg viewBox="0 0 440 370" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="雪花算法生成 ID 的流程">
+  <rect width="440" height="370" fill="#0f0e1c"/>
+  <defs><marker id="sa" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#bae6fd"/></marker></defs>
+  <g font-family="PingFang SC, Noto Sans SC, sans-serif" text-anchor="middle">
+    <rect x="30" y="16" width="240" height="40" rx="10" fill="rgba(255,255,255,.06)" stroke="#9a93a8"/>
+    <text x="150" y="41" fill="#f4ede4" font-size="15" font-weight="700">读取当前毫秒 now</text>
+    <line x1="150" y1="56" x2="150" y2="80" stroke="#bae6fd" stroke-width="2.5" marker-end="url(#sa)"/>
+    <rect x="30" y="82" width="240" height="40" rx="10" fill="rgba(255,211,138,.10)" stroke="#ffd38a"/>
+    <text x="150" y="107" fill="#ffd38a" font-size="15" font-weight="800">now &lt; lastTs ？（时钟回拨）</text>
+    <line x1="270" y1="102" x2="296" y2="102" stroke="#ff8a8a" stroke-width="2.5" marker-end="url(#sa)"/>
+    <text x="283" y="94" fill="#ff8a8a" font-size="12">是</text>
+    <rect x="298" y="78" width="132" height="48" rx="10" fill="rgba(255,138,138,.10)" stroke="#ff8a8a"/>
+    <text x="364" y="98" fill="#ff8a8a" font-size="13" font-weight="800">回拨少：等待</text>
+    <text x="364" y="117" fill="#ff8a8a" font-size="13" font-weight="800">回拨多：报错</text>
+    <line x1="150" y1="122" x2="150" y2="150" stroke="#bae6fd" stroke-width="2.5" marker-end="url(#sa)"/>
+    <text x="162" y="140" fill="#9a93a8" font-size="12">否</text>
+    <rect x="30" y="152" width="240" height="40" rx="10" fill="rgba(255,211,138,.10)" stroke="#ffd38a"/>
+    <text x="150" y="177" fill="#ffd38a" font-size="15" font-weight="800">now == lastTs ？（同一毫秒）</text>
+    <line x1="270" y1="172" x2="296" y2="172" stroke="#bae6fd" stroke-width="2.5" marker-end="url(#sa)"/>
+    <text x="283" y="164" fill="#9a93a8" font-size="12">是</text>
+    <rect x="298" y="146" width="132" height="52" rx="10" fill="rgba(186,230,253,.10)" stroke="#bae6fd"/>
+    <text x="364" y="167" fill="#bae6fd" font-size="13" font-weight="800">seq = seq + 1</text>
+    <text x="364" y="186" fill="#9a93a8" font-size="12">到 4096 则等下一毫秒</text>
+    <line x1="150" y1="192" x2="150" y2="222" stroke="#bae6fd" stroke-width="2.5" marker-end="url(#sa)"/>
+    <text x="162" y="211" fill="#9a93a8" font-size="12">否</text>
+    <rect x="30" y="224" width="240" height="40" rx="10" fill="rgba(110,231,200,.10)" stroke="#6ee7c8"/>
+    <text x="150" y="249" fill="#6ee7c8" font-size="15" font-weight="800">seq = 0（新的一毫秒）</text>
+    <line x1="150" y1="264" x2="150" y2="292" stroke="#bae6fd" stroke-width="2.5" marker-end="url(#sa)"/>
+    <path d="M364,198 L364,316 L274,316" fill="none" stroke="#bae6fd" stroke-width="2.5" marker-end="url(#sa)"/>
+    <rect x="30" y="294" width="240" height="52" rx="10" fill="rgba(186,230,253,.14)" stroke="#bae6fd"/>
+    <text x="150" y="315" fill="#f4ede4" font-size="14" font-weight="800">lastTs = now，拼接 ID</text>
+    <text x="150" y="335" fill="#9a93a8" font-size="12">时间 &lt;&lt; 22 | 机器 &lt;&lt; 12 | seq</text>
+  </g>
+</svg>
+<figcaption>每次生成 ID 时的判断流程：先查时钟回拨，再看是否还在同一毫秒内</figcaption>
+</figure>
+
+<p>用一个具体例子走一遍（格式：时间戳 | 机器 | 序列号）：</p>
+<table>
+<thead>
+<tr>
+<th>时刻</th>
+<th>发生了什么</th>
+<th>生成的 ID</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>第 1000 毫秒</td>
+<td>本毫秒第一个请求，序列号从 0 开始</td>
+<td>1000 | 7 | 0</td>
+</tr>
+<tr>
+<td>第 1000 毫秒</td>
+<td>同一毫秒又来两个请求</td>
+<td>1000 | 7 | 1、1000 | 7 | 2</td>
+</tr>
+<tr>
+<td>第 1001 毫秒</td>
+<td>进入新的一毫秒，序列号归 0</td>
+<td>1001 | 7 | 0</td>
+</tr>
+<tr>
+<td>第 1001 毫秒</td>
+<td>流量高峰，序列号一路涨到 4095</td>
+<td>1001 | 7 | 4095</td>
+</tr>
+<tr>
+<td>第 1001 毫秒</td>
+<td>第 4097 个请求：本毫秒的号用完了，<strong>自旋等到下一毫秒</strong></td>
+<td>1002 | 7 | 0</td>
+</tr>
+</tbody>
+</table>
+<p>整个过程<strong>只读本机时钟、只在内存里算</strong>，不访问网络、不依赖数据库，所以极快。多台机器之间不需要任何通信，因为机器 ID 不同，拼出来的 ID 不可能相同。</p>
+<h3 id="_10">「趋势递增」的含义</h3>
+<ul>
+<li><strong>同一台机器</strong>：时间不回退的前提下，生成的 ID 是严格递增的；</li>
+<li><strong>多台机器之间</strong>：同一毫秒内，机器 7 生成的 ID 可能比机器 3 晚一点生成的 ID 更大，各机器的时钟也有细微差别。所以从全局看，ID 只是<strong>大致按时间递增</strong>。</li>
+</ul>
+<p>这对 B+ 树来说已经足够：新 ID 都集中在索引的「最右边」附近，不会到处随机插入。</p>
+<h3 id="0">一个隐蔽的坑：低流量时序列号总是 0</h3>
+<p>按上面的写法，每进入新的一毫秒，序列号都从 0 开始。如果一个服务每秒只发几十个 ID，几乎每个 ID 都落在不同的毫秒里，<strong>序列号几乎全是 0</strong>。后面的实验输出也能看到这一点。</p>
+<p>这意味着 ID 的低 12 位基本固定，如果有人用 <code>id % 8</code> 来决定数据放到哪张分表，结果<strong>所有数据都会进同一张表</strong>。应对办法：</p>
+<ul>
+<li>分片时对 ID 做一次哈希再取模，而不是直接取模；</li>
+<li>或者让每一毫秒的序列号从一个随机的小数字开始（一些开源实现提供了这个选项）。</li>
+</ul>
+<h2 id="_11">最大的坑：时钟回拨</h2>
+<figure><img src="img/f-66.5.jpg" alt="时钟回拨导致重复 ID，以及四种应对方式" loading="lazy"><figcaption>时钟回拨导致重复 ID，以及四种应对方式</figcaption></figure>
+<p>雪花算法把唯一性押在了「时间只会往前走」上。可服务器的时钟<strong>会往回走</strong>：</p>
+<ul>
+<li><strong>NTP 校时</strong>：机器时钟走快了，NTP 服务把它往回调；</li>
+<li>运维<strong>手动修改</strong>系统时间；</li>
+<li><strong>虚拟机迁移、快照恢复</strong>后，系统时间发生跳变；</li>
+<li>闰秒处理不当。</li>
+</ul>
+<p>假设时钟在第 1002 毫秒时被往回拨了 3 毫秒，回到了第 999 毫秒。如果代码不做任何检查，当时间再次走到第 1001 毫秒时，序列号又从 0 开始，生成的 <code>1001 | 7 | 0</code> 和之前那个<strong>一模一样</strong>。</p>
+<p>正确的实现都会记住上一次的时间戳 <code>lastTs</code>，一旦发现 <code>now &lt; lastTs</code> 就说明时钟回拨了。接下来怎么办，有几种策略：</p>
+<table>
+<thead>
+<tr>
+<th>策略</th>
+<th>做法</th>
+<th>适用</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>等待</strong></td>
+<td>回拨幅度很小（几毫秒）时，原地等时间追上 <code>lastTs</code> 再继续发号</td>
+<td>小幅回拨，代价是短暂的延迟</td>
+</tr>
+<tr>
+<td><strong>报错</strong></td>
+<td>回拨幅度大时，直接抛异常拒绝发号，触发告警，由上游重试到其他节点</td>
+<td>大幅回拨，宁可失败也不发重复号</td>
+</tr>
+<tr>
+<td><strong>回拨位</strong></td>
+<td>从机器 ID 里借出 1～2 位作为「回拨计数」，每发生一次回拨就加 1，相当于换了个身份继续发号</td>
+<td>想在回拨期间不中断服务</td>
+</tr>
+<tr>
+<td><strong>借用未来时间</strong></td>
+<td>不再每次读取系统时钟，而是自己维护一个只增不减的逻辑时间；某个时间单位的序列号用完了，就把逻辑时间加 1</td>
+<td>百度 UidGenerator 的缓存模式采用了类似思路</td>
+</tr>
+</tbody>
+</table>
+<p>实际系统往往组合使用：小回拨等待、大回拨报错，再加上运维层面的预防。</p>
+<h3 id="_12">进程重启时的回拨</h3>
+<p><code>lastTs</code> 只存在内存里。如果时钟回拨发生在<strong>进程重启期间</strong>，新进程不知道上次发到了什么时间，检查就失效了。</p>
+<p>美团 Leaf 的 snowflake 模式为此做了额外的防护：节点会定期把自己的当前时间上报到 ZooKeeper；启动时，如果发现本机时间比上次上报的时间还早，就<strong>拒绝启动</strong>并报警。</p>
+<h3 id="_13">运维层面的预防</h3>
+<ul>
+<li>时间同步尽量<strong>平滑调整</strong>（slew，让时钟慢慢变快或变慢），避免直接<strong>跳变</strong>（step）；</li>
+<li>监控各节点的时钟偏差，偏差过大就告警；</li>
+<li>不要在线上服务器上手动改时间。</li>
+</ul>
+<h2 id="id_1">落地：机器 ID 分配与前端精度</h2>
+<figure><img src="img/f-77.5.jpg" alt="机器 ID 的分配方式，以及前端精度丢失问题" loading="lazy"><figcaption>机器 ID 的分配方式，以及前端精度丢失问题</figcaption></figure>
+<h3 id="id_2">机器 ID 怎么分配</h3>
+<p>雪花算法的唯一性还依赖一个前提：<strong>同一时刻，不能有两个节点使用相同的机器 ID</strong>。常见的分配方式：</p>
+<table>
+<thead>
+<tr>
+<th>方式</th>
+<th>做法</th>
+<th>优缺点</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>配置文件 / 环境变量</td>
+<td>部署时给每个实例写死一个编号</td>
+<td>最简单；靠人保证不重复，实例一多容易出错</td>
+</tr>
+<tr>
+<td>ZooKeeper 顺序节点</td>
+<td>启动时在 ZooKeeper 下创建顺序节点，用节点序号作为机器 ID</td>
+<td>自动、可靠；Leaf 的 snowflake 模式采用此方式，并在本地缓存一份以降低对 ZooKeeper 的依赖</td>
+</tr>
+<tr>
+<td>数据库注册表</td>
+<td>启动时往一张表插入一行（记录 IP、端口、启动时间），用这行的自增 id 作为机器 ID</td>
+<td>不需要额外组件；UidGenerator 采用此方式，每次启动都换新 ID，所以它给机器 ID 留了 22 位</td>
+</tr>
+<tr>
+<td>Redis 抢占</td>
+<td>用 <code>SET workerId:N &lt;实例&gt; NX EX 60</code> 抢一个空闲编号，并定期续期</td>
+<td>适合实例频繁扩缩容；要处理续期失败</td>
+</tr>
+<tr>
+<td>K8s StatefulSet</td>
+<td>Pod 名称自带序号（order-0、order-1……），直接解析出来</td>
+<td>部署方式受限于 StatefulSet</td>
+</tr>
+</tbody>
+</table>
+<p>容器化部署时要特别小心：实例被重新调度后，如果新实例拿到的编号恰好和一个「还没彻底退出」的旧实例相同，就可能在短时间内生成重复 ID。依赖租约（如 ZooKeeper 临时节点、Redis 过期键）的方案，要确保旧实例失去租约后<strong>立即停止发号</strong>。</p>
+<h3 id="_14">前端的坑：精度丢失</h3>
+<p>后端用 <code>long</code> 生成了 ID，序列化成 JSON 返回给前端：</p>
+<pre><code class="language-json">{&quot;id&quot;: 367144209683083265}
+</code></pre>
+<p>前端 <code>JSON.parse</code> 之后，拿到的却是 <code>367144209683083260</code>，末尾变了。用这个 ID 再去请求详情接口，自然查不到数据。</p>
+<p>原因是 JavaScript 的 <code>Number</code> 类型是 <strong>64 位双精度浮点数</strong>，只有 53 位用来存有效数字。能精确表示的最大整数是 <code>Number.MAX_SAFE_INTEGER = 2^53 − 1 = 9007199254740991</code>。超过这个值，相邻的整数就可能被映射成同一个浮点数。</p>
+<p>雪花 ID 会超过这个值吗？几乎一定会：时间戳左移了 22 位，只要时间戳部分超过 2^31 毫秒（约 <strong>24.9 天</strong>），ID 就大于 2^53。也就是说，系统上线不到一个月，所有新 ID 都会在前端丢精度。</p>
+<p>解决办法：<strong>ID 以字符串的形式返回给前端</strong>。</p>
+<pre><code class="language-java">// 方式一：给字段加注解（Jackson）
+@JsonSerialize(using = ToStringSerializer.class)
+private Long id;
+
+// 方式二：全局把 Long 都序列化成字符串
+SimpleModule module = new SimpleModule();
+module.addSerializer(Long.class, ToStringSerializer.instance);
+module.addSerializer(Long.TYPE, ToStringSerializer.instance);
+objectMapper.registerModule(module);
+</code></pre>
+<p>Twitter 的开放 API 就是这么做的：每个对象同时返回数字形式的 <code>id</code> 和字符串形式的 <code>id_str</code>，并提醒 JavaScript 开发者使用后者。前端如果确实要对 ID 做运算，可以用 <code>BigInt</code>。</p>
+<h2 id="_15">动手实验</h2>
+<p>以下代码都在本机（2 核 CPU，OpenJDK 21，Python 3.13，Node.js 22）实际运行过，输出是真实结果；耗时类数字在不同机器上会有差别。</p>
+<h3 id="java-21">实验一：Java 21 实现线程安全的雪花算法</h3>
+<p>这个实现包含了前面讲到的所有要点：位运算拼接、同一毫秒序列号自增、序列号溢出等待下一毫秒、小幅时钟回拨等待、大幅回拨报错，以及反解析。时钟通过 <code>LongSupplier</code> 注入，方便在测试里模拟回拨。</p>
+<pre><code class="language-java">import java.time.Instant;
+import java.util.Set;
+import java.util.concurrent.*;
+import java.util.function.LongSupplier;
+
+public class Snowflake {
+    // 自定义起始时间：2024-01-01T00:00:00Z，41 位时间戳从这里开始算，约可用 69 年
+    static final long EPOCH = 1704067200000L;
+    static final int WORKER_BITS = 10, SEQ_BITS = 12;
+    static final long MAX_WORKER = (1L &lt;&lt; WORKER_BITS) - 1;   // 1023
+    static final long SEQ_MASK   = (1L &lt;&lt; SEQ_BITS) - 1;      // 4095
+    static final long MAX_BACKWARD_MS = 5;                    // 容忍的最大回拨毫秒数
+
+    private final long workerId;
+    private final LongSupplier clock;     // 时钟可替换，方便演示回拨
+    private long lastTs = -1, seq = 0;
+
+    Snowflake(long workerId, LongSupplier clock) {
+        if (workerId &lt; 0 || workerId &gt; MAX_WORKER)
+            throw new IllegalArgumentException(&quot;workerId 超出范围: &quot; + workerId);
+        this.workerId = workerId;
+        this.clock = clock;
+    }
+    Snowflake(long workerId) { this(workerId, System::currentTimeMillis); }
+
+    public synchronized long nextId() {
+        long now = clock.getAsLong();
+        if (now &lt; lastTs) {                                   // 时钟回拨
+            long back = lastTs - now;
+            if (back &gt; MAX_BACKWARD_MS)
+                throw new IllegalStateException(&quot;时钟回拨 &quot; + back + &quot; ms，拒绝发号&quot;);
+            now = waitUntilAfter(lastTs - 1);                 // 小幅回拨：等时间追上来
+        }
+        if (now == lastTs) {
+            seq = (seq + 1) &amp; SEQ_MASK;
+            if (seq == 0) now = waitUntilAfter(lastTs);       // 本毫秒 4096 个用完
+        } else {
+            seq = 0;
+        }
+        lastTs = now;
+        return ((now - EPOCH) &lt;&lt; (WORKER_BITS + SEQ_BITS)) | (workerId &lt;&lt; SEQ_BITS) | seq;
+    }
+
+    private long waitUntilAfter(long ts) {
+        long now = clock.getAsLong();
+        while (now &lt;= ts) { Thread.onSpinWait(); now = clock.getAsLong(); }
+        return now;
+    }
+
+    record Parts(Instant time, long workerId, long seq) {}
+    static Parts parse(long id) {
+        return new Parts(Instant.ofEpochMilli((id &gt;&gt;&gt; (WORKER_BITS + SEQ_BITS)) + EPOCH),
+                         (id &gt;&gt;&gt; SEQ_BITS) &amp; MAX_WORKER, id &amp; SEQ_MASK);
+    }
+
+    public static void main(String[] args) throws Exception {
+        // 1. 生成几个 ID 并反解析
+        Snowflake gen = new Snowflake(7);
+        System.out.println(&quot;== 生成与反解析 ==&quot;);
+        for (int i = 0; i &lt; 3; i++) {
+            long id = gen.nextId();
+            System.out.printf(&quot;%d  %s  二进制位数=%d%n&quot;, id, parse(id), 64 - Long.numberOfLeadingZeros(id));
+        }
+
+        // 2. 序列号溢出：用一个「冻结」的时钟，同一毫秒内要 4097 个
+        long[] fake = {EPOCH + 1000};
+        int[] calls = {0};
+        Snowflake frozen = new Snowflake(1, () -&gt; ++calls[0] &gt; 4200 ? fake[0] + 1 : fake[0]);
+        long last = 0;
+        for (int i = 0; i &lt; 4097; i++) last = frozen.nextId();
+        System.out.println(&quot;\n== 同一毫秒第 4097 个 ID ==&quot;);
+        System.out.println(parse(last) + &quot;  （时间被推到下一毫秒，序列号归 0）&quot;);
+
+        // 3. 时钟回拨：回拨 3ms 等待，回拨 50ms 报错
+        System.out.println(&quot;\n== 时钟回拨 ==&quot;);
+        long[] now = {EPOCH + 10_000};
+        Snowflake g2 = new Snowflake(2, () -&gt; now[0]);
+        g2.nextId();
+        now[0] -= 3;
+        Thread t = Thread.ofVirtual().start(() -&gt; System.out.println(&quot;回拨 3ms：等待后发号 &quot; + parse(g2.nextId())));
+        Thread.sleep(50); now[0] += 4; t.join();
+        now[0] -= 50;
+        try { g2.nextId(); } catch (IllegalStateException e) { System.out.println(&quot;回拨 50ms：&quot; + e.getMessage()); }
+
+        // 4. 多线程并发生成 10 万个，检查重复并测速
+        System.out.println(&quot;\n== 并发测试 ==&quot;);
+        Snowflake g3 = new Snowflake(3);
+        int threads = 8, perThread = 12_500;
+        Set&lt;Long&gt; ids = ConcurrentHashMap.newKeySet();
+        long[] buf = new long[threads * perThread];
+        long t0 = System.nanoTime();
+        try (ExecutorService pool = Executors.newFixedThreadPool(threads)) {
+            for (int k = 0; k &lt; threads; k++) {
+                int base = k * perThread;
+                pool.submit(() -&gt; { for (int i = 0; i &lt; perThread; i++) buf[base + i] = g3.nextId(); });
+            }
+        }
+        long cost = System.nanoTime() - t0;
+        for (long id : buf) ids.add(id);
+        System.out.printf(&quot;线程数=%d 生成=%d 去重后=%d 耗时=%.1f ms 约 %.0f 万个/秒%n&quot;,
+                threads, buf.length, ids.size(), cost / 1e6, buf.length / (cost / 1e9) / 1e4);
+        long min = ids.stream().min(Long::compare).get(), max = ids.stream().max(Long::compare).get();
+        System.out.println(&quot;最小 &quot; + parse(min));
+        System.out.println(&quot;最大 &quot; + parse(max));
+    }
+}
+</code></pre>
+<p>用 <code>java -Dstdout.encoding=UTF-8 Snowflake.java</code> 直接运行（Java 11 起支持单文件源码直接运行），输出：</p>
+<pre><code class="language-text">== 生成与反解析 ==
+367144209607585792  Parts[time=2026-10-10T03:00:00.780Z, workerId=7, seq=0]  二进制位数=59
+367144209683083264  Parts[time=2026-10-10T03:00:00.798Z, workerId=7, seq=0]  二进制位数=59
+367144209683083265  Parts[time=2026-10-10T03:00:00.798Z, workerId=7, seq=1]  二进制位数=59
+
+== 同一毫秒第 4097 个 ID ==
+Parts[time=2024-01-01T00:00:01.001Z, workerId=1, seq=0]  （时间被推到下一毫秒，序列号归 0）
+
+== 时钟回拨 ==
+回拨 3ms：等待后发号 Parts[time=2024-01-01T00:00:10.001Z, workerId=2, seq=0]
+回拨 50ms：时钟回拨 50 ms，拒绝发号
+
+== 并发测试 ==
+线程数=8 生成=100000 去重后=100000 耗时=27.1 ms 约 369 万个/秒
+最小 Parts[time=2026-10-10T03:00:00.861Z, workerId=3, seq=0]
+最大 Parts[time=2026-10-10T03:00:00.886Z, workerId=3, seq=1680]
+</code></pre>
+<p>几个观察：</p>
+<ul>
+<li><strong>反解析</strong>：从 ID 里可以直接读出生成时间、机器号和序列号，排查问题时很方便。这也意味着雪花 ID 会<strong>泄露生成时间</strong>；</li>
+<li><strong>二进制位数是 59</strong>：起始时间是 2024 年，时间戳部分还很小。随着时间推移，ID 会逐渐变长，最终用满 63 位；</li>
+<li><strong>第一段输出里，序列号大多是 0</strong>：打印很慢，几乎每个 ID 都在不同的毫秒生成，正是前面说的「低流量时序列号总是 0」；</li>
+<li><strong>并发测试</strong>：8 个线程生成 10 万个 ID，没有重复，速度约每秒三四百万个（两次运行分别是 225 万和 369 万个/秒，受机器负载影响）。这已经接近单机理论上限 409.6 万个/秒：<code>synchronized</code> 并不是瓶颈，每毫秒 4096 个的序列号上限才是。</li>
+</ul>
+<h3 id="_16">实验二：号段模式</h3>
+<p>用 Python 和 SQLite 模拟号段模式的核心逻辑：一条 <code>UPDATE</code> 领号段，内存里发号，用完再领。</p>
+<pre><code class="language-python">import sqlite3, threading
+from concurrent.futures import ThreadPoolExecutor
+
+db = sqlite3.connect(&quot;leaf.db&quot;, check_same_thread=False, isolation_level=None)
+db.execute(&quot;DROP TABLE IF EXISTS id_alloc&quot;)
+db.execute(&quot;CREATE TABLE id_alloc (biz_tag TEXT PRIMARY KEY, max_id INTEGER, step INTEGER)&quot;)
+db.execute(&quot;INSERT INTO id_alloc VALUES ('order', 1000, 1000)&quot;)
+db_calls = 0
+
+def fetch_segment(tag):
+    &quot;&quot;&quot;去数据库领一个号段：max_id += step，返回 (起点, 终点]&quot;&quot;&quot;
+    global db_calls
+    db_calls += 1
+    db.execute(&quot;BEGIN IMMEDIATE&quot;)                         # 写锁，保证多个实例不会领到同一段
+    db.execute(&quot;UPDATE id_alloc SET max_id = max_id + step WHERE biz_tag = ?&quot;, (tag,))
+    max_id, step = db.execute(&quot;SELECT max_id, step FROM id_alloc WHERE biz_tag = ?&quot;, (tag,)).fetchone()
+    db.execute(&quot;COMMIT&quot;)
+    return max_id - step, max_id
+
+class SegmentIdGen:
+    def __init__(self, tag):
+        self.tag, self.lock = tag, threading.Lock()
+        self.cur, self.end = fetch_segment(tag)
+    def next_id(self):
+        with self.lock:
+            if self.cur &gt;= self.end:                     # 号段用完，再领一段
+                self.cur, self.end = fetch_segment(self.tag)
+            self.cur += 1
+            return self.cur
+
+gen = SegmentIdGen(&quot;order&quot;)
+print(&quot;前 3 个:&quot;, [gen.next_id() for _ in range(3)])
+with ThreadPoolExecutor(8) as pool:
+    ids = list(pool.map(lambda _: gen.next_id(), range(20000)))
+print(&quot;并发取 20000 个，重复数:&quot;, len(ids) - len(set(ids)), &quot; 访问数据库次数:&quot;, db_calls)
+
+# 模拟服务重启：内存里没用完的号段直接丢弃
+gen2 = SegmentIdGen(&quot;order&quot;)
+print(&quot;重启后第一个 ID:&quot;, gen2.next_id(), &quot; (上一个实例最后发到&quot;, max(ids), &quot;)&quot;)
+</code></pre>
+<p>输出：</p>
+<pre><code class="language-text">前 3 个: [1001, 1002, 1003]
+并发取 20000 个，重复数: 0  访问数据库次数: 21
+重启后第一个 ID: 22001  (上一个实例最后发到 21003 )
+</code></pre>
+<p>两万多个 ID 只访问了 21 次数据库；重启后，上一个号段里没发完的 21004～22000 被直接跳过。生产实现（如 Leaf）还会加上双 Buffer 预加载，让「领下一段」不阻塞发号。</p>
+<h3 id="vs">实验三：有序主键 vs 随机主键</h3>
+<p>SQLite 的 <code>WITHOUT ROWID</code> 表和 InnoDB 一样，按主键把整行数据组织在一棵 B 树里。我们只给它约 2MB 的页缓存，模拟「数据量比内存大」的情况，比较三种主键的写入：</p>
+<pre><code class="language-python">import sqlite3, uuid, time, os
+
+N = 300_000
+def bench(name, keys):
+    path = f&quot;{name}.db&quot;
+    if os.path.exists(path): os.remove(path)
+    db = sqlite3.connect(path)
+    db.execute(&quot;PRAGMA cache_size = -2000&quot;)        # 只给约 2MB 页缓存，模拟「数据比内存大」
+    # WITHOUT ROWID：数据按主键组织成一棵 B 树，和 InnoDB 的聚簇索引类似
+    db.execute(&quot;CREATE TABLE t (id BLOB PRIMARY KEY, payload TEXT) WITHOUT ROWID&quot;)
+    t0 = time.perf_counter()
+    for i in range(0, N, 1000):
+        db.executemany(&quot;INSERT INTO t VALUES (?, ?)&quot;, [(k, &quot;x&quot; * 100) for k in keys[i:i + 1000]])
+        db.commit()
+    cost = time.perf_counter() - t0
+    pages = db.execute(&quot;PRAGMA page_count&quot;).fetchone()[0]
+    db.close(); os.remove(path)
+    print(f&quot;{name:&lt;12} 插入 {N} 行 {cost:5.2f} s   文件 {pages * 4096 / 1e6:5.1f} MB&quot;)
+
+seq_keys  = [i.to_bytes(8, &quot;big&quot;) for i in range(N)]               # 递增的 8 字节整数（类似雪花 ID）
+uuid_keys = [str(uuid.uuid4()).encode() for _ in range(N)]         # 36 字节的随机 UUID 字符串
+# 类似 UUIDv7：前 6 字节是递增的时间戳，后 10 字节随机（Python 3.13 还没有内置 uuid7）
+v7_keys = [(1_700_000_000_000 + i).to_bytes(6, &quot;big&quot;) + os.urandom(10) for i in range(N)]
+bench(&quot;递增 8 字节&quot;, seq_keys)
+bench(&quot;有序 16 字节&quot;, v7_keys)
+bench(&quot;UUID 字符串&quot;, uuid_keys)
+</code></pre>
+<p>输出：</p>
+<pre><code class="language-text">递增 8 字节      插入 300000 行  0.98 s   文件  39.7 MB
+有序 16 字节     插入 300000 行  0.84 s   文件  42.4 MB
+UUID 字符串     插入 300000 行 11.79 s   文件  49.7 MB
+</code></pre>
+<p>随机 UUID 主键的写入慢了 <strong>10 倍以上</strong>，文件也大了约 25%。而同样是 16 字节、但按时间有序的主键，速度和 8 字节递增主键几乎一样。可见<strong>拖慢写入的主要是「无序」，而不是「长」</strong>；「长」主要影响的是空间，以及（在 InnoDB 里）所有二级索引的大小。</p>
+<blockquote>
+<p>这是一个用 SQLite 做的粗略实验，用来直观感受差异，不能直接换算成 MySQL 的性能数字。差距的大小与缓存大小、磁盘、数据量都有关系：数据能全部放进内存时，差距会小很多。</p>
+</blockquote>
+<h3 id="javascript">实验四：JavaScript 的精度问题</h3>
+<pre><code class="language-python">import json
+
+id_ = 367144209683083265          # 上面 Java 程序生成的一个雪花 ID
+print(&quot;2^53            =&quot;, 2**53)
+print(&quot;雪花 ID         =&quot;, id_, &quot; 是否超过 2^53:&quot;, id_ &gt; 2**53)
+print(&quot;转成 float 再转回 =&quot;, int(float(id_)))           # JS 的 Number 就是 64 位 float
+print(&quot;相邻两个 ID 变成 float 后相等:&quot;, float(id_) == float(id_ + 1))
+print(&quot;2^53 + 1 == 2^53 ?&quot;, float(2**53 + 1) == float(2**53))
+
+# 41 位时间戳只要超过 2^31 毫秒，ID 就 ≥ 2^53
+print(&quot;2^31 毫秒约等于 %.1f 天&quot; % (2**31 / 1000 / 86400))
+print(&quot;2^41 毫秒约等于 %.1f 年&quot; % (2**41 / 1000 / 86400 / 365.25))
+
+# 后端以字符串输出，前端拿到的就是精确值
+print(json.dumps({&quot;id&quot;: str(id_)}))
+</code></pre>
+<pre><code class="language-text">2^53            = 9007199254740992
+雪花 ID         = 367144209683083265  是否超过 2^53: True
+转成 float 再转回 = 367144209683083264
+相邻两个 ID 变成 float 后相等: True
+2^53 + 1 == 2^53 ? True
+2^31 毫秒约等于 24.9 天
+2^41 毫秒约等于 69.7 年
+{&quot;id&quot;: &quot;367144209683083265&quot;}
+</code></pre>
+<p>在 Node.js 里看看前端实际拿到的是什么：</p>
+<pre><code class="language-bash">node -e '
+const body = &quot;{\&quot;id\&quot;: 367144209683083265, \&quot;idStr\&quot;: \&quot;367144209683083265\&quot;}&quot;;
+const o = JSON.parse(body);
+console.log(&quot;JSON.parse 数字:&quot;, o.id);
+console.log(&quot;字符串字段     :&quot;, o.idStr);
+console.log(&quot;安全整数上限   :&quot;, Number.MAX_SAFE_INTEGER, Number.isSafeInteger(o.id));
+console.log(&quot;用 BigInt 处理 :&quot;, (BigInt(o.idStr) &gt;&gt; 22n).toString(), &quot;&lt;- 右移 22 位得到时间戳偏移&quot;);
+'
+</code></pre>
+<pre><code class="language-text">JSON.parse 数字: 367144209683083260
+字符串字段     : 367144209683083265
+安全整数上限   : 9007199254740991 false
+用 BigInt 处理 : 87534000798 &lt;- 右移 22 位得到时间戳偏移
+</code></pre>
+<p><code>...265</code> 被存成了离它最近的双精度浮点数 <code>...264</code>（Python 输出），JavaScript 打印时又用「能唯一确定这个浮点数的最短十进制」显示，于是变成了 <code>...260</code>。无论哪种，都已经不是原来的 ID 了。</p>
+<h2 id="_17">工程实践与选型</h2>
+<h3 id="_18">怎么选</h3>
+<table>
+<thead>
+<tr>
+<th>场景</th>
+<th>推荐</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>数据库主键、订单号，要求趋势递增、性能高</td>
+<td><strong>雪花算法</strong>或<strong>号段模式</strong></td>
+</tr>
+<tr>
+<td>不想分配机器 ID、能接受 128 位</td>
+<td><strong>UUIDv7</strong></td>
+</tr>
+<tr>
+<td>请求号、Trace ID、文件名，不做主键</td>
+<td>UUIDv4 即可</td>
+</tr>
+<tr>
+<td>必须严格连续（如发票号、凭证号）</td>
+<td>数据库自增 / 号段，并在业务上处理「作废号」</td>
+</tr>
+<tr>
+<td>订单号不想暴露业务量和时间</td>
+<td>雪花 ID 再做一层可逆的混淆，或单独生成对外展示用的编号</td>
+</tr>
+</tbody>
+</table>
+<p>雪花算法和号段模式的取舍：</p>
+<ul>
+<li><strong>雪花算法</strong>：不依赖任何存储，本地生成；但要处理时钟回拨，要分配机器 ID，ID 中带有时间信息；</li>
+<li><strong>号段模式</strong>：不怕时钟回拨，ID 更短（从小数字开始）；但依赖数据库，ID 较连续，容易被推算。</li>
+</ul>
+<h3 id="_19">不要自己从零写</h3>
+<p>成熟的实现已经处理了各种边界情况：</p>
+<ul>
+<li><strong>Java 生态</strong>：MyBatis-Plus 的 <code>IdType.ASSIGN_ID</code> 默认就是雪花算法；Hutool 提供了 <code>IdUtil.getSnowflake(workerId, datacenterId)</code>；</li>
+<li><strong>独立发号服务</strong>：美团 Leaf（号段 + snowflake 两种模式）、百度 UidGenerator；</li>
+<li><strong>其他语言</strong>：Go 的 Sonyflake 等。</li>
+</ul>
+<p>使用时重点确认三件事：<strong>机器 ID 怎么来、时钟回拨怎么处理、起始时间设的是什么</strong>。</p>
+<h3 id="_20">常见的坑</h3>
+<ol>
+<li><strong>机器 ID 重复</strong>：两个实例配了同一个 workerId，同一毫秒就可能生成相同的 ID。上线前一定要确认分配机制；</li>
+<li><strong>起始时间改了</strong>：上线后修改 EPOCH，新 ID 可能与旧 ID 重复或变小。起始时间一旦确定，永远不要改；</li>
+<li><strong>前端精度</strong>：ID 返回给前端时一律用字符串，接口文档里写清楚；</li>
+<li><strong>用 ID 直接取模分片</strong>：低流量时序列号几乎都是 0，导致数据倾斜；应先哈希再取模；</li>
+<li><strong>把 ID 当作安全凭证</strong>：雪花 ID 可以被推算（知道时间和机器号，序列号又很小），不能当作访问令牌，鉴权要单独做；</li>
+<li><strong>ID 泄露信息</strong>：反解析能得到生成时间和机器号。如果这些信息敏感，对外展示时要另做处理。</li>
+</ol>
+<h2 id="_21">高频面试题速答</h2>
+<p><strong>Q：分库分表后为什么不能用数据库自增主键？</strong>
+每个库、每张表的自增计数器是独立的，会生成相同的 ID。合并数据、迁移扩容、对外提供订单号时都会冲突。</p>
+<p><strong>Q：为什么不直接用 UUID 做主键？</strong>
+UUIDv4 是无序的，作为 InnoDB 聚簇索引的主键会导致随机写入和频繁页分裂；36 个字符太长，所有二级索引都会跟着变大；不是数字，没法比较先后。</p>
+<p><strong>Q：雪花算法的结构是什么？</strong>
+64 位：1 位符号位（恒为 0）+ 41 位毫秒时间戳（约 69 年）+ 10 位机器 ID（1024 个节点）+ 12 位序列号（每毫秒 4096 个）。</p>
+<p><strong>Q：同一毫秒内序列号用完了怎么办？</strong>
+自旋等待到下一毫秒，序列号归 0 后继续生成。</p>
+<p><strong>Q：雪花算法 ID 是严格递增的吗？</strong>
+同一台机器上（时钟不回退时）是严格递增的；多台机器之间只是趋势递增。</p>
+<p><strong>Q：什么是时钟回拨？怎么处理？</strong>
+系统时间因 NTP 校时等原因往回跳，可能生成重复 ID。处理方式：记录上次时间戳，回拨幅度小就等待，幅度大就报错拒绝发号；也可以预留回拨位，或者使用不依赖系统时钟的逻辑时间。</p>
+<p><strong>Q：机器 ID 怎么分配？</strong>
+配置文件、ZooKeeper 顺序节点、数据库注册表、Redis 抢占、K8s StatefulSet 序号等。关键是保证同一时刻没有两个节点使用相同的机器 ID。</p>
+<p><strong>Q：号段模式和雪花算法怎么选？</strong>
+号段模式依赖数据库但不怕时钟回拨，ID 较短较连续；雪花算法完全本地生成，但依赖时钟和机器 ID 分配。需要防止被推算业务量时，号段模式要额外处理。</p>
+<p><strong>Q：雪花 ID 传给前端有什么问题？</strong>
+JavaScript 的 Number 只能精确表示 2^53 以内的整数，雪花 ID 超过这个范围会丢失精度。后端应该把 ID 序列化成字符串。</p>
+<h2 id="_22">总结</h2>
+<figure><img src="img/f-83.jpg" alt="四个关键点" loading="lazy"><figcaption>四个关键点</figcaption></figure>
+<ul>
+<li>分库分表后，自增主键只在单表内唯一，需要<strong>全局唯一、趋势递增、高性能、高可用、不易暴露业务量</strong>的分布式 ID；</li>
+<li><strong>UUID</strong> 简单但无序且长；<strong>数据库步长</strong>难扩容；<strong>号段模式</strong>批量领号，性能高、依赖弱；<strong>Redis INCR</strong> 有丢数据回退的风险；<strong>雪花算法</strong>本地生成、极快、趋势递增；</li>
+<li>雪花 ID 的 64 位 = <strong>1 位符号 + 41 位时间戳 + 10 位机器 ID + 12 位序列号</strong>，时间在最高位，所以趋势递增；</li>
+<li>同一毫秒靠<strong>序列号</strong>区分，用完就<strong>等下一毫秒</strong>；</li>
+<li>最大的风险是<strong>时钟回拨</strong>：小幅等待、大幅报错，配合回拨位、逻辑时间和运维预防；</li>
+<li>落地时要保证<strong>机器 ID 不重复</strong>，返回给前端时<strong>用字符串</strong>，避免超过 2^53 后丢精度。</li>
+</ul>
+<div class="refs">
+<h3 id="_23">参考资料</h3>
+<ul>
+<li>Twitter Engineering Blog：Announcing Snowflake（2010）；twitter-archive/snowflake 代码仓库.</li>
+<li>RFC 9562：Universally Unique IDentifiers (UUIDs)，2024（取代 RFC 4122，定义了 UUIDv7）.</li>
+<li>MySQL 8.0 Reference Manual：Clustered and Secondary Indexes；The Physical Structure of an InnoDB Index；Replication Source Configuration Options（auto_increment_increment、auto_increment_offset）.</li>
+<li>美团技术团队：Leaf——美团点评分布式 ID 生成系统（2017）；Meituan-Dianping/Leaf 代码仓库.</li>
+<li>baidu/uid-generator 代码仓库与文档.</li>
+<li>sony/sonyflake 代码仓库与文档.</li>
+<li>Redis 官方文档：INCR 命令；Redis persistence.</li>
+<li>ECMAScript Language Specification：The Number Type；MDN：Number.MAX_SAFE_INTEGER、BigInt.</li>
+<li>Jackson Databind 文档：ToStringSerializer.</li>
+<li>SQLite 文档：Clustered Indexes and the WITHOUT ROWID Optimization.</li>
+</ul>
+</div>
+  </article>
+  <div class="foot"><a href="../index.html">← 拾星首页</a><a href="landscape.html">▶ 看配套视频</a></div>
+</div>
+</body>
+</html>

@@ -1,0 +1,389 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>登录认证：Session、JWT 与 OAuth2 · 拾星</title>
+<style>
+  :root{--bg:#07080f;--fg:#f4ede4;--muted:#9a93a8;--acc:#fda4af}
+  html,body{margin:0;height:100%;background:var(--bg);color:var(--fg);
+    font-family:-apple-system,"PingFang SC","Noto Sans SC","Noto Sans CJK SC","Microsoft YaHei",sans-serif}
+  body{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;overflow:hidden}
+  #stage{display:block;background:#07080f;border-radius:12px;box-shadow:0 20px 60px rgba(0,0,0,.55);cursor:pointer}
+  #bar{display:flex;align-items:center;gap:12px;width:min(calc(100vw - 32px),640px)}
+  #btn{width:40px;height:40px;border-radius:50%;border:1px solid rgba(253,164,175,.5);background:transparent;
+    color:var(--acc);font-size:16px;cursor:pointer;flex:none}
+  #seek{flex:1;accent-color:var(--acc)}
+  #time{font-variant-numeric:tabular-nums;font-size:13px;color:var(--muted);min-width:84px;text-align:right}
+  body.render{display:block}
+  body.render #bar{display:none}
+  body.render #stage{border-radius:0;box-shadow:none}
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="bar">
+  <button id="btn" aria-label="播放/暂停">❚❚</button>
+  <input id="seek" type="range" min="0" max="84" step="0.01" value="0">
+  <span id="time">0:00 / 1:24</span>
+</div>
+<script>
+/* ============ 基础设置（横屏 1920×1080） ============ */
+const W = 1920, H = 1080, DUR = 84;
+const cv = document.getElementById('stage'), ctx = cv.getContext('2d');
+cv.width = W; cv.height = H;
+const FONT = '"PingFang SC","Noto Sans SC","Noto Sans CJK SC","Source Han Sans SC","Microsoft YaHei",sans-serif';
+const MONO = '"JetBrains Mono","SF Mono",Menlo,Consolas,"DejaVu Sans Mono","Noto Sans Mono CJK SC","PingFang SC","Microsoft YaHei",monospace';
+const C = {acc:'#fda4af', mint:'#6ee7c8', gold:'#ffd38a', coral:'#ff9e7a', rose:'#ff8a8a', blue:'#9cc3ff', text:'#f4ede4', muted:'#9a93a8', dim:'#4a4558', panel:'#0f0e1f'};
+
+const clamp = (x,a=0,b=1) => Math.max(a, Math.min(b, x));
+const lerp = (a,b,t) => a + (b-a)*t;
+const p = (t,a,b) => clamp((t-a)/(b-a));
+const eo = x => 1 - Math.pow(1-x, 3);
+const eio = x => x < .5 ? 4*x*x*x : 1 - Math.pow(-2*x+2, 3)/2;
+const eback = x => { const c1=1.70158, c3=c1+1; return 1 + c3*Math.pow(x-1,3) + c1*Math.pow(x-1,2); };
+function rnd(seed){ let s = seed>>>0; return () => { s = (s*1664525 + 1013904223)>>>0; return s/4294967296; }; }
+
+let SA = 1;
+const al = a => { ctx.globalAlpha = clamp(SA*a); };
+const sceneA = (t,a,b,f=.5) => Math.min(p(t,a,a+f), 1 - p(t,b-f,b));
+
+function txt(s, x, y, o = {}){
+  const {size=64, weight=700, color=C.text, alpha=1, align='center', glow=0, scale=1, font=FONT} = o;
+  if (alpha <= 0) return;
+  ctx.save(); al(alpha);
+  ctx.font = `${weight} ${size}px ${font}`;
+  ctx.textAlign = align; ctx.textBaseline = 'middle'; ctx.fillStyle = color;
+  if (glow){ ctx.shadowColor = color; ctx.shadowBlur = glow; }
+  if (scale !== 1){ ctx.translate(x, y); ctx.scale(scale, scale); ctx.fillText(s, 0, 0); }
+  else ctx.fillText(s, x, y);
+  ctx.restore();
+}
+function rise(s, x, y, t, t0, o = {}, d = .7){
+  const e = eo(p(t, t0, t0+d));
+  if (e <= 0) return;
+  txt(s, x, y + (1-e)*36, {...o, alpha:(o.alpha ?? 1)*e});
+}
+function rr(x,y,w,h,r){ ctx.beginPath(); ctx.roundRect(x,y,w,h,r); }
+function box(x, y, w, h, a, o = {}){
+  const {fill='rgba(255,255,255,.05)', stroke='rgba(253,164,175,.35)', lw=2, glow=0, r=18, dash=null} = o;
+  if (a <= 0) return;
+  ctx.save(); al(a); rr(x, y, w, h, r); ctx.fillStyle = fill; ctx.fill();
+  if (dash) ctx.setLineDash(dash);
+  ctx.strokeStyle = stroke; ctx.lineWidth = lw; if (glow){ ctx.shadowColor = stroke; ctx.shadowBlur = glow; } ctx.stroke(); ctx.restore();
+}
+function arrow(x1, y1, x2, y2, e, a, color = C.acc, lw = 3){
+  if (e <= 0 || a <= 0) return;
+  const x = lerp(x1, x2, e), y = lerp(y1, y2, e), ang = Math.atan2(y2 - y1, x2 - x1);
+  ctx.save(); al(a); ctx.strokeStyle = color; ctx.fillStyle = color; ctx.lineWidth = lw; ctx.lineCap = 'round';
+  ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x, y); ctx.stroke();
+  if (e > .85){ ctx.translate(x, y); ctx.rotate(ang); ctx.beginPath(); ctx.moveTo(4, 0); ctx.lineTo(-14, -9); ctx.lineTo(-14, 9); ctx.closePath(); ctx.fill(); }
+  ctx.restore();
+}
+function panel(x, y, w, h, title, a){
+  box(x, y, w, h, a, {fill:C.panel, stroke:'rgba(255,255,255,.1)', r:20});
+  if (a <= 0) return;
+  ctx.save(); al(a); ctx.strokeStyle = 'rgba(255,255,255,.07)'; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(x, y + 52); ctx.lineTo(x + w, y + 52); ctx.stroke();
+  ['#ff6b6b','#ffd166','#6ee7a0'].forEach((c, i) => { ctx.fillStyle = c; ctx.globalAlpha = clamp(SA*a*.8); ctx.beginPath(); ctx.arc(x + 30 + i*24, y + 26, 7, 0, 6.283); ctx.fill(); });
+  ctx.restore();
+  txt(title, x + w/2, y + 27, {size:22, weight:500, color:C.muted, font:MONO, alpha:a});
+}
+
+/* ============ 背景 ============ */
+const PARTS = (() => { const r = rnd(241); return Array.from({length:100}, () => ({
+  x:r()*W, y:r()*H, s:r()*2.2+.5, v:r()*12+4, ph:r()*6.283, c:r()<.25})); })();
+function background(t){
+  const g = ctx.createLinearGradient(0,0,W,H);
+  g.addColorStop(0,'#0a0916'); g.addColorStop(.55,'#110f24'); g.addColorStop(1,'#18122c');
+  ctx.globalAlpha = 1; ctx.fillStyle = g; ctx.fillRect(0,0,W,H);
+  const gx = W*.5 + Math.sin(t*.27)*140;
+  const rg = ctx.createRadialGradient(gx, H*.45, 0, gx, H*.45, 950);
+  rg.addColorStop(0,'rgba(253,164,175,0.09)'); rg.addColorStop(1,'rgba(253,164,175,0)');
+  ctx.fillStyle = rg; ctx.fillRect(0,0,W,H);
+  ctx.fillStyle = C.acc;
+  for (let x = 40; x < W; x += 80) for (let y = 40; y < H; y += 80){ ctx.globalAlpha = .06; ctx.fillRect(x, y, 2, 2); }
+  for (const q of PARTS){
+    const y = ((q.y - t*q.v) % H + H) % H, x = q.x + Math.sin(t*.35 + q.ph)*12;
+    ctx.globalAlpha = .2 + .3*(.5 + .5*Math.sin(t*1.2 + q.ph));
+    ctx.fillStyle = q.c ? C.acc : '#d8d0ff';
+    ctx.beginPath(); ctx.arc(x, y, q.s, 0, 6.283); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+}
+function vignette(){
+  const v = ctx.createRadialGradient(W/2, H/2, W*.28, W/2, H/2, W*.62);
+  v.addColorStop(0,'rgba(0,0,0,0)'); v.addColorStop(1,'rgba(0,0,0,.55)');
+  ctx.globalAlpha = 1; ctx.fillStyle = v; ctx.fillRect(0,0,W,H);
+}
+function codeLine(s, x, y, size, a, kw = /\b(public|class|static|void|new|return)\b/){
+  const parts = s.split(/("[^"]*"|\b(?:public|class|static|void|new|return|getstatic|ldc|invokevirtual)\b)/g);
+  ctx.save(); al(a); ctx.font = `500 ${size}px ${MONO}`; ctx.textBaseline = 'middle'; ctx.textAlign = 'left';
+  let xx = x;
+  for (const seg of parts){ if (!seg) continue;
+    ctx.fillStyle = seg.startsWith('"') ? C.mint : /^(public|class|static|void|new|return|getstatic|ldc|invokevirtual)$/.test(seg) ? C.acc : C.text;
+    ctx.fillText(seg, xx, y); xx += ctx.measureText(seg).width; }
+  ctx.restore();
+}
+
+function card(h, lines, x, y, w, hh, a, c = C.acc, o = {}){
+  const {hs=30, ls=22, lh=40, font=FONT, t0=null, t=0} = o;
+  box(x, y, w, hh, a, {fill:'rgba(253,164,175,.05)', stroke:c === C.acc ? 'rgba(253,164,175,.5)' : c, r:20});
+  txt(h, x + 30, y + 44, {size:hs, weight:900, color:c, align:'left', alpha:a});
+  lines.forEach((s, i) => { const e = t0 == null ? a : Math.min(a, eo(p(t, t0 + i*.4, t0 + i*.4 + .4)));
+    txt(s, x + 30, y + 96 + i*lh, {size:ls, weight:600, color:'#e6dbe2', align:'left', alpha:e, font}); });
+}
+function node(label, sub, x, y, a, c = C.text, w = 240){
+  box(x - w/2, y - 70, w, 140, a, {fill:'rgba(255,255,255,.05)', stroke:'rgba(255,255,255,.3)', r:22});
+  txt(label, x, y - (sub ? 14 : 0), {size:34, weight:900, color:c, alpha:a});
+  if (sub) txt(sub, x, y + 32, {size:20, weight:600, color:C.muted, alpha:a});
+}
+function packet(s, x, y, a, c, w = 260){
+  box(x - w/2, y - 30, w, 60, a, {fill:'rgba(20,16,36,.92)', stroke:c, r:14});
+  txt(s, x, y, {size:22, weight:700, font:MONO, color:c, alpha:a});
+}
+function chip(s, x, y, a, c = C.text, o = {}){
+  const {size=22, font=FONT, weight=700, pad=18} = o;
+  if (a <= 0) return;
+  ctx.save(); ctx.font = `${weight} ${size}px ${font}`; const w = ctx.measureText(s).width + pad*2; ctx.restore();
+  box(x - w/2, y - size*.95, w, size*1.9, a, {fill:'#151227', stroke:c === C.text ? 'rgba(255,255,255,.25)' : c, r:12});
+  txt(s, x, y, {size, weight, color:c, alpha:a, font});
+}
+function vline(x, y1, y2, a){
+  if (a <= 0) return;
+  ctx.save(); al(a); ctx.strokeStyle = 'rgba(255,255,255,.22)'; ctx.lineWidth = 3; ctx.setLineDash([8, 8]);
+  ctx.beginPath(); ctx.moveTo(x, y1); ctx.lineTo(x, y2); ctx.stroke(); ctx.restore();
+}
+
+/* ============ 场景 1 · 钩子：HTTP 无状态 (0–7s) ============ */
+function s1(t){
+  rise('登录成功了，下一个请求服务器却问：「你是谁？」', W/2, 120, t, .2, {size:52, weight:900});
+  const a = eo(p(t, .7, 1.2));
+  node('浏览器', '你', 280, 420, a); node('服务器', 'shop.com', 1640, 420, a);
+  const k1 = p(t, 1.1, 2.3);
+  ctx.save(); al(a*.6); ctx.strokeStyle = 'rgba(255,255,255,.3)'; ctx.setLineDash([10, 10]); ctx.lineWidth = 3; ctx.beginPath(); ctx.moveTo(410, 420); ctx.lineTo(1510, 420); ctx.stroke(); ctx.restore();
+  if (k1 > 0) packet('POST /login', lerp(560, 1340, eio(k1)), 340, clamp(k1*5), C.gold, 240);
+  const k2 = p(t, 2.3, 3.2);
+  if (k2 > 0) txt('✓ 登录成功', 1640, 300, {size:28, weight:900, color:C.mint, alpha:eo(k2)});
+  const k3 = p(t, 3.0, 4.1);
+  if (k3 > 0) packet('GET /orders', lerp(560, 1340, eio(k3)), 500, clamp(k3*5), C.text, 240);
+  const e = eo(p(t, 4.1, 4.5));
+  if (e > 0){ box(1490, 520, 300, 80, e, {fill:'rgba(253,164,175,.12)', stroke:C.acc, r:16, glow:14}); txt('你是谁？请先登录', 1640, 560, {size:26, weight:900, color:C.acc, alpha:e}); }
+  rise('HTTP 是无状态的：服务器默认不记得上一个请求', W/2, 700, t, 4.6, {size:34, weight:800, color:C.gold});
+  [['Cookie + Session', 5.3], ['Token / JWT', 5.7], ['OAuth2 / OIDC', 6.1]].forEach(([s, ts], i) =>
+    chip(s, 480 + i*480, 860, eo(p(t, ts, ts + .4)), C.acc, {size:34, weight:900, pad:30}));
+}
+
+/* ============ 场景 2 · Cookie (7–18s) ============ */
+function s2(t){
+  rise('Cookie：浏览器替你保管的「小纸条」', W/2, 90, t, 7.2, {size:54, weight:900});
+  const a = eo(p(t, 7.6, 8.1)), bx = 200, sx = 1000;
+  txt('浏览器', bx, 180, {size:32, weight:900, alpha:a}); txt('服务器', sx, 180, {size:32, weight:900, alpha:a});
+  vline(bx, 210, 720, a); vline(sx, 210, 720, a);
+  const msgs = [[8.2, 290, 1, 'POST /login', '账号 + 密码', C.text],
+                [9.4, 440, -1, '200 OK', 'Set-Cookie: sid=a1b2c3; HttpOnly', C.acc],
+                [11.0, 600, 1, 'GET /orders', 'Cookie: sid=a1b2c3', C.acc]];
+  msgs.forEach(([ts, y, d, h, sub, c]) => { const e = eo(p(t, ts, ts + .7)), ea = clamp(p(t, ts, ts + .3));
+    if (d > 0) arrow(bx + 12, y, sx - 12, y, e, ea, c, 3); else arrow(sx - 12, y, bx + 12, y, e, ea, c, 3);
+    txt(h, 600, y - 34, {size:28, weight:900, color:C.text, alpha:ea});
+    txt(sub, 600, y + 38, {size:23, weight:700, font:MONO, color:c, alpha:eo(p(t, ts + .4, ts + .8))}); });
+  txt('浏览器自动带上，不用你管', 600, 690, {size:22, weight:700, color:C.muted, alpha:eo(p(t, 11.8, 12.2))});
+  const c = eo(p(t, 12.4, 12.9));
+  card('Cookie 的规则', ['服务器用 Set-Cookie 下发，浏览器保存', '再访问同一站点时，浏览器自动携带', '按域名、路径隔离，单个约 4KB', '可设过期时间，不设则随浏览器会话结束'], 1120, 200, 700, 340, c, C.acc, {ls:23, lh:58, t0:12.8, t});
+  const k = eo(p(t, 14.6, 15.1));
+  box(200, 790, 1520, 170, k, {fill:'rgba(253,164,175,.08)', stroke:C.acc, r:24, glow:16});
+  txt('Cookie 只是「怎么带」；里面放什么，决定了方案', W/2, 845, {size:34, weight:900, color:C.acc, alpha:k});
+  txt('放一个编号 → Session        放一张自带信息的令牌 → Token', W/2, 910, {size:27, weight:700, alpha:eo(p(t, 15.4, 15.9))});
+}
+
+/* ============ 场景 3 · Session (18–30s) ============ */
+function s3(t){
+  rise('Session：用户状态存在服务端', W/2, 90, t, 18.2, {size:54, weight:900});
+  const a = eo(p(t, 18.6, 19.1));
+  node('浏览器', '', 230, 320, a, C.text, 220);
+  chip('Cookie: sid=a1b2c3', 230, 430, a, C.acc, {font:MONO, size:20});
+  arrow(350, 320, 560, 320, eo(p(t, 19.2, 19.7)), a, C.acc, 3);
+  node('服务器', '', 680, 320, eo(p(t, 19.3, 19.8)), C.text, 220);
+  arrow(800, 320, 1010, 320, eo(p(t, 20, 20.5)), eo(p(t, 20, 20.3)), C.acc, 3);
+  txt('按 sid 查', 905, 290, {size:20, weight:700, color:C.muted, alpha:eo(p(t, 20.2, 20.6))});
+  const b = eo(p(t, 20.2, 20.7));
+  panel(1030, 190, 790, 290, 'Session 存储（内存 / Redis）', b);
+  [['a1b2c3', '{ userId: 42, role: "user" }'], ['f9e8d7', '{ userId: 7, role: "admin" }'], ['c0ffee', '{ userId: 1024, cart: [...] }']].forEach(([k, v], i) => {
+    const e = eo(p(t, 20.6 + i*.25, 21 + i*.25)), y = 290 + i*58;
+    if (i === 0) box(1050, y - 25, 750, 50, eo(p(t, 21.6, 22)), {fill:'rgba(253,164,175,.14)', stroke:C.acc, r:10});
+    txt(k, 1070, y, {size:22, weight:800, font:MONO, color:C.acc, align:'left', alpha:e});
+    txt('→ ' + v, 1190, y, {size:22, weight:600, font:MONO, color:i ? C.muted : C.text, align:'left', alpha:e}); });
+  rise('浏览器只拿一个随机编号，用户数据全在服务器上', W/2, 540, t, 22.2, {size:30, weight:800, color:C.gold});
+  // 分布式问题
+  const d = eo(p(t, 23.6, 24.1));
+  box(120, 735, 220, 90, d, {fill:'rgba(255,255,255,.06)', stroke:'rgba(255,255,255,.35)', r:14}); txt('负载均衡', 230, 780, {size:26, weight:800, alpha:d});
+  ['A', 'B', 'C'].forEach((s, i) => { const y = 650 + i*130;
+    box(500, y - 45, 240, 90, d, {fill:'rgba(255,255,255,.06)', stroke:'rgba(255,255,255,.35)', r:14});
+    txt('实例 ' + s, 620, y - (i === 0 ? 12 : 0), {size:26, weight:800, alpha:d});
+    if (i === 0) txt('会话存在本机', 620, y + 22, {size:18, weight:600, color:C.muted, alpha:d}); });
+  arrow(345, 780, 492, 780, eo(p(t, 24.4, 24.9)), d, C.gold, 3);
+  const bad = eo(p(t, 25, 25.4))*(1 - p(t, 26.4, 26.8));
+  txt('✗ 请求打到 B：找不到会话 → 被踢回登录页', 780, 780, {size:26, weight:900, color:C.rose, align:'left', alpha:bad});
+  const r = eo(p(t, 26.6, 27.1));
+  [650, 780, 910].forEach((y, i) => arrow(745, y, 1000, 780 + (i - 1)*24, eo(p(t, 26.8, 27.3)), r, C.acc, 3));
+  box(1010, 730, 300, 100, r, {fill:'rgba(253,164,175,.14)', stroke:C.acc, r:16, glow:14});
+  txt('Redis', 1160, 765, {size:30, weight:900, color:C.acc, alpha:r}); txt('集中存放 Session', 1160, 805, {size:20, weight:700, color:C.muted, alpha:r});
+  [['✓ 任意实例都能查到会话', C.mint], ['✓ 退出登录：删掉记录，立即生效', C.mint], ['· 代价：每个请求都要查一次存储', C.muted]].forEach(([s, c], i) =>
+    txt(s, 1370, 690 + i*90, {size:25, weight:800, color:c, align:'left', alpha:eo(p(t, 27.6 + i*.5, 28 + i*.5))}));
+}
+
+/* ============ 场景 4 · JWT 结构 (30–42s) ============ */
+function s4(t){
+  rise('JWT：把信息写进令牌，再签个名', W/2, 90, t, 30.2, {size:54, weight:900});
+  const segs = [['eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9', C.gold], ['.', C.muted], ['eyJzdWIiOiI0MiIsInJvbGUiOiJ1c2Vy…', C.acc], ['.', C.muted], ['gubfjxdkEn2OVxanA7BO…', C.blue]];
+  const a = eo(p(t, 30.6, 31.1));
+  ctx.save(); ctx.font = `700 26px ${MONO}`; const ws = segs.map(([s]) => ctx.measureText(s).width); ctx.restore();
+  let x = W/2 - ws.reduce((u, v) => u + v, 0)/2; const mids = [];
+  segs.forEach(([s, c], i) => { txt(s, x, 190, {size:26, weight:700, font:MONO, color:c, align:'left', alpha:a}); mids.push(x + ws[i]/2); x += ws[i]; });
+  const cols = [['Header 头部', ['{ "alg": "HS256",', '  "typ": "JWT" }'], '用哪种算法签名', C.gold, 31.4],
+                ['Payload 载荷', ['{ "sub": "42",', '  "role": "user",', '  "exp": 1760000000 }'], '声明：用户是谁、何时过期', C.acc, 32.2],
+                ['Signature 签名', ['HMAC-SHA256(', '  header + "." + payload,', '  服务端密钥 )'], '只有服务器知道密钥', C.blue, 33.0]];
+  cols.forEach(([h, ls, note, c, ts], i) => { const e = eo(p(t, ts, ts + .5)), bx = 130 + i*570;
+    arrow(mids[i*2], 215, bx + 260, 268, e, e, c, 2);
+    box(bx, 275, 520, 330, e, {fill:'rgba(255,255,255,.04)', stroke:c, r:20});
+    txt(h, bx + 30, 320, {size:28, weight:900, color:c, align:'left', alpha:e});
+    ls.forEach((s, j) => txt(s, bx + 30, 385 + j*46, {size:22, weight:600, font:MONO, align:'left', alpha:e}));
+    txt(note, bx + 30, 565, {size:21, weight:700, color:C.muted, align:'left', alpha:e}); });
+  txt('三段各自 Base64URL 编码，用「.」连起来', W/2, 650, {size:24, weight:700, color:C.muted, alpha:eo(p(t, 34, 34.4))});
+  const b = eo(p(t, 35, 35.5));
+  box(120, 710, 820, 290, b, {fill:'rgba(255,211,138,.07)', stroke:C.gold, r:22});
+  txt('⚠ 签名 ≠ 加密', 160, 760, {size:32, weight:900, color:C.gold, align:'left', alpha:b});
+  txt('Header 和 Payload 只是编码，谁拿到都能解码', 160, 830, {size:24, weight:700, align:'left', alpha:eo(p(t, 35.6, 36))});
+  txt('→ 不要放密码、手机号等敏感信息', 160, 885, {size:24, weight:700, align:'left', alpha:eo(p(t, 36.1, 36.5))});
+  txt('签名只保证：内容没被改过、确实是服务器签发的', 160, 950, {size:22, weight:700, color:C.muted, align:'left', alpha:eo(p(t, 36.6, 37))});
+  const c = eo(p(t, 37.4, 37.9));
+  box(980, 710, 820, 290, c, {fill:'rgba(253,164,175,.07)', stroke:C.acc, r:22});
+  txt('篡改试试？', 1020, 760, {size:32, weight:900, color:C.acc, align:'left', alpha:c});
+  const k = p(t, 38.4, 39.2);
+  txt('"role": "' + (k > .5 ? 'admin' : 'user') + '"', 1020, 830, {size:26, weight:700, font:MONO, color:k > .5 ? C.rose : C.text, align:'left', alpha:c});
+  txt('payload 变了，签名却还是旧的', 1020, 885, {size:24, weight:700, align:'left', alpha:eo(p(t, 39.2, 39.6))});
+  txt('✗ 服务器重新计算签名，对不上 → 拒绝', 1020, 950, {size:24, weight:900, color:C.rose, align:'left', alpha:eo(p(t, 39.8, 40.2))});
+}
+
+/* ============ 场景 5 · 无状态与失效 (42–54s) ============ */
+function s5(t){
+  rise('无状态的好处，与它的代价', W/2, 90, t, 42.2, {size:54, weight:900});
+  card('Session', ['每个请求都查一次存储', '✓ 踢人下线：删掉记录，立即生效'], 120, 170, 820, 230, eo(p(t, 42.6, 43.1)), C.muted, {ls:24, lh:48});
+  card('JWT', ['只验签名和 exp，不查任何存储', '✓ 多实例、跨服务都能直接验证', '✗ 签发后收不回：到期前一直有效'], 980, 170, 820, 230, eo(p(t, 43.4, 43.9)), C.acc, {ls:24, lh:42, t0:43.8, t});
+  rise('用户改了密码、被封号，旧 token 还没过期，怎么办？', W/2, 470, t, 45.6, {size:32, weight:900, color:C.gold});
+  const a = eo(p(t, 46.6, 47.1));
+  box(120, 540, 1100, 470, a, {fill:'rgba(253,164,175,.05)', stroke:'rgba(253,164,175,.5)', r:22});
+  txt('方案一：短期 access token + refresh token', 160, 590, {size:30, weight:900, color:C.acc, align:'left', alpha:a});
+  const x0 = 160, x1 = 1180, ax = x0 + 20;
+  // 时间轴
+  ctx.save(); al(a); ctx.strokeStyle = 'rgba(255,255,255,.3)'; ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(x0, 790); ctx.lineTo(x1, 790); ctx.stroke(); ctx.restore();
+  txt('时间 →', x1, 815, {size:18, weight:600, color:C.muted, align:'right', alpha:a});
+  const n = 6, sw = (x1 - ax - 20)/n;
+  for (let i = 0; i < n; i++){ const e = eo(p(t, 47.4 + i*.3, 47.7 + i*.3));
+    box(ax + i*sw, 650, sw - 12, 44, e, {fill:'rgba(253,164,175,.22)', stroke:C.acc, r:8});
+    if (i === 0) txt('access 15 分钟', ax + sw/2 - 6, 672, {size:18, weight:800, color:C.text, alpha:e}); }
+  const rb = eo(p(t, 47.4, 49.2));
+  box(ax, 720, (x1 - ax - 32)*rb, 44, a, {fill:'rgba(255,211,138,.18)', stroke:C.gold, r:8});
+  txt('refresh token：较长，服务端可吊销', ax + 20, 742, {size:20, weight:800, color:C.gold, align:'left', alpha:eo(p(t, 48.6, 49))});
+  [['access token 很短：泄露或被封号，最多再撑几分钟', 50.0], ['过期后用 refresh token 换新的，此时服务端检查是否已吊销', 50.5], ['refresh token 每次用后轮换，旧的立即作废', 51.0]].forEach(([s, ts], i) =>
+    txt('· ' + s, 160, 860 + i*48, {size:23, weight:700, color:'#e6dbe2', align:'left', alpha:eo(p(t, ts, ts + .4))}));
+  const b = eo(p(t, 51.6, 52.1));
+  card('方案二：黑名单', ['登出时把 token 的 jti 写入 Redis', 'TTL = 剩余有效期', '验签后再查一次黑名单', '代价：又引入了状态', '常与短期 token 搭配使用'], 1260, 540, 540, 470, b, C.gold, {ls:23, lh:64, t0:52, t});
+}
+
+/* ============ 场景 6 · OAuth2 授权码 + PKCE (54–66s) ============ */
+function s6(t){
+  rise('OAuth2 授权码 + PKCE：第三方登录', W/2, 80, t, 54.2, {size:52, weight:900});
+  const a = eo(p(t, 54.5, 55)), X = [210, 720, 1230, 1710];
+  [['浏览器', '用户'], ['你的应用', '后端'], ['授权服务器', '第三方平台'], ['资源服务器', '平台 API']].forEach(([h, s], i) => {
+    box(X[i] - 140, 150, 280, 90, a, {fill:'rgba(255,255,255,.05)', stroke:i === 2 ? C.acc : 'rgba(255,255,255,.3)', r:16});
+    txt(h, X[i], 182, {size:28, weight:900, color:i === 2 ? C.acc : C.text, alpha:a}); txt(s, X[i], 218, {size:18, weight:600, color:C.muted, alpha:a});
+    vline(X[i], 245, 920, a*.8); });
+  const M = [[55.2, 300, 0, 1, '① 点击「用第三方账号登录」', C.text],
+             [56.4, 390, 0, 2, '② 跳转授权页：client_id · redirect_uri · scope · state · code_challenge', C.text],
+             [57.8, 480, 2, 2, '③ 用户在授权服务器登录，并同意授权范围（scope）', C.gold],
+             [59.0, 570, 2, 1, '④ 带着授权码 code 跳回 redirect_uri（经浏览器）', C.text],
+             [60.2, 660, 1, 2, '⑤ code + code_verifier（+ client_secret）换令牌', C.acc],
+             [61.4, 750, 2, 1, '⑥ access_token（可附 refresh_token）', C.acc],
+             [62.4, 840, 1, 3, '⑦ Authorization: Bearer <access_token>', C.mint]];
+  M.forEach(([ts, y, f, to, s, c]) => { const e = eo(p(t, ts, ts + .6)), ea = clamp(p(t, ts, ts + .3));
+    if (f !== to) arrow(X[f] + (to > f ? 10 : -10), y, X[to] + (to > f ? -10 : 10), y, e, ea, c, 3);
+    const mx = f === to ? X[f] : (X[f] + X[to])/2;
+    chip(s, mx, y - (f === to ? 0 : 34), eo(p(t, ts + .2, ts + .6)), c, {size:21, font:s.includes(':') && s.includes('Bearer') ? MONO : FONT}); });
+  [['✓ 应用全程拿不到用户密码', 63.3], ['✓ 授权码短期、只能用一次', 63.8], ['✓ PKCE：截获 code 也换不到令牌', 64.3]].forEach(([s, ts], i) =>
+    txt(s, 340 + i*620, 990, {size:25, weight:800, color:C.mint, alpha:eo(p(t, ts, ts + .4))}));
+}
+
+/* ============ 场景 7 · OIDC 与安全底线 (66–78s) ============ */
+function s7(t){
+  rise('OAuth2 vs OIDC，以及几条安全底线', W/2, 90, t, 66.2, {size:52, weight:900});
+  card('OAuth2：授权', ['「允许这个应用读取我的相册」', 'access_token：给资源服务器看的通行证', 'scope 限定它能做什么'], 120, 160, 820, 270, eo(p(t, 66.6, 67.1)), C.gold, {ls:24, lh:46});
+  card('OIDC：认证（建在 OAuth2 之上）', ['scope 里加上 openid', '额外返回 id_token（一个 JWT）', 'iss · sub · aud · exp：「是谁登录了」'], 980, 160, 820, 270, eo(p(t, 67.6, 68.1)), C.acc, {ls:24, lh:46});
+  rise('「用第三方账号登录」要的是身份，应当用 OIDC 的 id_token，而不是拿 access_token 当身份证明', W/2, 485, t, 68.8, {size:26, weight:800, color:C.gold});
+  const S = [['Cookie 属性', ['HttpOnly：JS 读不到', 'Secure：只走 HTTPS', 'SameSite：限制跨站携带', 'Domain / Path：作用范围']],
+             ['防 CSRF', ['冒用你的 Cookie 发请求', 'SameSite + CSRF Token', '校验 Origin / Referer', '改数据的操作不用 GET']],
+             ['防 XSS', ['注入脚本，偷走令牌', '输出转义 + CSP', '令牌别放 localStorage', '会话用 HttpOnly Cookie']],
+             ['密码与传输', ['bcrypt / argon2 慢哈希', '每个密码独立加盐', '全站 HTTPS', '登录接口限流防爆破']]];
+  S.forEach(([h, ls], i) => card(h, ls, 120 + i*430, 570, 400, 360, eo(p(t, 70 + i*.8, 70.5 + i*.8)), i === 3 ? C.mint : C.acc, {ls:22, lh:62, t0:70.3 + i*.8, t}));
+}
+
+/* ============ 场景 8 · 收尾 (78–84s) ============ */
+function s8(t){
+  [['Cookie', '浏览器自动携带'], ['Session', '状态存在服务端'], ['JWT', '签名防篡改、无状态'], ['OIDC', 'OAuth2 + 身份认证']].forEach(([a, b], i) => {
+    const st = 78.2 + i*.25, e = eback(p(t, st, st + .5)); if (e <= 0) return;
+    const x = 330 + i*420, y = 330;
+    ctx.save(); ctx.translate(x, y); ctx.scale(e, e); ctx.translate(-x, -y);
+    box(x - 185, y - 90, 370, 180, clamp(e), {fill:'rgba(253,164,175,.08)', stroke:'rgba(253,164,175,.5)', r:26}); ctx.restore();
+    txt(a, x, y - 22, {size:40, weight:900, color:C.acc, alpha:clamp(e)}); txt(b, x, y + 40, {size:24, weight:600, color:C.muted, alpha:clamp(e)});
+  });
+  rise('认证回答「你是谁」，授权回答「你能做什么」', W/2, 600, t, 79.2, {size:56, weight:900, glow:22});
+  rise('关注拾星，一起搞懂后端', W/2, 760, t, 80, {size:36, weight:500, color:C.muted});
+}
+/* ============ 总调度 ============ */
+const SCENES = [[s1,-1,7],[s2,7,18],[s3,18,30],[s4,30,42],[s5,42,54],[s6,54,66],[s7,66,78],[s8,78,84]];
+function draw(t){
+  t = clamp(t, 0, DUR);
+  ctx.save(); ctx.globalAlpha = 1; ctx.clearRect(0,0,W,H); background(t);
+  for (const [fn,a,b] of SCENES){
+    if (t < a || t > b) continue;
+    SA = sceneA(t, a, b, b === DUR ? .8 : .5);
+    if (SA > 0){ ctx.save(); fn(t); ctx.restore(); }
+  }
+  SA = 1; vignette();
+  const fo = p(t, DUR - .8, DUR);
+  if (fo > 0){ ctx.globalAlpha = fo; ctx.fillStyle = '#000'; ctx.fillRect(0,0,W,H); }
+  ctx.restore();
+}
+
+/* ============ 播放器 / 逐帧渲染接口 ============ */
+const isRender = new URLSearchParams(location.search).has('render');
+window.DURATION = DUR;
+window.renderFrame = t => draw(t);
+const btn = document.getElementById('btn'), seek = document.getElementById('seek'), timeEl = document.getElementById('time');
+const fmt = s => `${Math.floor(s/60)}:${String(Math.floor(s%60)).padStart(2,'0')}`;
+function fit(){
+  if (isRender){ cv.style.width = W+'px'; cv.style.height = H+'px'; return; }
+  const w = Math.min(innerWidth - 32, (innerHeight - 84)*16/9);
+  cv.style.width = w + 'px'; cv.style.height = w*9/16 + 'px';
+}
+addEventListener('resize', fit); fit();
+
+let cur = 0, playing = !isRender, last = null;
+function toggle(){ if (cur >= DUR) cur = 0; playing = !playing; }
+btn.onclick = toggle; cv.onclick = toggle;
+addEventListener('keydown', e => { if (e.code === 'Space'){ e.preventDefault(); toggle(); } });
+seek.oninput = () => { cur = +seek.value; draw(cur); };
+function loop(ts){
+  if (playing && last != null){ cur += (ts - last)/1000; if (cur >= DUR){ cur = DUR; playing = false; } }
+  last = ts; draw(cur);
+  seek.value = cur; timeEl.textContent = `${fmt(cur)} / ${fmt(DUR)}`;
+  btn.textContent = playing ? '❚❚' : (cur >= DUR ? '↺' : '▶');
+  requestAnimationFrame(loop);
+}
+document.fonts.ready.then(() => {
+  window.ready = true;
+  if (isRender) draw(0); else requestAnimationFrame(loop);
+});
+</script>
+</body>
+</html>

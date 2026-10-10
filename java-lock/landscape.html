@@ -1,0 +1,383 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Java 的锁：synchronized、CAS 与 AQS · 拾星</title>
+<style>
+  :root{--bg:#07080f;--fg:#f4ede4;--muted:#9a93a8;--acc:#f4a261}
+  html,body{margin:0;height:100%;background:var(--bg);color:var(--fg);
+    font-family:-apple-system,"PingFang SC","Noto Sans SC","Noto Sans CJK SC","Microsoft YaHei",sans-serif}
+  body{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;overflow:hidden}
+  #stage{display:block;background:#07080f;border-radius:12px;box-shadow:0 20px 60px rgba(0,0,0,.55);cursor:pointer}
+  #bar{display:flex;align-items:center;gap:12px;width:min(calc(100vw - 32px),640px)}
+  #btn{width:40px;height:40px;border-radius:50%;border:1px solid rgba(244,162,97,.5);background:transparent;
+    color:var(--acc);font-size:16px;cursor:pointer;flex:none}
+  #seek{flex:1;accent-color:var(--acc)}
+  #time{font-variant-numeric:tabular-nums;font-size:13px;color:var(--muted);min-width:84px;text-align:right}
+  body.render{display:block}
+  body.render #bar{display:none}
+  body.render #stage{border-radius:0;box-shadow:none}
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="bar">
+  <button id="btn" aria-label="播放/暂停">❚❚</button>
+  <input id="seek" type="range" min="0" max="84" step="0.01" value="0">
+  <span id="time">0:00 / 1:24</span>
+</div>
+<script>
+/* ============ 基础设置（横屏 1920×1080） ============ */
+const W = 1920, H = 1080, DUR = 84;
+const cv = document.getElementById('stage'), ctx = cv.getContext('2d');
+cv.width = W; cv.height = H;
+const FONT = '"PingFang SC","Noto Sans SC","Noto Sans CJK SC","Source Han Sans SC","Microsoft YaHei",sans-serif';
+const MONO = '"JetBrains Mono","SF Mono",Menlo,Consolas,"DejaVu Sans Mono","Noto Sans Mono CJK SC","PingFang SC","Microsoft YaHei",monospace';
+const C = {acc:'#f4a261', mint:'#6ee7c8', gold:'#ffd38a', coral:'#ff9e7a', rose:'#ff8a8a', blue:'#9cc3ff', text:'#f4ede4', muted:'#9a93a8', dim:'#4a4558', panel:'#0f0e1f'};
+
+const clamp = (x,a=0,b=1) => Math.max(a, Math.min(b, x));
+const lerp = (a,b,t) => a + (b-a)*t;
+const p = (t,a,b) => clamp((t-a)/(b-a));
+const eo = x => 1 - Math.pow(1-x, 3);
+const eio = x => x < .5 ? 4*x*x*x : 1 - Math.pow(-2*x+2, 3)/2;
+const eback = x => { const c1=1.70158, c3=c1+1; return 1 + c3*Math.pow(x-1,3) + c1*Math.pow(x-1,2); };
+function rnd(seed){ let s = seed>>>0; return () => { s = (s*1664525 + 1013904223)>>>0; return s/4294967296; }; }
+
+let SA = 1;
+const al = a => { ctx.globalAlpha = clamp(SA*a); };
+const sceneA = (t,a,b,f=.5) => Math.min(p(t,a,a+f), 1 - p(t,b-f,b));
+
+function txt(s, x, y, o = {}){
+  const {size=64, weight=700, color=C.text, alpha=1, align='center', glow=0, scale=1, font=FONT} = o;
+  if (alpha <= 0) return;
+  ctx.save(); al(alpha);
+  ctx.font = `${weight} ${size}px ${font}`;
+  ctx.textAlign = align; ctx.textBaseline = 'middle'; ctx.fillStyle = color;
+  if (glow){ ctx.shadowColor = color; ctx.shadowBlur = glow; }
+  if (scale !== 1){ ctx.translate(x, y); ctx.scale(scale, scale); ctx.fillText(s, 0, 0); }
+  else ctx.fillText(s, x, y);
+  ctx.restore();
+}
+function rise(s, x, y, t, t0, o = {}, d = .7){
+  const e = eo(p(t, t0, t0+d));
+  if (e <= 0) return;
+  txt(s, x, y + (1-e)*36, {...o, alpha:(o.alpha ?? 1)*e});
+}
+function rr(x,y,w,h,r){ ctx.beginPath(); ctx.roundRect(x,y,w,h,r); }
+function box(x, y, w, h, a, o = {}){
+  const {fill='rgba(255,255,255,.05)', stroke='rgba(244,162,97,.35)', lw=2, glow=0, r=18, dash=null} = o;
+  if (a <= 0) return;
+  ctx.save(); al(a); rr(x, y, w, h, r); ctx.fillStyle = fill; ctx.fill();
+  if (dash) ctx.setLineDash(dash);
+  ctx.strokeStyle = stroke; ctx.lineWidth = lw; if (glow){ ctx.shadowColor = stroke; ctx.shadowBlur = glow; } ctx.stroke(); ctx.restore();
+}
+function arrow(x1, y1, x2, y2, e, a, color = C.acc, lw = 3){
+  if (e <= 0 || a <= 0) return;
+  const x = lerp(x1, x2, e), y = lerp(y1, y2, e), ang = Math.atan2(y2 - y1, x2 - x1);
+  ctx.save(); al(a); ctx.strokeStyle = color; ctx.fillStyle = color; ctx.lineWidth = lw; ctx.lineCap = 'round';
+  ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x, y); ctx.stroke();
+  if (e > .85){ ctx.translate(x, y); ctx.rotate(ang); ctx.beginPath(); ctx.moveTo(4, 0); ctx.lineTo(-14, -9); ctx.lineTo(-14, 9); ctx.closePath(); ctx.fill(); }
+  ctx.restore();
+}
+function panel(x, y, w, h, title, a){
+  box(x, y, w, h, a, {fill:C.panel, stroke:'rgba(255,255,255,.1)', r:20});
+  if (a <= 0) return;
+  ctx.save(); al(a); ctx.strokeStyle = 'rgba(255,255,255,.07)'; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(x, y + 52); ctx.lineTo(x + w, y + 52); ctx.stroke();
+  ['#ff6b6b','#ffd166','#6ee7a0'].forEach((c, i) => { ctx.fillStyle = c; ctx.globalAlpha = clamp(SA*a*.8); ctx.beginPath(); ctx.arc(x + 30 + i*24, y + 26, 7, 0, 6.283); ctx.fill(); });
+  ctx.restore();
+  txt(title, x + w/2, y + 27, {size:22, weight:500, color:C.muted, font:MONO, alpha:a});
+}
+
+/* ============ 背景 ============ */
+const PARTS = (() => { const r = rnd(283); return Array.from({length:100}, () => ({
+  x:r()*W, y:r()*H, s:r()*2.2+.5, v:r()*12+4, ph:r()*6.283, c:r()<.25})); })();
+function background(t){
+  const g = ctx.createLinearGradient(0,0,W,H);
+  g.addColorStop(0,'#0a0916'); g.addColorStop(.55,'#110f24'); g.addColorStop(1,'#18122c');
+  ctx.globalAlpha = 1; ctx.fillStyle = g; ctx.fillRect(0,0,W,H);
+  const gx = W*.5 + Math.sin(t*.27)*140;
+  const rg = ctx.createRadialGradient(gx, H*.45, 0, gx, H*.45, 950);
+  rg.addColorStop(0,'rgba(244,162,97,0.09)'); rg.addColorStop(1,'rgba(244,162,97,0)');
+  ctx.fillStyle = rg; ctx.fillRect(0,0,W,H);
+  ctx.fillStyle = C.acc;
+  for (let x = 40; x < W; x += 80) for (let y = 40; y < H; y += 80){ ctx.globalAlpha = .06; ctx.fillRect(x, y, 2, 2); }
+  for (const q of PARTS){
+    const y = ((q.y - t*q.v) % H + H) % H, x = q.x + Math.sin(t*.35 + q.ph)*12;
+    ctx.globalAlpha = .2 + .3*(.5 + .5*Math.sin(t*1.2 + q.ph));
+    ctx.fillStyle = q.c ? C.acc : '#d8d0ff';
+    ctx.beginPath(); ctx.arc(x, y, q.s, 0, 6.283); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+}
+function vignette(){
+  const v = ctx.createRadialGradient(W/2, H/2, W*.28, W/2, H/2, W*.62);
+  v.addColorStop(0,'rgba(0,0,0,0)'); v.addColorStop(1,'rgba(0,0,0,.55)');
+  ctx.globalAlpha = 1; ctx.fillStyle = v; ctx.fillRect(0,0,W,H);
+}
+function codeLine(s, x, y, size, a, kw = /\b(public|class|static|void|new|return)\b/){
+  const parts = s.split(/("[^"]*"|\b(?:public|class|static|void|new|return|getstatic|ldc|invokevirtual)\b)/g);
+  ctx.save(); al(a); ctx.font = `500 ${size}px ${MONO}`; ctx.textBaseline = 'middle'; ctx.textAlign = 'left';
+  let xx = x;
+  for (const seg of parts){ if (!seg) continue;
+    ctx.fillStyle = seg.startsWith('"') ? C.mint : /^(public|class|static|void|new|return|getstatic|ldc|invokevirtual)$/.test(seg) ? C.acc : C.text;
+    ctx.fillText(seg, xx, y); xx += ctx.measureText(seg).width; }
+  ctx.restore();
+}
+
+function card(h, lines, x, y, w, hh, a, c = C.acc, o = {}){
+  const {hs=30, ls=22, lh=40} = o;
+  box(x, y, w, hh, a, {fill:'rgba(244,162,97,.05)', stroke:c === C.acc ? 'rgba(244,162,97,.5)' : c, r:20});
+  txt(h, x + 30, y + 44, {size:hs, weight:900, color:c, align:'left', alpha:a});
+  lines.forEach((s, i) => txt(s, x + 30, y + 96 + i*lh, {size:ls, weight:600, color:'#d9d2e4', align:'left', alpha:a}));
+}
+function pill(s, x, y, w, a, c = C.acc, fill = 'rgba(244,162,97,.12)', size = 24){
+  box(x - w/2, y - 30, w, 60, a, {fill, stroke:c, r:30});
+  txt(s, x, y, {size, weight:800, color:c, alpha:a});
+}
+function fmtN(n){ return Math.round(n).toString().replace(/\B(?=(\d{3})+(?!\d))/g, ','); }
+
+/* ============ 场景 1 · 钩子 (0–7s) ============ */
+function s1(t){
+  rise('4 个线程各执行 100 万次 count++，结果却不是 400 万', W/2, 120, t, .2, {size:50, weight:900});
+  ['线程 1', '线程 2', '线程 3', '线程 4'].forEach((s, i) => { const e = eo(p(t, .8 + i*.15, 1.2 + i*.15)), y = 300 + i*110;
+    pill(s, 330, y, 200, e);
+    arrow(440, y, 690, 450 + (i - 1.5)*40, eo(p(t, 1.2 + i*.15, 1.7 + i*.15)), e, 'rgba(244,162,97,.7)', 3); });
+  const a = eo(p(t, 1.4, 1.9));
+  box(720, 300, 900, 300, a, {fill:'rgba(255,255,255,.04)', stroke:'rgba(255,255,255,.25)', r:24});
+  txt('count =', 900, 400, {size:44, weight:800, color:C.muted, alpha:a});
+  const k = eio(p(t, 1.8, 3.6)), done = t >= 3.6;
+  txt(fmtN(3665104*k), 1290, 400, {size:76, weight:900, font:MONO, color:done ? C.rose : C.text, alpha:a, glow:done ? 16 : 0});
+  txt('期望 4,000,000', 1170, 520, {size:30, weight:800, color:C.mint, alpha:eo(p(t, 2.4, 2.8))});
+  txt('少了 334,896 次！', 1170, 660, {size:40, weight:900, color:C.rose, alpha:eo(p(t, 3.8, 4.2))});
+  txt('（本机某次实测，每次运行结果都不一样）', 1170, 720, {size:22, weight:600, color:C.muted, alpha:eo(p(t, 4.2, 4.6))});
+  rise('count++ 看起来是一步，其实是三步', W/2, 860, t, 5, {size:40, weight:900, color:C.gold});
+  rise('Java 靠什么让它变对？—— 锁', W/2, 950, t, 5.6, {size:32, weight:800, color:C.acc});
+}
+
+/* ============ 场景 2 · 竞态条件 (7–18s) ============ */
+function s2(t){
+  rise('竞态条件：读 → 改 → 写', W/2, 90, t, 7.2, {size:56, weight:900});
+  const a = eo(p(t, 7.6, 8.1));
+  panel(100, 180, 680, 420, 'count++ 编译后的字节码', a);
+  txt('count++;', 140, 280, {size:32, weight:700, font:MONO, align:'left', alpha:a});
+  txt('↓ javac', 140, 335, {size:22, weight:600, font:MONO, color:C.muted, align:'left', alpha:eo(p(t, 8.2, 8.6))});
+  [['getfield count', '读：把 count 读到栈上', C.blue], ['iconst_1 / iadd', '改：加 1', C.gold], ['putfield count', '写：写回对象', C.mint]].forEach(([c, d, col], i) => { const e = eo(p(t, 8.6 + i*.4, 9 + i*.4)), y = 400 + i*62;
+    txt(c, 140, y, {size:26, weight:700, font:MONO, color:col, align:'left', alpha:e}); txt(d, 470, y, {size:22, weight:700, color:C.muted, align:'left', alpha:e}); });
+  // 交错时序
+  const b = eo(p(t, 9.8, 10.3));
+  box(840, 180, 980, 420, b, {fill:'rgba(255,255,255,.03)', stroke:'rgba(255,255,255,.18)', r:24});
+  [['线程 A', 1020], ['线程 B', 1340], ['内存 count', 1650]].forEach(([s, x]) => txt(s, x, 230, {size:28, weight:900, color:s.startsWith('内存') ? C.acc : C.text, alpha:b}));
+  const rows = [['读到 5', '', '5'], ['', '读到 5', '5'], ['+1，写回 6', '', '6'], ['', '+1，写回 6', '6']];
+  rows.forEach(([ra, rb, m], i) => { const e = eo(p(t, 10.4 + i*.8, 10.8 + i*.8)), y = 310 + i*70, last = i === 3;
+    if (ra) txt(ra, 1020, y, {size:26, weight:700, alpha:e});
+    if (rb) txt(rb, 1340, y, {size:26, weight:700, color:last ? C.rose : C.text, alpha:e});
+    txt(m, 1650, y, {size:30, weight:900, font:MONO, color:last ? C.rose : C.acc, alpha:e}); });
+  txt('两次 ++，只加了 1：A 的更新被覆盖（丢失更新）', 1330, 565, {size:24, weight:800, color:C.rose, alpha:eo(p(t, 13.6, 14))});
+  const c = eo(p(t, 14.2, 14.7));
+  box(360, 650, 1200, 90, c, {fill:'rgba(244,162,97,.10)', stroke:C.acc, r:20, glow:14});
+  txt('解决：让「读-改-写」成为一个整体，一次只允许一个线程执行（互斥）', W/2, 695, {size:28, weight:900, color:C.acc, alpha:c});
+  [['synchronized', 'JVM 内置锁'], ['CAS', '硬件级原子操作'], ['AQS', 'JUC 锁的框架']].forEach(([h, d], i) => { const e = eo(p(t, 15 + i*.4, 15.4 + i*.4)), x = 480 + i*480;
+    box(x - 200, 790, 400, 140, e, {fill:'rgba(255,255,255,.05)', stroke:'rgba(244,162,97,.5)', r:20});
+    txt(h, x, 840, {size:34, weight:900, font:MONO, color:C.acc, alpha:e}); txt(d, x, 892, {size:22, weight:700, color:C.muted, alpha:e}); });
+  rise('本期的三位主角', W/2, 990, t, 16.4, {size:26, weight:700, color:C.muted});
+}
+
+/* ============ 场景 3 · synchronized (18–31s) ============ */
+function s3(t){
+  rise('synchronized：JVM 内置的锁', W/2, 90, t, 18.2, {size:54, weight:900});
+  const a = eo(p(t, 18.6, 19.1));
+  panel(100, 160, 820, 320, '两种写法', a);
+  codeLine('public synchronized void inc() { count++; }', 135, 250, 24, eo(p(t, 19, 19.4)));
+  txt('方法：锁 this（static 方法锁的是 Class 对象）', 135, 295, {size:22, weight:700, color:C.muted, align:'left', alpha:eo(p(t, 19.3, 19.7))});
+  codeLine('synchronized (lock) { count++; }', 135, 375, 24, eo(p(t, 19.8, 20.2)));
+  txt('代码块：锁括号里的对象，编译成 monitorenter / monitorexit', 135, 420, {size:22, weight:700, color:C.muted, align:'left', alpha:eo(p(t, 20.1, 20.5))});
+  // 对象头 → Monitor
+  const b = eo(p(t, 21, 21.5));
+  box(100, 560, 250, 170, b, {fill:'rgba(255,255,255,.05)', stroke:'rgba(255,255,255,.3)', r:18});
+  txt('lock 对象', 225, 610, {size:28, weight:900, alpha:b}); txt('对象头', 225, 660, {size:22, weight:700, color:C.muted, alpha:b}); txt('Mark Word', 225, 695, {size:22, weight:700, font:MONO, color:C.acc, alpha:b});
+  arrow(355, 645, 440, 645, eo(p(t, 21.5, 21.9)), b, C.acc, 3);
+  const m = eo(p(t, 21.8, 22.3));
+  box(450, 520, 470, 360, m, {fill:'rgba(244,162,97,.07)', stroke:C.acc, r:20});
+  txt('Monitor（监视器）', 685, 565, {size:28, weight:900, color:C.acc, alpha:m});
+  [['Owner', '线程 A（重入计数 2）', C.mint, 22.4], ['EntryList', '线程 B、C：等锁', C.rose, 22.9], ['WaitSet', '线程 D：调用了 wait()', C.blue, 23.4]].forEach(([k, v, col, ts], i) => { const e = eo(p(t, ts, ts + .4)), y = 640 + i*78;
+    txt(k, 480, y, {size:24, weight:800, font:MONO, color:col, align:'left', alpha:e}); txt(v, 630, y, {size:22, weight:700, align:'left', alpha:e}); });
+  rise('可重入：持锁线程再次进入，计数 +1，退出 -1，减到 0 才释放', 510, 930, t, 24, {size:24, weight:800, color:C.gold});
+  // 锁升级
+  const c = eo(p(t, 24.8, 25.3));
+  txt('锁的状态（HotSpot 的优化）', 1390, 190, {size:32, weight:900, color:C.acc, alpha:c});
+  const L = [['无锁', '没有线程持有', C.text, 25.2], ['偏向锁', 'JDK 15 起默认禁用，JDK 18 起移除', C.dim, 25.8], ['轻量级锁', '无竞争（交替加锁）：CAS 改对象头，不进内核', C.mint, 26.4], ['重量级锁', '出现竞争就膨胀为 Monitor：先自旋，再阻塞', C.rose, 27]];
+  L.forEach(([h, d, col, ts], i) => { const e = eo(p(t, ts, ts + .5)), y = 250 + i*150;
+    box(990, y, 800, 110, e, {fill:'rgba(255,255,255,.04)', stroke:i === 1 ? 'rgba(255,255,255,.15)' : col, r:16, dash:i === 1 ? [8, 8] : null});
+    txt(h, 1020, y + 55, {size:30, weight:900, color:i === 1 ? C.muted : col, align:'left', alpha:e});
+    txt(d, 1190, y + 55, {size:22, weight:700, color:i === 1 ? C.muted : C.text, align:'left', alpha:e});
+    if (i) arrow(1390, y - 36, 1390, y - 4, e, e, 'rgba(244,162,97,.6)', 3); });
+  rise('没竞争时几乎零成本，竞争激烈才变「重」', 1390, 880, t, 28.4, {size:28, weight:900, color:C.gold});
+}
+
+/* ============ 场景 4 · CAS (31–43s) ============ */
+function s4(t){
+  rise('CAS：比较并交换（Compare-And-Swap）', W/2, 90, t, 31.2, {size:52, weight:900});
+  rise('CPU 提供的原子指令（x86 上是 lock cmpxchg）：内存里还是旧值，才换成新值', W/2, 160, t, 31.6, {size:26, weight:700, color:C.muted});
+  const a = eo(p(t, 32.2, 32.7));
+  box(100, 220, 820, 470, a, {fill:'rgba(255,255,255,.03)', stroke:'rgba(255,255,255,.18)', r:24});
+  const v = t < 33.6 ? 5 : t < 36.4 ? 6 : 7;
+  txt('内存 count', 330, 290, {size:28, weight:800, color:C.muted, alpha:a});
+  box(510, 250, 160, 80, a, {fill:'rgba(244,162,97,.12)', stroke:C.acc, r:14});
+  txt(String(v), 590, 290, {size:44, weight:900, font:MONO, color:C.acc, alpha:a});
+  [['线程 A', 'CAS(期望 5 → 新值 6)', '✓ 成功', C.mint, 33.2], ['线程 B', 'CAS(期望 5 → 新值 6)', '✗ 失败', C.rose, 34.6], ['线程 B', '重新读到 6，CAS(6 → 7)', '✓ 成功', C.mint, 36]].forEach(([th, op, r, col, ts], i) => { const e = eo(p(t, ts, ts + .4)), y = 400 + i*80;
+    txt(th, 140, y, {size:26, weight:900, align:'left', alpha:e}); txt(op, 260, y, {size:24, weight:700, font:MONO, align:'left', alpha:e});
+    txt(r, 880, y, {size:26, weight:900, color:col, align:'right', alpha:eo(p(t, ts + .3, ts + .6))}); });
+  rise('失败了不阻塞，读最新值再试一次（自旋）', 510, 640, t, 37, {size:26, weight:800, color:C.gold});
+  const b = eo(p(t, 32.8, 33.3));
+  panel(980, 220, 840, 470, 'AtomicInteger.incrementAndGet() 的思路', b);
+  [['int old, next;', C.text], ['do {', C.text], ['    old  = value;          // 读', C.text], ['    next = old + 1;        // 改', C.text], ['} while (!CAS(value, old, next));', C.acc], ['                           // 写：失败就重来', C.muted]].forEach(([s, c], i) =>
+    txt(s, 1020, 320 + i*55, {size:23, weight:600, font:MONO, color:c, align:'left', alpha:eo(p(t, 33.2 + i*.2, 33.6 + i*.2))}));
+  card('ABA 问题', ['值从 A 改成 B 又改回 A，CAS 以为「没变过」', '解决：带版本号比较 → AtomicStampedReference'], 100, 740, 820, 220, eo(p(t, 38.4, 38.9)), C.rose);
+  card('竞争激烈时', ['大量线程反复失败、空转，白白消耗 CPU', 'LongAdder：分散到多个 Cell 各自累加，读取时求和'], 1000, 740, 820, 220, eo(p(t, 39.6, 40.1)), C.blue);
+}
+
+/* ============ 场景 5 · AQS (43–55s) ============ */
+function s5(t){
+  rise('AQS：JUC 里各种锁的地基', W/2, 90, t, 43.2, {size:54, weight:900});
+  rise('AbstractQueuedSynchronizer = 一个 volatile int state + 一个 FIFO 等待队列', W/2, 160, t, 43.6, {size:28, weight:700, color:C.muted});
+  const a = eo(p(t, 44, 44.5));
+  const owner = t < 44.8 ? '无' : t < 48.6 ? '线程 A' : t < 49.6 ? '无' : '线程 B', st = owner === '无' ? 0 : 1;
+  box(120, 240, 420, 260, a, {fill:'rgba(244,162,97,.08)', stroke:C.acc, r:22, glow:st ? 12 : 0});
+  txt('state', 330, 290, {size:28, weight:800, font:MONO, color:C.muted, alpha:a});
+  txt(String(st), 330, 365, {size:72, weight:900, font:MONO, color:st ? C.acc : C.mint, alpha:a});
+  txt('持有者：' + owner, 330, 450, {size:26, weight:800, alpha:a});
+  txt('等待队列（CLH 变体，双向链表）', 1060, 245, {size:26, weight:800, color:C.muted, alpha:eo(p(t, 45.6, 46))});
+  const sh = eo(p(t, 49.6, 50.1));
+  [['B', 45.8, 0], ['C', 46.6, 1], ['D', 47.3, 2]].forEach(([n, te, idx]) => {
+    const e = eo(p(t, te, te + .5)); if (e <= 0) return;
+    let x = 760 + (n === 'B' ? 0 : (idx - sh)*300) + (1 - e)*160, al2 = e;
+    if (n === 'B'){ const k = eio(p(t, 49.6, 50.3)); if (k >= 1) return; al2 = e*(1 - k); }
+    box(x - 120, 300, 240, 120, al2, {fill:'rgba(255,255,255,.06)', stroke:C.rose, r:18});
+    txt('线程 ' + n, x, 340, {size:28, weight:900, alpha:al2}); txt('park 挂起', x, 385, {size:20, weight:700, color:C.rose, alpha:al2});
+    if (idx > 0 && n !== 'B') arrow(x - 178 , 360, x - 124, 360, e, e*(1 - (idx === 1 ? 0 : 0)), 'rgba(255,255,255,.4)', 2); });
+  if (t > 45.8 && t < 49.6) arrow(548, 360, 636, 360, eo(p(t, 45.8, 46.3)), 1 - p(t, 49.4, 49.6), 'rgba(255,255,255,.4)', 2);
+  const log = [[44.8, 'A：CAS(state 0 → 1) 成功，拿到锁', C.mint], [45.8, 'B、C、D：CAS 失败 → 包装成节点入队 → park 挂起', C.rose], [48.6, 'A：release，state 置 0，unpark 队首的 B', C.gold], [49.6, 'B 醒来，重新 CAS 成功，出队成为持有者', C.mint]];
+  log.forEach(([ts, s, c], i) => txt(s, 140, 570 + i*52, {size:24, weight:800, color:c, align:'left', alpha:eo(p(t, ts, ts + .4))}));
+  card('独占模式', ['同一时刻只有一个线程持有', 'ReentrantLock', '读写锁的写锁'], 1040, 520, 370, 260, eo(p(t, 51, 51.5)), C.acc, {ls:21, lh:38});
+  card('共享模式', ['允许多个线程同时通过', 'Semaphore、CountDownLatch', '读写锁的读锁'], 1440, 520, 380, 260, eo(p(t, 51.6, 52.1)), C.blue, {ls:21, lh:38});
+  const c = eo(p(t, 52.6, 53.1));
+  box(120, 840, 1700, 130, c, {fill:'rgba(244,162,97,.08)', stroke:'rgba(244,162,97,.5)', r:20});
+  txt('写一个锁，只需重写 tryAcquire / tryRelease（共享模式是 …Shared）', W/2, 880, {size:28, weight:900, color:C.acc, alpha:c});
+  txt('排队、挂起、唤醒、超时、中断，全部由 AQS 处理', W/2, 930, {size:24, weight:700, color:C.text, alpha:eo(p(t, 53.2, 53.6))});
+}
+
+/* ============ 场景 6 · 基于 AQS 的工具 (55–67s) ============ */
+function s6(t){
+  rise('基于 AQS 的同步工具', W/2, 90, t, 55.2, {size:56, weight:900});
+  const a = eo(p(t, 55.6, 56.1));
+  box(100, 160, 1720, 330, a, {fill:'rgba(244,162,97,.05)', stroke:'rgba(244,162,97,.5)', r:22});
+  txt('ReentrantLock', 140, 210, {size:34, weight:900, font:MONO, color:C.acc, align:'left', alpha:a});
+  txt('state = 重入次数，0 表示没人持有', 480, 210, {size:24, weight:700, color:C.muted, align:'left', alpha:a});
+  [['公平 / 非公平', '默认非公平：新来的线程', '可以直接插队抢锁，吞吐更高'], ['可中断', 'lockInterruptibly()', '等锁时能响应中断'], ['超时', 'tryLock(1, SECONDS)', '等不到就放弃，避免死等'], ['多个条件', 'newCondition()', 'await / signal 精准唤醒']].forEach(([h, d1, d2], i) => {
+    const e = eo(p(t, 56.2 + i*.5, 56.7 + i*.5)), x = 130 + i*420;
+    box(x, 260, 400, 200, e, {fill:'rgba(255,255,255,.04)', stroke:'rgba(255,255,255,.2)', r:16});
+    txt(h, x + 200, 305, {size:28, weight:900, alpha:e});
+    txt(d1, x + 200, 365, {size:21, weight:700, font:i ? MONO : FONT, color:i ? C.acc : C.text, alpha:e});
+    txt(d2, x + 200, 410, {size:20, weight:600, color:C.muted, alpha:e}); });
+  // 三个工具
+  const T = [['Semaphore', 'state = 剩余许可数', ['acquire 减 1，为 0 就排队', '用途：限制并发数']], ['CountDownLatch', 'state = 计数', ['countDown 减 1，到 0 放行', '所有 await 的线程（一次性）']], ['ReentrantReadWriteLock', 'state 高 16 位读、低 16 位写', ['读读共享', '读写、写写互斥']]];
+  T.forEach(([h, s, ls], i) => { const e = eo(p(t, 58.8 + i*.8, 59.3 + i*.8)), x = 100 + i*580;
+    box(x, 540, 560, 320, e, {fill:'rgba(255,255,255,.04)', stroke:C.blue, r:20});
+    txt(h, x + 280, 590, {size:i === 2 ? 26 : 30, weight:900, font:MONO, color:C.blue, alpha:e});
+    txt(s, x + 280, 645, {size:22, weight:800, color:C.gold, alpha:e});
+    ls.forEach((l, j) => txt(l, x + 280, 715 + j*48, {size:22, weight:600, color:'#d9d2e4', alpha:e})); });
+  // CountDownLatch 小动画
+  const k = p(t, 61.6, 64.4), n = 3 - Math.min(3, Math.floor(k*3.999));
+  if (t > 61) { const e = eo(p(t, 61, 61.4)); [0, 1, 2].forEach(i => { const on = i < n;
+    ctx.save(); al(e); ctx.fillStyle = on ? C.gold : 'rgba(255,255,255,.15)'; ctx.beginPath(); ctx.arc(900 + i*40, 815, 12, 0, 6.283); ctx.fill(); ctx.restore(); });
+    txt(n ? 'await 中…' : '放行！', 1010, 815, {size:22, weight:800, color:n ? C.muted : C.mint, align:'left', alpha:e}); }
+  rise('同一个 AQS，state 的含义不同，就成了不同的工具', W/2, 940, t, 64.6, {size:30, weight:900, color:C.gold});
+}
+
+/* ============ 场景 7 · 选型与坑 (67–78s) ============ */
+function s7(t){
+  rise('怎么选？还有哪些坑', W/2, 90, t, 67.2, {size:56, weight:900});
+  const a = eo(p(t, 67.6, 68.1));
+  box(80, 160, 940, 500, a, {fill:'rgba(255,255,255,.03)', stroke:'rgba(255,255,255,.18)', r:22});
+  txt('synchronized', 490, 205, {size:26, weight:900, font:MONO, color:C.acc, alpha:a}); txt('ReentrantLock', 810, 205, {size:26, weight:900, font:MONO, color:C.blue, alpha:a});
+  [['实现', 'JVM 内置', 'Java 代码（AQS）'], ['释放', '自动，异常也会释放', 'finally 里手动 unlock'], ['公平锁', '不支持', '可选'], ['中断 / 超时', '不支持', '支持'], ['条件变量', '一个（wait / notify）', '多个 Condition'], ['推荐', '默认首选，简单不易错', '需要上面的功能时']].forEach(([k, v1, v2], i) => {
+    const e = eo(p(t, 68.2 + i*.35, 68.6 + i*.35)), y = 270 + i*64;
+    txt(k, 110, y, {size:22, weight:800, color:C.muted, align:'left', alpha:e}); txt(v1, 490, y, {size:22, weight:700, alpha:e}); txt(v2, 810, y, {size:22, weight:700, alpha:e}); });
+  // 死锁
+  const b = eo(p(t, 70.4, 70.9));
+  box(1060, 160, 780, 500, b, {fill:'rgba(255,138,138,.05)', stroke:C.rose, r:22});
+  txt('死锁', 1450, 205, {size:32, weight:900, color:C.rose, alpha:b});
+  pill('线程 1', 1200, 300, 170, b, C.text, 'rgba(255,255,255,.06)', 22); pill('线程 2', 1700, 300, 170, b, C.text, 'rgba(255,255,255,.06)', 22);
+  pill('锁 A', 1200, 440, 140, b, C.gold, 'rgba(255,211,138,.10)', 22); pill('锁 B', 1700, 440, 140, b, C.gold, 'rgba(255,211,138,.10)', 22);
+  arrow(1200, 410, 1200, 336, eo(p(t, 71, 71.4)), b, C.mint, 3); arrow(1700, 410, 1700, 336, eo(p(t, 71, 71.4)), b, C.mint, 3);
+  arrow(1290, 312, 1630, 428, eo(p(t, 71.4, 71.9)), b, C.rose, 3); arrow(1610, 312, 1270, 428, eo(p(t, 71.4, 71.9)), b, C.rose, 3);
+  txt('持有', 1160, 372, {size:20, weight:700, color:C.mint, align:'right', alpha:b}); txt('想要', 1450, 330, {size:20, weight:700, color:C.rose, alpha:eo(p(t, 71.6, 72))});
+  txt('四个条件：互斥 · 占有且等待 · 不可抢占 · 循环等待', 1450, 520, {size:22, weight:800, alpha:eo(p(t, 72.2, 72.6))});
+  txt('排查：jstack <pid> → Found one Java-level deadlock', 1450, 570, {size:20, weight:700, font:MONO, color:C.gold, alpha:eo(p(t, 72.8, 73.2))});
+  txt('预防：固定加锁顺序；tryLock 超时', 1450, 618, {size:22, weight:800, color:C.mint, alpha:eo(p(t, 73.2, 73.6))});
+  card('虚拟线程 × synchronized', ['JDK 21：在 synchronized 里阻塞会「钉住」载体线程（pinning）', 'JDK 24 起（JEP 491）已解决；之前的版本可改用 ReentrantLock'], 80, 710, 940, 220, eo(p(t, 74.2, 74.7)), C.blue, {ls:21});
+  card('通用原则', ['锁的范围尽量小，持锁时间尽量短', '读多写少用读写锁；简单计数用原子类'], 1060, 710, 780, 220, eo(p(t, 75.2, 75.7)), C.mint, {ls:21});
+}
+
+/* ============ 场景 8 · 收尾 (78–84s) ============ */
+function s8(t){
+  [['synchronized', '内置锁，按需升级'], ['CAS', '比较并交换，失败重试'], ['AQS', 'state + 等待队列'], ['ReentrantLock', '可中断、超时、公平']].forEach(([a, b], i) => {
+    const st = 78.2 + i*.25, e = eback(p(t, st, st + .5)); if (e <= 0) return;
+    const x = 330 + i*420, y = 330;
+    ctx.save(); ctx.translate(x, y); ctx.scale(e, e); ctx.translate(-x, -y);
+    box(x - 185, y - 90, 370, 180, clamp(e), {fill:'rgba(244,162,97,.08)', stroke:'rgba(244,162,97,.5)', r:26}); ctx.restore();
+    txt(a, x, y - 22, {size:a.length > 10 ? 32 : 40, weight:900, font:MONO, color:C.acc, alpha:clamp(e)}); txt(b, x, y + 40, {size:24, weight:600, color:C.muted, alpha:clamp(e)});
+  });
+  rise('锁的本质：让「读-改-写」不被打断', W/2, 600, t, 79.2, {size:60, weight:900, glow:22});
+  rise('关注拾星，一起搞懂后端', W/2, 760, t, 80, {size:36, weight:500, color:C.muted});
+}
+/* ============ 总调度 ============ */
+const SCENES = [[s1,-1,7],[s2,7,18],[s3,18,31],[s4,31,43],[s5,43,55],[s6,55,67],[s7,67,78],[s8,78,84]];
+function draw(t){
+  t = clamp(t, 0, DUR);
+  ctx.save(); ctx.globalAlpha = 1; ctx.clearRect(0,0,W,H); background(t);
+  for (const [fn,a,b] of SCENES){
+    if (t < a || t > b) continue;
+    SA = sceneA(t, a, b, b === DUR ? .8 : .5);
+    if (SA > 0){ ctx.save(); fn(t); ctx.restore(); }
+  }
+  SA = 1; vignette();
+  const fo = p(t, DUR - .8, DUR);
+  if (fo > 0){ ctx.globalAlpha = fo; ctx.fillStyle = '#000'; ctx.fillRect(0,0,W,H); }
+  ctx.restore();
+}
+
+/* ============ 播放器 / 逐帧渲染接口 ============ */
+const isRender = new URLSearchParams(location.search).has('render');
+window.DURATION = DUR;
+window.renderFrame = t => draw(t);
+const btn = document.getElementById('btn'), seek = document.getElementById('seek'), timeEl = document.getElementById('time');
+const fmt = s => `${Math.floor(s/60)}:${String(Math.floor(s%60)).padStart(2,'0')}`;
+function fit(){
+  if (isRender){ cv.style.width = W+'px'; cv.style.height = H+'px'; return; }
+  const w = Math.min(innerWidth - 32, (innerHeight - 84)*16/9);
+  cv.style.width = w + 'px'; cv.style.height = w*9/16 + 'px';
+}
+addEventListener('resize', fit); fit();
+
+let cur = 0, playing = !isRender, last = null;
+function toggle(){ if (cur >= DUR) cur = 0; playing = !playing; }
+btn.onclick = toggle; cv.onclick = toggle;
+addEventListener('keydown', e => { if (e.code === 'Space'){ e.preventDefault(); toggle(); } });
+seek.oninput = () => { cur = +seek.value; draw(cur); };
+function loop(ts){
+  if (playing && last != null){ cur += (ts - last)/1000; if (cur >= DUR){ cur = DUR; playing = false; } }
+  last = ts; draw(cur);
+  seek.value = cur; timeEl.textContent = `${fmt(cur)} / ${fmt(DUR)}`;
+  btn.textContent = playing ? '❚❚' : (cur >= DUR ? '↺' : '▶');
+  requestAnimationFrame(loop);
+}
+document.fonts.ready.then(() => {
+  window.ready = true;
+  if (isRender) draw(0); else requestAnimationFrame(loop);
+});
+</script>
+</body>
+</html>

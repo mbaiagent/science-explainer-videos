@@ -88,7 +88,12 @@ const VIDEOS = [
   {cat:'cs', title:"分布式锁", desc:"SET NX PX、Lua 释放、看门狗、Redlock 与 Fencing", path:'distributed-lock/landscape.html', dur:80, color:'#f59e0b'},
   {cat:'ai', title:"Transformer 详解", desc:"Q·K·V 自注意力、因果掩码、多头、FFN 与残差", path:'transformer/landscape.html', dur:84, color:'#f9a8d4'},
   {cat:'ai', title:"微调与 LoRA", desc:"什么时候该微调？全量微调为什么贵？LoRA 冻结原权重、只训练两个小矩阵，参数不到 1%", path:'fine-tuning-lora/landscape.html', dur:82, color:'#fcd34d'},
-  {cat:'cs', title:"HTTPS 加密全过程", desc:"对称与非对称加密、证书信任链、TLS 1.3 握手、ECDHE 密钥交换与前向保密，一次讲透小绿锁", path:'https-tls/landscape.html', dur:84, color:'#86efac'}
+  {cat:'cs', title:"HTTPS 加密全过程", desc:"对称与非对称加密、证书信任链、TLS 1.3 握手、ECDHE 密钥交换与前向保密，一次讲透小绿锁", path:'https-tls/landscape.html', dur:84, color:'#86efac'},
+  {cat:'cs', title:"Docker 容器原理", desc:"容器不是虚拟机，是被 Namespace 隔离、被 Cgroups 限制的普通进程；镜像分层与写时复制", path:'docker-container/landscape.html', dur:84, color:'#67e8f9'},
+  {cat:'cs', title:"登录认证：Session、JWT 与 OAuth2", desc:"HTTP 无状态，服务器怎么记住你？Cookie、Session、JWT、OAuth2 与 OIDC 一次讲清", path:'auth-session-jwt/landscape.html', dur:84, color:'#fda4af'},
+  {cat:'cs', title:"微服务：拆开之后的那些组件", desc:"从单体到微服务：注册发现、配置中心、API 网关、服务调用，以及怎么拆、何时不该拆", path:'microservices/landscape.html', dur:84, color:'#a5b4fc'},
+  {cat:'cs', title:"分布式 ID：雪花算法", desc:"分库分表后主键冲突怎么办？五种方案对比，雪花算法 64 位结构、时钟回拨与精度丢失", path:'snowflake-id/landscape.html', dur:84, color:'#bae6fd'},
+  {cat:'cs', title:"Java 的锁：synchronized、CAS 与 AQS", desc:"count++ 为什么会出错？synchronized、CAS、AQS 与 ReentrantLock，一次讲透 Java 并发的锁", path:'java-lock/landscape.html', dur:84, color:'#f4a261'}
 ];
 const fmt = s => `${Math.floor(s/60)}:${String(s%60).padStart(2,'0')}`;
 const esc = s => s.replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));

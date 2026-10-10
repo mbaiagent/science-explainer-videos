@@ -1,0 +1,927 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>微服务：拆开之后的那些组件 · 拾星</title>
+<meta name="description" content="单体的痛点与拆分的代价，注册与发现、配置中心、API 网关、服务调用与负载均衡逐个讲透，熔断、追踪、分布式事务等配套问题，以及怎么拆、什么时候不该拆，附可运行的 Python 注册中心模拟">
+<link rel="stylesheet" href="../assets/article.css">
+<style>:root{--acc:#a5b4fc}</style>
+</head>
+<body>
+<div class="wrap">
+  <nav class="top"><a href="../index.html">← 拾星 · 全部内容</a><a class="watch" href="landscape.html">▶ 看视频</a></nav>
+  <header class="hero">
+    <div class="tag">拾星 · 计算机与后端</div>
+    <h1>微服务：拆开之后的那些组件</h1>
+    <p>单体的痛点与拆分的代价，注册与发现、配置中心、API 网关、服务调用与负载均衡逐个讲透，熔断、追踪、分布式事务等配套问题，以及怎么拆、什么时候不该拆，附可运行的 Python 注册中心模拟</p>
+    <div class="meta">约 38 分钟读完 · 配套视频 1:24</div>
+  </header>
+  <nav class="toc">
+<ul>
+<li><a href="#_1">单体应用：一开始很好，后来很痛</a></li>
+<li><a href="#_2">拆成微服务：得到什么，付出什么</a></li>
+<li><a href="#_4">服务注册与发现：服务在哪儿？</a></li>
+<li><a href="#python">动手：用 Python 写一个迷你注册中心</a></li>
+<li><a href="#_8">配置中心：改配置，不用重新发布</a></li>
+<li><a href="#api">API 网关：所有请求的统一入口</a></li>
+<li><a href="#_17">服务之间怎么调用</a></li>
+<li><a href="#_21">拆开之后，还要面对这些问题</a></li>
+<li><a href="#_22">怎么拆，以及什么时候不该拆</a></li>
+<li><a href="#_26">高频面试题速答</a></li>
+<li><a href="#_27">总结</a></li>
+</ul>
+</nav>
+
+  <article>
+<figure><img src="img/f-6.5.jpg" alt="一个模块出问题，整个单体应用跟着挂掉" loading="lazy"><figcaption>一个模块出问题，整个单体应用跟着挂掉</figcaption></figure>
+<h2 id="_1">单体应用：一开始很好，后来很痛</h2>
+<p>几乎所有系统都是从<strong>单体应用</strong>（Monolith）起步的：用户、商品、订单、库存、支付、评论……所有功能写在一个代码库里，打成一个包（比如 <code>shop.jar</code>），跑在一个进程里，连同一个数据库。</p>
+<p>单体在早期其实非常好用：</p>
+<ul>
+<li><strong>开发简单</strong>：模块之间是函数调用，IDE 里一跳就到；</li>
+<li><strong>调试简单</strong>：一个进程，打个断点就能看完整条链路；</li>
+<li><strong>部署简单</strong>：一个包、一条命令；</li>
+<li><strong>事务简单</strong>：一个数据库，<code>@Transactional</code> 一加，要么都成功要么都失败。</li>
+</ul>
+<p>问题出在系统和团队<strong>变大以后</strong>：</p>
+<table>
+<thead>
+<tr>
+<th>痛点</th>
+<th>具体表现</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>发布慢、风险大</strong></td>
+<td>改一行评论模块的代码，也要整个应用重新构建、测试、发布；一次上线夹带几十个人的改动，出问题很难回滚</td>
+</tr>
+<tr>
+<td><strong>牵一发而动全身</strong></td>
+<td>评论模块内存泄漏，整个进程 OOM，下单、支付一起不可用</td>
+</tr>
+<tr>
+<td><strong>扩容不精准</strong></td>
+<td>大促时只有订单和库存压力大，却只能把整个应用复制多份，连没人用的模块也一起占资源</td>
+</tr>
+<tr>
+<td><strong>协作冲突</strong></td>
+<td>几十上百人改同一个代码库，合并冲突、互相等待、谁也不敢动公共代码</td>
+</tr>
+<tr>
+<td><strong>技术栈锁死</strong></td>
+<td>想给推荐模块换个语言或框架，几乎不可能</td>
+</tr>
+</tbody>
+</table>
+<p>于是人们开始把它<strong>拆开</strong>。</p>
+<h2 id="_2">拆成微服务：得到什么，付出什么</h2>
+<figure><img src="img/f-18.jpg" alt="单体与微服务的对比，以及拆分的代价" loading="lazy"><figcaption>单体与微服务的对比，以及拆分的代价</figcaption></figure>
+<p><strong>微服务</strong>（Microservices）是一种架构风格：把一个大应用按<strong>业务能力</strong>拆成一组小服务，每个服务：</p>
+<ul>
+<li>围绕一块业务（用户、订单、库存……），由一个小团队负责；</li>
+<li>有<strong>自己的代码库、自己的数据库</strong>；</li>
+<li>作为<strong>独立的进程</strong>运行，通过网络接口（HTTP、RPC、消息）和其他服务通信；</li>
+<li>可以<strong>独立开发、独立部署、独立扩容</strong>。</li>
+</ul>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>单体</th>
+<th>微服务</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>部署单位</td>
+<td>整个应用</td>
+<td>单个服务</td>
+</tr>
+<tr>
+<td>模块间通信</td>
+<td>进程内函数调用</td>
+<td>网络调用（HTTP / RPC / 消息）</td>
+</tr>
+<tr>
+<td>数据库</td>
+<td>一个共享数据库</td>
+<td>每个服务各自的数据库</td>
+</tr>
+<tr>
+<td>扩容</td>
+<td>整体复制</td>
+<td>哪个服务忙就扩哪个</td>
+</tr>
+<tr>
+<td>故障影响</td>
+<td>一个模块出错可能拖垮整个进程</td>
+<td>理论上可以隔离在单个服务内（需要熔断、隔离等手段配合）</td>
+</tr>
+<tr>
+<td>事务</td>
+<td>本地事务，简单</td>
+<td>跨服务一致性，复杂</td>
+</tr>
+<tr>
+<td>排查问题</td>
+<td>一个进程的日志和堆栈</td>
+<td>跨多个服务的日志、链路追踪</td>
+</tr>
+<tr>
+<td>运维</td>
+<td>一个应用</td>
+<td>几十上百个服务的部署、配置、监控</td>
+</tr>
+</tbody>
+</table>
+<h3 id="_3">代价：分布式系统的复杂度</h3>
+<p>拆分并没有让复杂度消失，而是<strong>换了个地方</strong>：</p>
+<ol>
+<li><strong>函数调用变成了网络调用</strong>。函数调用几乎不会失败、耗时纳秒级；网络调用会超时、会丢包、会因为对方宕机而失败，延迟是毫秒级。本地调一次的代码，现在要考虑超时、重试、幂等；</li>
+<li><strong>一个请求穿过多个服务</strong>。用户下单要经过网关 → 订单 → 库存 → 支付 → 优惠券……任何一个环节变慢或出错，都会影响整体，排查时要把多个服务的日志拼起来；</li>
+<li><strong>数据一致性变难</strong>。订单库和库存库是两个数据库，没法用一个本地事务保证「下单成功且扣减库存成功」（见本系列《CAP 与 BASE》）；</li>
+<li><strong>运维成本陡增</strong>。服务多了，部署、配置、监控、扩缩容都需要自动化工具支撑，这也是容器和 Kubernetes 流行的原因之一（见本系列《Docker》）。</li>
+</ol>
+<blockquote>
+<p>一句话：<strong>微服务把「代码的复杂度」换成了「分布式系统的复杂度」</strong>。下面登场的每一个组件，都是为了驯服这份新的复杂度。</p>
+</blockquote>
+<p>拆开之后，第一个冒出来的问题是：订单服务要调用库存服务，<strong>库存服务在哪儿？</strong></p>
+<h2 id="_4">服务注册与发现：服务在哪儿？</h2>
+<figure><img src="img/f-30.jpg" alt="注册、心跳、剔除、拉取与推送" loading="lazy"><figcaption>注册、心跳、剔除、拉取与推送</figcaption></figure>
+<h3 id="ip">为什么不能把 IP 写死</h3>
+<p>单体里调用库存模块是 <code>stockService.deduct()</code>，不需要知道地址。拆开以后，库存服务可能有 3 个实例：<code>10.0.0.11:8080</code>、<code>10.0.0.12:8080</code>、<code>10.0.0.13:8080</code>。如果把这些地址写在订单服务的配置文件里：</p>
+<ul>
+<li>大促<strong>扩容</strong>加了 2 台，订单服务不知道；</li>
+<li>某台机器<strong>宕机</strong>了，订单服务还在往上面发请求；</li>
+<li>容器每次<strong>重新部署</strong>，IP 都可能变化。</li>
+</ul>
+<p>需要一个「通讯录」，实时记录每个服务当前有哪些可用实例，这就是<strong>注册中心</strong>。</p>
+<h3 id="_5">完整流程</h3>
+<table>
+<thead>
+<tr>
+<th>步骤</th>
+<th>谁做</th>
+<th>做什么</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>① 注册</td>
+<td>服务提供者</td>
+<td>启动时把自己的服务名、IP、端口、元数据（版本、机房、权重等）登记到注册中心</td>
+</tr>
+<tr>
+<td>② 心跳</td>
+<td>服务提供者</td>
+<td>每隔几秒向注册中心报告「我还活着」</td>
+</tr>
+<tr>
+<td>③ 剔除</td>
+<td>注册中心</td>
+<td>一段时间收不到某个实例的心跳，就认为它挂了，从列表中删除</td>
+</tr>
+<tr>
+<td>④ 拉取 / 订阅</td>
+<td>服务调用者</td>
+<td>从注册中心拿到某个服务的实例列表，缓存在本地；定时拉取，或订阅变更推送</td>
+</tr>
+<tr>
+<td>⑤ 调用</td>
+<td>服务调用者</td>
+<td>从本地列表中按负载均衡策略选一个实例，<strong>直接</strong>发起调用</td>
+</tr>
+<tr>
+<td>⑥ 注销</td>
+<td>服务提供者</td>
+<td>正常停机时主动从注册中心下线，比等心跳超时快得多</td>
+</tr>
+</tbody>
+</table>
+<p>注意第 ⑤ 步：<strong>调用请求不经过注册中心</strong>。注册中心只是通讯录，就算它短暂不可用，调用方靠本地缓存的列表仍然能继续工作。</p>
+<h3 id="_6">心跳的两种方式</h3>
+<ul>
+<li><strong>客户端上报</strong>：实例主动定期发心跳，注册中心看「多久没收到」。Eureka 默认每 30 秒续约一次，90 秒没续约则过期；Nacos 1.x 的临时实例默认每 5 秒发一次心跳，15 秒没收到标记为不健康，30 秒没收到则删除（Nacos 2.x 改为通过 gRPC 长连接感知实例存活）；</li>
+<li><strong>服务端探测</strong>：注册中心（或 agent）主动去检查实例，比如 HTTP 健康检查接口、TCP 端口探测。Consul 的 health check、Kubernetes 的 readiness 探针都属于这一类。</li>
+</ul>
+<p>心跳超时的取值是一种权衡：设短了，网络抖动一下就把健康实例踢掉；设长了，实例真挂了之后要过好一阵调用方才知道。在这段「列表还没更新」的窗口里，调用方仍可能把请求发给已经宕机的实例，所以<strong>调用方自己也要有失败重试、快速失败的能力</strong>，不能完全依赖注册中心。</p>
+<h3 id="vs">客户端发现 vs 服务端发现</h3>
+<figure>
+<svg viewBox="0 0 440 360" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="客户端发现与服务端发现">
+  <rect width="440" height="360" fill="#0f0e1c"/>
+  <defs><marker id="ma" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#a5b4fc"/></marker>
+  <marker id="mg" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#ffd38a"/></marker></defs>
+  <g font-family="PingFang SC, Noto Sans SC, sans-serif" text-anchor="middle">
+    <text x="220" y="26" fill="#a5b4fc" font-size="17" font-weight="800">客户端发现：调用方自己挑实例</text>
+    <rect x="14" y="62" width="104" height="56" rx="12" fill="rgba(255,255,255,.06)" stroke="#9a93a8"/>
+    <text x="66" y="95" fill="#f4ede4" font-size="14" font-weight="700">订单服务</text>
+    <rect x="160" y="44" width="120" height="44" rx="12" fill="rgba(165,180,252,.14)" stroke="#a5b4fc"/>
+    <text x="220" y="71" fill="#a5b4fc" font-size="14" font-weight="800">注册中心</text>
+    <line x1="118" y1="76" x2="158" y2="68" stroke="#ffd38a" stroke-width="2" marker-end="url(#mg)"/>
+    <text x="134" y="56" fill="#ffd38a" font-size="11">①查列表</text>
+    <rect x="320" y="44" width="106" height="30" rx="8" fill="rgba(165,180,252,.10)" stroke="#a5b4fc"/>
+    <text x="373" y="64" fill="#f4ede4" font-size="12">库存 #1</text>
+    <rect x="320" y="82" width="106" height="30" rx="8" fill="rgba(165,180,252,.10)" stroke="#a5b4fc"/>
+    <text x="373" y="102" fill="#f4ede4" font-size="12">库存 #2</text>
+    <rect x="320" y="120" width="106" height="30" rx="8" fill="rgba(165,180,252,.10)" stroke="#a5b4fc"/>
+    <text x="373" y="140" fill="#f4ede4" font-size="12">库存 #3</text>
+    <path d="M118,100 C200,130 260,110 318,98" fill="none" stroke="#a5b4fc" stroke-width="2.5" marker-end="url(#ma)"/>
+    <text x="215" y="140" fill="#a5b4fc" font-size="11">②直接调用选中的实例</text>
+    <text x="220" y="168" fill="#9a93a8" font-size="11">Spring Cloud + Nacos/Eureka、Dubbo</text>
+    <line x1="14" y1="184" x2="426" y2="184" stroke="rgba(255,255,255,.12)" stroke-dasharray="6 6"/>
+    <text x="220" y="212" fill="#ffd38a" font-size="17" font-weight="800">服务端发现：交给中间层转发</text>
+    <rect x="14" y="246" width="104" height="56" rx="12" fill="rgba(255,255,255,.06)" stroke="#9a93a8"/>
+    <text x="66" y="279" fill="#f4ede4" font-size="14" font-weight="700">订单服务</text>
+    <rect x="160" y="246" width="120" height="56" rx="12" fill="rgba(255,211,138,.12)" stroke="#ffd38a"/>
+    <text x="220" y="270" fill="#ffd38a" font-size="13" font-weight="800">负载均衡器</text>
+    <text x="220" y="290" fill="#9a93a8" font-size="11">K8s Service / Nginx</text>
+    <line x1="118" y1="274" x2="158" y2="274" stroke="#ffd38a" stroke-width="2.5" marker-end="url(#mg)"/>
+    <rect x="320" y="228" width="106" height="30" rx="8" fill="rgba(165,180,252,.10)" stroke="#a5b4fc"/>
+    <text x="373" y="248" fill="#f4ede4" font-size="12">库存 #1</text>
+    <rect x="320" y="266" width="106" height="30" rx="8" fill="rgba(165,180,252,.10)" stroke="#a5b4fc"/>
+    <text x="373" y="286" fill="#f4ede4" font-size="12">库存 #2</text>
+    <rect x="320" y="304" width="106" height="30" rx="8" fill="rgba(165,180,252,.10)" stroke="#a5b4fc"/>
+    <text x="373" y="324" fill="#f4ede4" font-size="12">库存 #3</text>
+    <line x1="280" y1="266" x2="318" y2="244" stroke="#ffd38a" stroke-width="2" marker-end="url(#mg)"/>
+    <line x1="280" y1="276" x2="318" y2="280" stroke="#ffd38a" stroke-width="2" marker-end="url(#mg)"/>
+    <line x1="280" y1="286" x2="318" y2="316" stroke="#ffd38a" stroke-width="2" marker-end="url(#mg)"/>
+    <text x="66" y="330" fill="#9a93a8" font-size="11">调用方只认一个地址</text>
+  </g>
+</svg>
+<figcaption>客户端发现少一跳、更灵活，但每种语言都要有 SDK；服务端发现对调用方透明，但多了一个中间层</figcaption>
+</figure>
+
+<ul>
+<li><strong>客户端发现</strong>：调用方集成注册中心的 SDK，自己拉列表、自己做负载均衡。Spring Cloud + Nacos / Eureka、Dubbo 都是这种模式。少一跳网络，策略灵活；代价是每种语言都要有对应的客户端库；</li>
+<li><strong>服务端发现</strong>：调用方只访问一个固定地址（负载均衡器或 Kubernetes Service），由中间层查询实例并转发。调用方完全不用关心实例列表，跟语言无关；代价是多了一个转发环节。</li>
+</ul>
+<h3 id="_7">常见的注册中心</h3>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>一致性倾向</th>
+<th>健康检查</th>
+<th>特点</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Nacos</strong></td>
+<td>临时实例 AP（Distro 协议），持久实例 CP（Raft）</td>
+<td>客户端心跳 / 长连接；持久实例由服务端探测</td>
+<td>注册中心 + 配置中心二合一，国内 Spring Cloud Alibaba 生态常用</td>
+</tr>
+<tr>
+<td><strong>Eureka</strong></td>
+<td>AP</td>
+<td>客户端续约</td>
+<td>Spring Cloud Netflix 体系；有「自我保护」机制：短时间内大量实例续约失败时，宁可保留可能过期的实例也不批量剔除</td>
+</tr>
+<tr>
+<td><strong>Consul</strong></td>
+<td>CP（Raft）</td>
+<td>agent 执行的多种健康检查</td>
+<td>自带 KV 存储、DNS 接口、多数据中心支持</td>
+</tr>
+<tr>
+<td><strong>ZooKeeper</strong></td>
+<td>CP（ZAB）</td>
+<td>会话 + 临时节点</td>
+<td>实例注册为临时节点，会话断开自动删除；调用方 watch 节点变化。Dubbo 早期常用</td>
+</tr>
+<tr>
+<td><strong>etcd</strong></td>
+<td>CP（Raft）</td>
+<td>租约（lease）</td>
+<td>Kubernetes 自己的存储</td>
+</tr>
+<tr>
+<td><strong>Kubernetes Service</strong></td>
+<td>—</td>
+<td>readiness 探针</td>
+<td>Pod 就绪后自动进入 Service 的后端列表；通过 ClusterIP + 集群 DNS 访问</td>
+</tr>
+</tbody>
+</table>
+<p><strong>注册中心该选 AP 还是 CP？</strong> 注册中心的数据「稍微旧一点」通常问题不大（调用方有重试），但如果因为网络分区导致注册中心整体不可用、新实例无法注册、调用方拿不到列表，影响就大得多。所以业界普遍认为<strong>服务发现场景更适合 AP</strong>。CAP 的详细讨论见本系列《CAP 与 BASE》。</p>
+<h3 id="kubernetes">在 Kubernetes 里</h3>
+<p>如果服务都跑在 Kubernetes 上，很多时候不需要额外的注册中心：</p>
+<ul>
+<li>每个 Deployment 前面放一个 <strong>Service</strong>，它有一个稳定的虚拟 IP（ClusterIP）和 DNS 名字，比如 <code>stock-service.default.svc.cluster.local</code>；</li>
+<li>Pod 通过 readiness 探针后，会被加入 Service 的后端列表（EndpointSlice）；Pod 挂掉或未就绪时自动移除；</li>
+<li>调用方直接访问 <code>http://stock-service:8080</code>，由 kube-proxy（iptables / IPVS 规则）把请求转发到某个 Pod。</li>
+</ul>
+<p>这就是典型的「服务端发现」。代价是负载均衡策略比较简单，想做按权重、按版本的精细路由，往往要上服务网格（如 Istio）。</p>
+<h2 id="python">动手：用 Python 写一个迷你注册中心</h2>
+<p>下面这段程序只用 Python 标准库，模拟注册中心的核心逻辑：</p>
+<ul>
+<li><code>Registry</code>：保存实例列表，后台线程定期<strong>剔除心跳超时</strong>的实例；</li>
+<li><code>Provider</code>：真的起一个 HTTP 服务（随机端口），启动时<strong>注册</strong>，然后每 0.2 秒<strong>发心跳</strong>；可以模拟「突然宕机」（不注销、不再心跳）和「优雅下线」（主动注销）；</li>
+<li><code>Client</code>：启动时<strong>拉取</strong>列表缓存在本地，后台定期刷新，调用时<strong>轮询</strong>选实例，连接失败就换下一个。</li>
+</ul>
+<pre><code class="language-python">import itertools, threading, time, urllib.request
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
+
+HEARTBEAT = 0.2   # 提供者每 0.2 秒发一次心跳
+TTL = 0.6         # 超过 0.6 秒没收到心跳，就认为实例挂了
+REFRESH = 0.5     # 调用方每 0.5 秒从注册中心拉一次列表
+
+T0 = time.monotonic()
+def log(*a):
+    print(f&quot;[{time.monotonic() - T0:4.1f}s]&quot;, *a, flush=True)
+
+
+# ---------------- 注册中心 ----------------
+class Registry:
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._data = {}                      # 服务名 -&gt; {地址: (实例名, 最后心跳时间)}
+        threading.Thread(target=self._evict_loop, daemon=True).start()
+
+    def register(self, service, addr, name):
+        with self._lock:
+            self._data.setdefault(service, {})[addr] = (name, time.monotonic())
+        log(f&quot;注册中心：{name} 注册上线&quot;)
+
+    def heartbeat(self, service, addr):
+        with self._lock:
+            inst = self._data.get(service, {})
+            if addr in inst:
+                inst[addr] = (inst[addr][0], time.monotonic())
+
+    def deregister(self, service, addr):
+        with self._lock:
+            name, _ = self._data[service].pop(addr)
+        log(f&quot;注册中心：{name} 主动下线&quot;)
+
+    def instances(self, service):
+        with self._lock:
+            return sorted(((addr, name) for addr, (name, _) in self._data.get(service, {}).items()), key=lambda x: x[1])
+
+    def _evict_loop(self):                   # 后台线程：定期剔除心跳超时的实例
+        while True:
+            time.sleep(TTL / 3)
+            now = time.monotonic()
+            with self._lock:
+                for service, inst in self._data.items():
+                    for addr, (name, beat) in list(inst.items()):
+                        if now - beat &gt; TTL:
+                            del inst[addr]
+                            log(f&quot;注册中心：{name} 心跳超时 {now - beat:.1f}s，剔除&quot;)
+
+
+# ---------------- 服务提供者 ----------------
+class Provider:
+    def __init__(self, registry, service, name):
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                body = f&quot;{name} 扣减库存成功&quot;.encode()
+                self.send_response(200); self.send_header(&quot;Content-Length&quot;, str(len(body))); self.end_headers()
+                self.wfile.write(body)
+            def log_message(self, *args):
+                pass
+        self.registry, self.service, self.name = registry, service, name
+        self.httpd = ThreadingHTTPServer((&quot;127.0.0.1&quot;, 0), Handler)     # 端口 0：随机分配
+        self.addr = &quot;127.0.0.1:%d&quot; % self.httpd.server_address[1]
+        self._stop = threading.Event()
+        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+        registry.register(service, self.addr, name)                    # ① 启动时注册
+        threading.Thread(target=self._beat, daemon=True).start()       # ② 定时心跳
+
+    def _beat(self):
+        while not self._stop.wait(HEARTBEAT):
+            self.registry.heartbeat(self.service, self.addr)
+
+    def crash(self):                         # 进程被 kill -9：既不注销，也不再发心跳
+        self._stop.set(); self.httpd.shutdown(); self.httpd.server_close()
+        log(f&quot;!! {self.name} 突然宕机&quot;)
+
+    def shutdown(self):                      # 优雅下线：先注销，再关服务
+        self.registry.deregister(self.service, self.addr)
+        self._stop.set(); self.httpd.shutdown(); self.httpd.server_close()
+
+
+# ---------------- 服务调用方 ----------------
+class Client:
+    def __init__(self, registry, service):
+        self.registry, self.service = registry, service
+        self.cache = registry.instances(service)                       # ③ 拉取列表，缓存在本地
+        self.rr = itertools.count()
+        log(&quot;调用方：拿到实例列表&quot;, [n for _, n in self.cache])
+        threading.Thread(target=self._refresh, daemon=True).start()
+
+    def _refresh(self):
+        while True:
+            time.sleep(REFRESH)
+            new = self.registry.instances(self.service)
+            if new != self.cache:
+                self.cache = new
+                log(&quot;调用方：列表更新为&quot;, [n for _, n in new])
+
+    def call(self, path):
+        cache = self.cache
+        for _ in range(len(cache)):                                    # 最多把每个实例都试一遍
+            addr, name = cache[next(self.rr) % len(cache)]             # 轮询
+            try:
+                with urllib.request.urlopen(f&quot;http://{addr}{path}&quot;, timeout=0.5) as resp:
+                    return resp.read().decode()
+            except OSError:
+                log(f&quot;调用方：{name} 连接失败（本地列表还没更新），换下一个&quot;)
+        raise RuntimeError(&quot;没有可用的实例&quot;)
+
+
+if __name__ == &quot;__main__&quot;:
+    reg = Registry()
+    ps = [Provider(reg, &quot;stock-service&quot;, f&quot;stock-{i}&quot;) for i in (1, 2, 3)]
+    client = Client(reg, &quot;stock-service&quot;)
+
+    log(&quot;—— 轮询调用 6 次 ——&quot;)
+    for _ in range(6):
+        log(&quot;  &quot;, client.call(&quot;/deduct?id=42&quot;))
+
+    ps[2].crash()
+    log(&quot;—— 宕机后立刻调用 3 次 ——&quot;)
+    for _ in range(3):
+        log(&quot;  &quot;, client.call(&quot;/deduct?id=42&quot;))
+
+    time.sleep(1.2)                          # 等心跳超时被剔除、调用方刷新列表
+    log(&quot;—— 扩容：再启动一个实例 ——&quot;)
+    ps.append(Provider(reg, &quot;stock-service&quot;, &quot;stock-4&quot;))
+    time.sleep(0.6)
+    for _ in range(3):
+        log(&quot;  &quot;, client.call(&quot;/deduct?id=42&quot;))
+
+    log(&quot;—— 优雅下线 stock-1 ——&quot;)
+    ps[0].shutdown()
+    time.sleep(0.6)
+    for _ in range(2):
+        log(&quot;  &quot;, client.call(&quot;/deduct?id=42&quot;))
+</code></pre>
+<p>运行 <code>python3 registry_demo.py</code> 的真实输出（时间戳每次会有零点几秒的差异）：</p>
+<pre><code class="language-text">[ 0.0s] 注册中心：stock-1 注册上线
+[ 0.0s] 注册中心：stock-2 注册上线
+[ 0.0s] 注册中心：stock-3 注册上线
+[ 0.0s] 调用方：拿到实例列表 ['stock-1', 'stock-2', 'stock-3']
+[ 0.0s] —— 轮询调用 6 次 ——
+[ 0.0s]    stock-1 扣减库存成功
+[ 0.0s]    stock-2 扣减库存成功
+[ 0.0s]    stock-3 扣减库存成功
+[ 0.1s]    stock-1 扣减库存成功
+[ 0.1s]    stock-2 扣减库存成功
+[ 0.1s]    stock-3 扣减库存成功
+[ 0.6s] !! stock-3 突然宕机
+[ 0.6s] —— 宕机后立刻调用 3 次 ——
+[ 0.6s]    stock-1 扣减库存成功
+[ 0.6s]    stock-2 扣减库存成功
+[ 0.6s] 调用方：stock-3 连接失败（本地列表还没更新），换下一个
+[ 0.6s]    stock-1 扣减库存成功
+[ 0.8s] 注册中心：stock-3 心跳超时 0.8s，剔除
+[ 1.0s] 调用方：列表更新为 ['stock-1', 'stock-2']
+[ 1.8s] —— 扩容：再启动一个实例 ——
+[ 1.8s] 注册中心：stock-4 注册上线
+[ 2.0s] 调用方：列表更新为 ['stock-1', 'stock-2', 'stock-4']
+[ 2.4s]    stock-2 扣减库存成功
+[ 2.4s]    stock-4 扣减库存成功
+[ 2.4s]    stock-1 扣减库存成功
+[ 2.4s] —— 优雅下线 stock-1 ——
+[ 2.4s] 注册中心：stock-1 主动下线
+[ 2.5s] 调用方：列表更新为 ['stock-2', 'stock-4']
+[ 3.5s]    stock-4 扣减库存成功
+[ 3.5s]    stock-2 扣减库存成功
+</code></pre>
+<p>从输出里能读出几件真实系统里同样会发生的事：</p>
+<ol>
+<li><strong>宕机到被剔除之间有一个窗口</strong>：stock-3 在 0.6s 宕机，0.8s 才被注册中心剔除，1.0s 调用方才拿到新列表。这段时间里请求仍会打到 stock-3，靠调用方的「失败换下一个」兜住。真实系统的心跳间隔是秒级，这个窗口可能是十几秒到一分多钟；</li>
+<li><strong>扩容是自动生效的</strong>：stock-4 启动注册后，调用方下一次刷新就能看到它，订单服务的配置一行都不用改；</li>
+<li><strong>优雅下线比宕机好得多</strong>：stock-1 主动注销后立即从列表消失，不会有请求失败。所以生产环境发布时要先注销、等一会儿（让调用方刷新列表、处理完在途请求），再停进程。Kubernetes 里常用 <code>preStop</code> 钩子加一个短暂的 sleep 来做这件事。</li>
+</ol>
+<blockquote>
+<p>这只是教学模型：真实的注册中心还要处理集群部署与数据同步、推送而不是只靠拉取、命名空间与分组、权重与元数据、大规模实例下的性能等问题。</p>
+</blockquote>
+<h2 id="_8">配置中心：改配置，不用重新发布</h2>
+<figure><img src="img/f-41.jpg" alt="配置中心把一次修改推送到所有实例，并支持灰度" loading="lazy"><figcaption>配置中心把一次修改推送到所有实例，并支持灰度</figcaption></figure>
+<h3 id="_9">配置散落各处的问题</h3>
+<p>单体时代，配置写在 <code>application.yml</code> 里，跟着代码一起打包。拆成几十个服务、每个服务十几个实例后：</p>
+<ul>
+<li>改一个超时时间，要改配置文件、重新打包、重新发布所有实例；</li>
+<li>开发、测试、预发、生产四套环境，配置文件复制来复制去，很容易改漏；</li>
+<li>想临时关掉一个有问题的新功能，只能紧急发版；</li>
+<li>数据库密码明文写在代码仓库里。</li>
+</ul>
+<p><strong>配置中心</strong>把配置从代码里拿出来，集中管理，并在运行时推送给服务。</p>
+<h3 id="_10">核心能力</h3>
+<table>
+<thead>
+<tr>
+<th>能力</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>集中管理</strong></td>
+<td>所有服务的配置在一个地方查看和修改；按「环境 / 命名空间 / 分组 / 服务名」组织</td>
+</tr>
+<tr>
+<td><strong>动态刷新</strong></td>
+<td>修改后几秒内推送到所有实例，应用在不重启的情况下读到新值</td>
+</tr>
+<tr>
+<td><strong>灰度发布</strong></td>
+<td>新配置先推给部分实例（比如指定 IP 或按比例），观察没问题再全量</td>
+</tr>
+<tr>
+<td><strong>版本与回滚</strong></td>
+<td>每次修改都有历史版本、修改人、修改时间，出问题一键回滚</td>
+</tr>
+<tr>
+<td><strong>权限与审计</strong></td>
+<td>谁能改生产配置、改了什么，都有记录</td>
+</tr>
+<tr>
+<td><strong>本地容灾</strong></td>
+<td>客户端把配置缓存在本地文件，配置中心挂了，服务仍能用上次的配置启动</td>
+</tr>
+</tbody>
+</table>
+<h3 id="_11">配置是怎么「推」下去的</h3>
+<p>大多数配置中心并不是真的由服务端主动连接每个实例，而是让客户端<strong>长轮询</strong>或维持<strong>长连接</strong>：</p>
+<ol>
+<li>客户端发起请求：「我当前的配置版本是 v12，有变化告诉我」；</li>
+<li>服务端如果没有变化，就<strong>先不返回</strong>，挂起这个请求一段时间（比如几十秒）；</li>
+<li>期间配置被修改，服务端立刻返回「有变化」；客户端再去拉取新配置；</li>
+<li>挂起超时也没变化，就返回空结果，客户端马上再发起下一次长轮询。</li>
+</ol>
+<p>这样既有接近实时的推送效果，又不需要服务端维护到每个实例的反向连接。Apollo 使用 HTTP 长轮询；Nacos 1.x 用长轮询，2.x 改成了 gRPC 长连接。</p>
+<h3 id="_12">动态刷新的「参考写法」</h3>
+<p>以 Spring Cloud Alibaba + Nacos 为例（需要运行中的 Nacos 服务，本文没有在本机运行，属于<strong>参考写法</strong>，具体属性以所用版本的文档为准）：</p>
+<pre><code class="language-yaml"># application.yml（参考写法）
+spring:
+  application:
+    name: order-service
+  config:
+    import: nacos:order-service.yaml?refreshEnabled=true
+  cloud:
+    nacos:
+      server-addr: nacos.internal:8848
+      config:
+        namespace: prod
+</code></pre>
+<pre><code class="language-java">// 参考写法：@RefreshScope 让 Bean 在配置变更后重新创建，拿到新值
+@RefreshScope
+@RestController
+public class CheckoutController {
+
+    @Value(&quot;${feature.new-checkout:false}&quot;)
+    private boolean newCheckout;
+
+    @PostMapping(&quot;/checkout&quot;)
+    public String checkout() {
+        return newCheckout ? newFlow() : oldFlow();
+    }
+}
+</code></pre>
+<p>也可以用 <code>@ConfigurationProperties</code> 绑定一组配置，Spring Cloud 在收到刷新事件后会重新绑定。</p>
+<h3 id="_13">用好配置中心的注意事项</h3>
+<ul>
+<li><strong>配置也是代码</strong>：改生产配置和发版一样危险，同样需要审批、灰度、回滚预案。很多线上事故就是一次「只改了个配置」；</li>
+<li><strong>区分静态与动态</strong>：数据库连接池大小、线程池核心数这类配置，改了值未必能在运行时生效，要确认组件是否支持热更新；</li>
+<li><strong>敏感信息加密</strong>：密码、密钥不要明文存放，使用配置中心的加密功能或专门的密钥管理服务；</li>
+<li><strong>功能开关</strong>（Feature Flag）是配置中心最常见的用途之一：新功能代码先上线但默认关闭，再通过配置逐步打开，出问题立刻关掉。</li>
+</ul>
+<p>常见的配置中心：<strong>Nacos</strong>、<strong>Apollo</strong>、<strong>Spring Cloud Config</strong>（基于 Git 存储）、<strong>Consul KV</strong>、<strong>etcd</strong>。Kubernetes 里的 <strong>ConfigMap / Secret</strong> 也承担了一部分配置管理的工作，但灰度、审计等能力较弱。</p>
+<h2 id="api">API 网关：所有请求的统一入口</h2>
+<figure><img src="img/f-52.jpg" alt="API 网关负责鉴权、限流和路由" loading="lazy"><figcaption>API 网关负责鉴权、限流和路由</figcaption></figure>
+<h3 id="_14">没有网关会怎样</h3>
+<p>拆成几十个服务以后，如果让 App、Web、小程序直接调用各个服务：</p>
+<ul>
+<li>客户端要知道每个服务的地址，服务一调整，客户端就得发版；</li>
+<li>每个服务都要自己实现登录校验、限流、跨域、日志……大量重复代码，还容易有遗漏；</li>
+<li>内部服务直接暴露在公网上，安全风险大。</li>
+</ul>
+<p><strong>API 网关</strong>是挡在所有服务前面的一层：外部请求只访问网关，由网关完成通用处理，再转发给对应的服务。</p>
+<h3 id="_15">网关做什么</h3>
+<table>
+<thead>
+<tr>
+<th>功能</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>路由转发</strong></td>
+<td>按路径、域名、请求头等规则，把 <code>/api/order/**</code> 转给订单服务、<code>/api/user/**</code> 转给用户服务</td>
+</tr>
+<tr>
+<td><strong>身份鉴权</strong></td>
+<td>统一校验 Token / Cookie，没登录直接返回 401，后端服务只需信任网关传下来的用户身份</td>
+</tr>
+<tr>
+<td><strong>限流熔断</strong></td>
+<td>按接口、用户、IP 限制请求速率，保护后端（见本系列《限流算法》）</td>
+</tr>
+<tr>
+<td><strong>协议转换</strong></td>
+<td>对外提供 HTTP/JSON，对内转成 gRPC 或 Dubbo 调用</td>
+</tr>
+<tr>
+<td><strong>灰度路由</strong></td>
+<td>按用户、比例、请求头把一部分流量导到新版本服务</td>
+</tr>
+<tr>
+<td><strong>日志监控</strong></td>
+<td>统一记录访问日志、耗时、错误率，生成 TraceId 传给下游</td>
+</tr>
+<tr>
+<td><strong>跨域、HTTPS 卸载、请求改写</strong></td>
+<td>这些「横切」逻辑在网关做一次即可</td>
+</tr>
+</tbody>
+</table>
+<h3 id="nginx">网关和 Nginx 是什么关系</h3>
+<p>两者都能做反向代理和负载均衡，区别在于侧重点：</p>
+<ul>
+<li><strong>Nginx</strong>：高性能的通用反向代理，配置以静态文件为主，适合做流量入口、TLS 卸载、静态资源；</li>
+<li><strong>业务网关</strong>（Spring Cloud Gateway、Kong、APISIX 等）：和注册中心集成（路由到 <code>lb://order-service</code> 这样的服务名，而不是写死 IP），支持动态路由、插件化的鉴权和限流，更贴近业务。Kong 和 APISIX 本身就基于 Nginx / OpenResty 构建。</li>
+</ul>
+<p>常见的部署是两层：最外层 Nginx 或云厂商的负载均衡器（负责 TLS、抗流量），后面是业务网关（负责鉴权、路由），再后面是各个服务。</p>
+<h3 id="spring-cloud-gateway">Spring Cloud Gateway 路由的参考写法</h3>
+<pre><code class="language-yaml"># 参考写法：需要注册中心和后端服务，本文没有在本机运行
+spring:
+  cloud:
+    gateway:
+      routes:
+        - id: order
+          uri: lb://order-service        # lb:// 表示从注册中心找实例，并做负载均衡
+          predicates:
+            - Path=/api/order/**
+          filters:
+            - StripPrefix=1              # 转发时去掉 /api 前缀
+        - id: user
+          uri: lb://user-service
+          predicates:
+            - Path=/api/user/**
+          filters:
+            - StripPrefix=1
+</code></pre>
+<p>Spring Cloud Gateway 较新的版本对配置前缀做了调整，以所用版本的文档为准。</p>
+<h3 id="_16">网关的注意事项</h3>
+<ul>
+<li><strong>网关不能成为单点</strong>：网关自身必须多实例部署，前面再放负载均衡器；</li>
+<li><strong>网关里不要写业务逻辑</strong>：它应该保持「薄」，只做通用的横切处理。业务逻辑塞进网关，所有团队都得改它，又回到了单体的老路；</li>
+<li><strong>注意性能</strong>：所有流量都经过网关，网关多一毫秒，所有接口都多一毫秒。主流网关都采用异步非阻塞模型；</li>
+<li><strong>BFF</strong>（Backend for Frontend）：不同客户端（App、Web）需要的数据形态差别很大时，可以在网关后面为每类客户端做一个聚合层，把多个服务的数据组装好再返回。</li>
+</ul>
+<h2 id="_17">服务之间怎么调用</h2>
+<figure><img src="img/f-64.jpg" alt="HTTP 与 RPC 两种调用方式，以及轮询负载均衡" loading="lazy"><figcaption>HTTP 与 RPC 两种调用方式，以及轮询负载均衡</figcaption></figure>
+<h3 id="http-rest-rpc">HTTP / REST 与 RPC</h3>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>HTTP / REST</th>
+<th>RPC（gRPC、Dubbo 等）</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>调用形式</td>
+<td><code>POST /stock/deduct</code> + JSON</td>
+<td><code>stockClient.deduct(42, 1)</code>，像调用本地方法</td>
+</tr>
+<tr>
+<td>序列化</td>
+<td>文本（JSON），可读性好</td>
+<td>通常是二进制（Protobuf、Hessian 等），体积小、解析快</td>
+</tr>
+<tr>
+<td>接口约定</td>
+<td>文档 / OpenAPI，约束较松</td>
+<td>IDL（如 <code>.proto</code> 文件）或 Java 接口，强类型，自动生成代码</td>
+</tr>
+<tr>
+<td>跨语言</td>
+<td>天然通用</td>
+<td>gRPC 跨语言好；Dubbo 以 Java 为主</td>
+</tr>
+<tr>
+<td>调试</td>
+<td>curl、浏览器就能调</td>
+<td>需要专门的工具</td>
+</tr>
+<tr>
+<td>典型场景</td>
+<td>对外开放接口、异构系统、团队间约定</td>
+<td>内部高频调用、对性能要求高</td>
+</tr>
+</tbody>
+</table>
+<p>gRPC 基于 HTTP/2，支持多路复用和双向流。对大多数业务来说，两者的性能差异不是瓶颈，选择更多取决于团队技术栈和生态。</p>
+<p>Spring Cloud 里常用 <strong>OpenFeign</strong> 把 HTTP 调用写成接口的形式（参考写法）：</p>
+<pre><code class="language-java">// 参考写法：声明一个接口，Feign 在运行时生成实现；&quot;stock-service&quot; 通过注册中心解析
+@FeignClient(name = &quot;stock-service&quot;)
+public interface StockClient {
+    @PostMapping(&quot;/stock/deduct&quot;)
+    DeductResult deduct(@RequestParam(&quot;skuId&quot;) long skuId, @RequestParam(&quot;count&quot;) int count);
+}
+</code></pre>
+<p>另一种通信方式是<strong>异步消息</strong>：订单服务发出「订单已创建」事件，库存、积分、通知服务各自订阅处理，彼此不直接依赖（见本系列《消息队列》）。适合不需要立即拿到结果的场景。</p>
+<h3 id="_18">负载均衡：这次请求交给哪个实例</h3>
+<p>调用方从注册中心拿到 3 个库存服务实例，每次调用选哪一个？</p>
+<table>
+<thead>
+<tr>
+<th>策略</th>
+<th>做法</th>
+<th>适合</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>轮询</strong></td>
+<td>1 → 2 → 3 → 1 → …</td>
+<td>实例配置相同，最常用的默认策略</td>
+</tr>
+<tr>
+<td><strong>加权轮询</strong></td>
+<td>按权重分配，权重 2 的实例拿到 2 倍请求</td>
+<td>机器配置不同；新实例预热时先给小权重</td>
+</tr>
+<tr>
+<td><strong>随机 / 加权随机</strong></td>
+<td>随机选，请求量大时接近均匀</td>
+<td>实现简单，无需共享状态</td>
+</tr>
+<tr>
+<td><strong>最少连接 / 最短响应时间</strong></td>
+<td>选当前正在处理请求最少（或最快）的实例</td>
+<td>请求耗时差异大</td>
+</tr>
+<tr>
+<td><strong>一致性哈希</strong></td>
+<td>按用户 ID 等参数哈希，同一个参数总落到同一个实例</td>
+<td>需要利用本地缓存、会话粘滞的场景</td>
+</tr>
+</tbody>
+</table>
+<p>加权轮询有个细节：如果把权重为 5 的实例 A 简单地重复 5 次，请求顺序会是 <code>A A A A A B C</code>，A 在短时间内连续承受 5 个请求。Nginx 使用的<strong>平滑加权轮询</strong>算法能把它们打散：</p>
+<pre><code class="language-python"># 平滑加权轮询（Nginx 使用的算法）
+def smooth_wrr(weights, n):
+    current = {k: 0 for k in weights}
+    total = sum(weights.values())
+    for _ in range(n):
+        for k, w in weights.items():          # 1. 每个实例的当前值 += 自己的权重
+            current[k] += w
+        best = max(current, key=current.get)  # 2. 选当前值最大的
+        current[best] -= total                # 3. 被选中的减去总权重
+        yield best
+
+print(&quot; &quot;.join(smooth_wrr({&quot;A&quot;: 5, &quot;B&quot;: 1, &quot;C&quot;: 1}, 7)))
+print(&quot; &quot;.join(smooth_wrr({&quot;A&quot;: 3, &quot;B&quot;: 2, &quot;C&quot;: 1}, 12)))
+
+# 对比：朴素加权轮询（把 A 重复 5 次放进列表）
+seq = [&quot;A&quot;] * 5 + [&quot;B&quot;, &quot;C&quot;]
+print(&quot; &quot;.join(seq))
+</code></pre>
+<p>输出：</p>
+<pre><code class="language-text">A A B A C A A
+A B A C B A A B A C B A
+A A A A A B C
+</code></pre>
+<p>每一轮 7 次里 A 仍然被选中 5 次，比例完全符合权重，但 B、C 被均匀地穿插在中间。</p>
+<h3 id="_19">客户端负载均衡与服务端负载均衡</h3>
+<ul>
+<li><strong>客户端负载均衡</strong>：调用方自己从实例列表里挑。Spring Cloud LoadBalancer（取代了早期的 Ribbon）、Dubbo 内置的负载均衡都是这种；</li>
+<li><strong>服务端负载均衡</strong>：请求先到 Nginx、云负载均衡器或 Kubernetes Service，由它们转发。</li>
+</ul>
+<h3 id="_20">每一次远程调用都要考虑的事</h3>
+<ul>
+<li><strong>设置超时</strong>：不设超时的远程调用，在下游卡住时会一直占着线程，这是雪崩的起点；</li>
+<li><strong>谨慎重试</strong>：只对幂等操作重试，并限制次数、加退避，否则会放大故障；</li>
+<li><strong>保证幂等</strong>：重试和网络抖动都可能导致同一个请求被执行两次，扣库存、支付这类接口要用请求 ID 等方式去重。</li>
+</ul>
+<p>这些话题在本系列《熔断与降级》里有详细展开。</p>
+<h2 id="_21">拆开之后，还要面对这些问题</h2>
+<figure><img src="img/f-77.jpg" alt="熔断、限流、链路追踪、分布式事务与拆分原则" loading="lazy"><figcaption>熔断、限流、链路追踪、分布式事务与拆分原则</figcaption></figure>
+<p>前面四个组件解决的是「找得到、改得动、进得来、调得通」。服务一多，还有一批配套问题：</p>
+<table>
+<thead>
+<tr>
+<th>问题</th>
+<th>解决思路</th>
+<th>常见方案</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>一个服务慢，拖垮一串</strong></td>
+<td>超时、熔断、降级、隔离</td>
+<td>Sentinel、Resilience4j（见本系列《熔断与降级》）</td>
+</tr>
+<tr>
+<td><strong>流量超出承受能力</strong></td>
+<td>限流，主动拒绝一部分请求</td>
+<td>网关限流、Sentinel（见本系列《限流算法》）</td>
+</tr>
+<tr>
+<td><strong>一个请求跨十几个服务，慢在哪？</strong></td>
+<td><strong>链路追踪</strong>：入口生成 TraceId，随调用一路传递，每个服务记录自己这一段（Span）的耗时</td>
+<td>OpenTelemetry、SkyWalking、Zipkin、Jaeger</td>
+</tr>
+<tr>
+<td><strong>日志分散在几百个实例上</strong></td>
+<td>集中采集日志，按 TraceId 检索</td>
+<td>ELK / EFK、Loki</td>
+</tr>
+<tr>
+<td><strong>跨服务的数据一致性</strong></td>
+<td>大多数场景接受最终一致：本地消息表、事务消息、Saga；少数场景用 TCC、Seata AT 等分布式事务框架</td>
+<td>Seata、RocketMQ 事务消息（见本系列《CAP 与 BASE》《消息队列》）</td>
+</tr>
+<tr>
+<td><strong>服务太多，治理逻辑侵入代码</strong></td>
+<td><strong>服务网格</strong>：把重试、熔断、mTLS、流量路由下沉到每个 Pod 旁边的代理（sidecar）</td>
+<td>Istio、Linkerd</td>
+</tr>
+</tbody>
+</table>
+<p>可以看到，微服务真正的门槛不是「把代码拆开」，而是<strong>这一整套基础设施</strong>：自动化部署、注册发现、配置中心、网关、监控告警、链路追踪、日志平台……少了其中几样，微服务就会比单体更难维护。</p>
+<h2 id="_22">怎么拆，以及什么时候不该拆</h2>
+<h3 id="_23">拆分原则</h3>
+<ol>
+<li><strong>按业务边界拆，而不是按技术分层拆</strong>。不要拆成「Controller 服务」「DAO 服务」，而是拆成用户、订单、库存这样的业务能力。领域驱动设计（DDD）里的<strong>限界上下文</strong>（Bounded Context）是常用的划分工具：同一个词在不同上下文里含义不同（「商品」在商品目录里是描述和图片，在库存里是数量和仓库），这种边界往往就是服务的边界；</li>
+<li><strong>高内聚、低耦合</strong>：经常一起改的东西放在一个服务里。如果每个需求都要同时改三个服务、协调三个团队一起发布，说明边界划错了；</li>
+<li><strong>数据库各自独立</strong>：每个服务只访问自己的数据库，要用别人的数据就调用对方的接口或订阅对方的事件。多个服务共享同一个库，表结构一改大家一起崩，等于没拆；</li>
+<li><strong>别拆太细</strong>：服务的大小应该和团队匹配，而不是越小越好。一个请求要串行调用十几个服务时，延迟和失败概率都会叠加：假设每个服务的可用性是 99.9%，串行经过 10 个服务，整体可用性约为 0.999¹⁰ ≈ 99.0%；</li>
+<li><strong>渐进式拆分</strong>：从单体中先剥离边界最清楚、变化最频繁或压力最大的模块。新功能放到新服务里，旧功能逐步迁移，在网关上逐步把流量切过去（这种做法常被称为「绞杀者模式」）。</li>
+</ol>
+<h3 id="_24">常见的反模式</h3>
+<ul>
+<li><strong>分布式单体</strong>：拆成了很多服务，但它们必须一起发布、共享数据库、同步调用一长串——同时承担了单体和微服务两边的缺点；</li>
+<li><strong>为了微服务而微服务</strong>：三个人的团队维护二十个服务，大部分时间花在运维和联调上；</li>
+<li><strong>没有基础设施就开拆</strong>：没有自动化部署、没有监控和链路追踪，一出问题完全不知道从哪里查。</li>
+</ul>
+<h3 id="_25">什么时候不该上微服务</h3>
+<ul>
+<li>团队规模小（比如一个团队就能维护整个系统）；</li>
+<li>业务还在早期、快速试错，业务边界本身还不清楚，过早拆分以后改边界的代价很高；</li>
+<li>没有自动化部署、监控告警、链路追踪等基础设施，也没有人力去建；</li>
+<li>系统的性能瓶颈其实在数据库或某个算法上，拆服务解决不了。</li>
+</ul>
+<p>更好的起点往往是<strong>模块化单体</strong>：仍然是一个部署单元，但代码按业务严格分模块，模块之间只通过明确的接口调用，各模块使用各自的表。等团队和业务长大、边界被验证清楚了，再把模块平滑地拆成服务。</p>
+<h2 id="_26">高频面试题速答</h2>
+<p><strong>Q：单体应用和微服务各有什么优缺点？</strong>
+单体开发、调试、部署、事务都简单，但大了以后发布慢、故障相互影响、无法按模块扩容、协作冲突多。微服务可以独立开发、部署、扩容，故障更容易隔离，但要承担网络调用、数据一致性、运维和排障的复杂度。</p>
+<p><strong>Q：服务注册与发现的流程是怎样的？</strong>
+提供者启动时把地址注册到注册中心，并定期发心跳；注册中心剔除心跳超时的实例；调用者拉取或订阅实例列表并缓存在本地，按负载均衡策略选择实例后直接调用；提供者正常停机时主动注销。</p>
+<p><strong>Q：注册中心挂了，服务之间还能调用吗？</strong>
+通常可以短时间继续调用：调用方本地缓存了实例列表，调用本身不经过注册中心。但新上线的实例无法被发现，宕机的实例也无法被剔除，所以注册中心本身要集群部署。</p>
+<p><strong>Q：Eureka、ZooKeeper、Nacos 有什么区别？</strong>
+Eureka 是 AP，有自我保护机制；ZooKeeper 是 CP，基于临时节点和 watch，选主期间不可用；Nacos 的临时实例走 AP、持久实例走 CP，同时还提供配置中心功能。服务发现场景一般更看重可用性。</p>
+<p><strong>Q：配置中心是怎么实现配置实时推送的？</strong>
+常见做法是客户端长轮询或长连接：客户端带着当前版本号请求，服务端没有变化时挂起请求，配置变更时立刻返回，客户端再拉取新配置并刷新相关的 Bean。客户端还会在本地缓存配置，配置中心不可用时仍能启动。</p>
+<p><strong>Q：API 网关有什么作用？和 Nginx 有什么区别？</strong>
+统一入口，负责路由、鉴权、限流、协议转换、灰度、日志监控等横切功能。Nginx 是通用的高性能反向代理，以静态配置为主；业务网关和注册中心集成，支持动态路由和插件化的治理能力。两者常常分层配合使用。</p>
+<p><strong>Q：客户端负载均衡和服务端负载均衡有什么区别？</strong>
+客户端负载均衡由调用方从实例列表中自己选择（Spring Cloud LoadBalancer、Dubbo），少一跳网络；服务端负载均衡由 Nginx、Kubernetes Service 等中间层转发，对调用方透明。</p>
+<p><strong>Q：微服务怎么拆分？</strong>
+按业务能力和限界上下文拆，保证高内聚低耦合；每个服务独立数据库；粒度和团队匹配，不要拆得过细；渐进式地从单体中剥离。</p>
+<h2 id="_27">总结</h2>
+<figure><img src="img/f-83.jpg" alt="四个关键组件" loading="lazy"><figcaption>四个关键组件</figcaption></figure>
+<ul>
+<li>单体在规模变大后会遇到<strong>发布慢、故障互相影响、扩容不精准、协作冲突</strong>等问题；</li>
+<li>微服务按业务拆分，换来<strong>独立开发、部署、扩容</strong>，代价是<strong>分布式系统的复杂度</strong>；</li>
+<li><strong>注册与发现</strong>解决「服务在哪儿」：注册、心跳、剔除、拉取 / 订阅，调用不经过注册中心；</li>
+<li><strong>配置中心</strong>解决「配置怎么改」：集中管理、动态刷新、灰度、回滚；</li>
+<li><strong>API 网关</strong>是统一入口：路由、鉴权、限流、协议转换，自己要保持轻薄、多实例；</li>
+<li><strong>服务调用</strong>用 HTTP 或 RPC，配合<strong>负载均衡</strong>、超时、重试、幂等；</li>
+<li>还要有熔断降级、限流、链路追踪、分布式事务等配套能力；</li>
+<li>按<strong>业务边界</strong>拆，每个服务独立数据库，别拆太细；团队小、业务早期时，先做<strong>模块化单体</strong>。</li>
+</ul>
+<div class="refs">
+<h3 id="_28">参考资料</h3>
+<ul>
+<li>Spring Cloud 官方文档：Spring Cloud Gateway、Spring Cloud OpenFeign、Spring Cloud LoadBalancer、Spring Cloud Config.</li>
+<li>Nacos 官方文档：服务注册与发现、配置管理、Nacos 架构（Distro 与 Raft 协议）.</li>
+<li>Netflix Eureka Wiki（GitHub）：Understanding eureka client server communication.</li>
+<li>HashiCorp Consul 文档：Services、Health checks.</li>
+<li>Apache ZooKeeper 文档：ZooKeeper Programmer's Guide（Ephemeral Nodes、Watches）.</li>
+<li>Kubernetes 文档：Service、DNS for Services and Pods、Configure Liveness, Readiness and Startup Probes.</li>
+<li>Apollo 配置中心文档：设计文档（客户端长轮询）.</li>
+<li>gRPC 官方文档：Introduction to gRPC；Apache Dubbo 文档.</li>
+<li>OpenTelemetry 文档：Traces、Context Propagation.</li>
+<li>Seata 文档：AT、TCC、Saga 模式.</li>
+<li>Nginx 源码：ngx_http_upstream_round_robin.c（平滑加权轮询）.</li>
+<li><em>Domain-Driven Design: Tackling Complexity in the Heart of Software</em>. Addison-Wesley, 2003.</li>
+<li><em>Building Microservices</em>（第 2 版）. O'Reilly, 2021.</li>
+</ul>
+</div>
+  </article>
+  <div class="foot"><a href="../index.html">← 拾星首页</a><a href="landscape.html">▶ 看配套视频</a></div>
+</div>
+</body>
+</html>

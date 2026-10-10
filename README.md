@@ -37,6 +37,11 @@
 | Transformer 详解 | `transformer/landscape.html` | 横屏 1920×1080 | 84s |
 | 微调与 LoRA | `fine-tuning-lora/landscape.html` | 横屏 1920×1080 | 82s |
 | HTTPS 加密全过程 | `https-tls/landscape.html` | 横屏 1920×1080 | 84s |
+| Docker 容器原理 | `docker-container/landscape.html` | 横屏 1920×1080 | 84s |
+| 登录认证：Session、JWT 与 OAuth2 | `auth-session-jwt/landscape.html` | 横屏 1920×1080 | 84s |
+| 微服务：拆开之后的那些组件 | `microservices/landscape.html` | 横屏 1920×1080 | 84s |
+| 分布式 ID：雪花算法 | `snowflake-id/landscape.html` | 横屏 1920×1080 | 84s |
+| Java 的锁：synchronized、CAS 与 AQS | `java-lock/landscape.html` | 横屏 1920×1080 | 84s |
 
 ### 幸福的科学
 钩子 → 享乐适应（快乐曲线 + 跑步机）→ 哈佛成人发展研究（关系网络）→ 心流（挑战 × 技能坐标图）→ 今晚就能做的 3 件事 → 收尾
@@ -124,6 +129,21 @@ CPU 轮流切换 → 进程与隔离 → 线程与竞态条件 → 上下文切�
 
 ### HTTPS 加密全过程
 钩子（HTTP 明文的三大风险）→ 对称 vs 非对称，混合使用 → 证书与信任链 → TLS 1.3 一个来回的握手 → ECDHE 调颜料与前向保密 → AEAD 加密防篡改 → 实践：免费证书、HSTS、会话恢复 → 收尾
+
+### Docker 容器原理
+钩子（在我电脑上能跑）→ 容器 vs 虚拟机 → Namespace 隔离 → Cgroups 限制与 OOM → 镜像分层与写时复制 → 构建、推送、运行 → 端口映射与数据卷 → 收尾
+
+### 登录认证：Session、JWT 与 OAuth2
+钩子（下一个请求服务器问你是谁）→ Cookie → Session 与分布式共享 → JWT 三段结构与签名 → 无状态的代价与 refresh token → OAuth2 授权码 + PKCE → OIDC 与安全底线 → 收尾
+
+### 微服务：拆开之后的那些组件
+钩子（改一行代码整个系统重新发布）→ 单体到微服务的收益与代价 → 注册与发现 → 配置中心 → API 网关 → 服务调用与负载均衡 → 配套问题与拆分原则 → 收尾
+
+### 分布式 ID：雪花算法
+钩子（两个订单 id 都是 1001）→ 合格 ID 的五条要求 → 五种方案对比 → 雪花算法 64 位结构 → 毫秒内靠序列号 → 时钟回拨 → 机器 ID 与前端精度 → 收尾
+
+### Java 的锁：synchronized、CAS 与 AQS
+钩子（4 个线程加不到 400 万）→ 读改写竞态 → synchronized 与锁升级 → CAS、ABA 与 LongAdder → AQS → 基于 AQS 的同步工具 → 选型、死锁与虚拟线程 → 收尾
 
 ## 预览
 

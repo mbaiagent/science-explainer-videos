@@ -1,0 +1,344 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Docker 容器原理 · 拾星</title>
+<style>
+  :root{--bg:#07080f;--fg:#f4ede4;--muted:#9a93a8;--acc:#67e8f9}
+  html,body{margin:0;height:100%;background:var(--bg);color:var(--fg);
+    font-family:-apple-system,"PingFang SC","Noto Sans SC","Noto Sans CJK SC","Microsoft YaHei",sans-serif}
+  body{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;overflow:hidden}
+  #stage{display:block;background:#07080f;border-radius:12px;box-shadow:0 20px 60px rgba(0,0,0,.55);cursor:pointer}
+  #bar{display:flex;align-items:center;gap:12px;width:min(calc(100vw - 32px),640px)}
+  #btn{width:40px;height:40px;border-radius:50%;border:1px solid rgba(103,232,249,.5);background:transparent;
+    color:var(--acc);font-size:16px;cursor:pointer;flex:none}
+  #seek{flex:1;accent-color:var(--acc)}
+  #time{font-variant-numeric:tabular-nums;font-size:13px;color:var(--muted);min-width:84px;text-align:right}
+  body.render{display:block}
+  body.render #bar{display:none}
+  body.render #stage{border-radius:0;box-shadow:none}
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="bar">
+  <button id="btn" aria-label="播放/暂停">❚❚</button>
+  <input id="seek" type="range" min="0" max="84" step="0.01" value="0">
+  <span id="time">0:00 / 1:24</span>
+</div>
+<script>
+/* ============ 基础设置（横屏 1920×1080） ============ */
+const W = 1920, H = 1080, DUR = 84;
+const cv = document.getElementById('stage'), ctx = cv.getContext('2d');
+cv.width = W; cv.height = H;
+const FONT = '"PingFang SC","Noto Sans SC","Noto Sans CJK SC","Source Han Sans SC","Microsoft YaHei",sans-serif';
+const MONO = '"JetBrains Mono","SF Mono",Menlo,Consolas,"DejaVu Sans Mono","Noto Sans Mono CJK SC","PingFang SC","Microsoft YaHei",monospace';
+const C = {acc:'#67e8f9', mint:'#6ee7c8', gold:'#ffd38a', coral:'#ff9e7a', rose:'#ff8a8a', blue:'#9cc3ff', text:'#f4ede4', muted:'#9a93a8', dim:'#4a4558', panel:'#0f0e1f'};
+
+const clamp = (x,a=0,b=1) => Math.max(a, Math.min(b, x));
+const lerp = (a,b,t) => a + (b-a)*t;
+const p = (t,a,b) => clamp((t-a)/(b-a));
+const eo = x => 1 - Math.pow(1-x, 3);
+const eio = x => x < .5 ? 4*x*x*x : 1 - Math.pow(-2*x+2, 3)/2;
+const eback = x => { const c1=1.70158, c3=c1+1; return 1 + c3*Math.pow(x-1,3) + c1*Math.pow(x-1,2); };
+function rnd(seed){ let s = seed>>>0; return () => { s = (s*1664525 + 1013904223)>>>0; return s/4294967296; }; }
+
+let SA = 1;
+const al = a => { ctx.globalAlpha = clamp(SA*a); };
+const sceneA = (t,a,b,f=.5) => Math.min(p(t,a,a+f), 1 - p(t,b-f,b));
+
+function txt(s, x, y, o = {}){
+  const {size=64, weight=700, color=C.text, alpha=1, align='center', glow=0, scale=1, font=FONT} = o;
+  if (alpha <= 0) return;
+  ctx.save(); al(alpha);
+  ctx.font = `${weight} ${size}px ${font}`;
+  ctx.textAlign = align; ctx.textBaseline = 'middle'; ctx.fillStyle = color;
+  if (glow){ ctx.shadowColor = color; ctx.shadowBlur = glow; }
+  if (scale !== 1){ ctx.translate(x, y); ctx.scale(scale, scale); ctx.fillText(s, 0, 0); }
+  else ctx.fillText(s, x, y);
+  ctx.restore();
+}
+function rise(s, x, y, t, t0, o = {}, d = .7){
+  const e = eo(p(t, t0, t0+d));
+  if (e <= 0) return;
+  txt(s, x, y + (1-e)*36, {...o, alpha:(o.alpha ?? 1)*e});
+}
+function rr(x,y,w,h,r){ ctx.beginPath(); ctx.roundRect(x,y,w,h,r); }
+function box(x, y, w, h, a, o = {}){
+  const {fill='rgba(255,255,255,.05)', stroke='rgba(103,232,249,.35)', lw=2, glow=0, r=18, dash=null} = o;
+  if (a <= 0) return;
+  ctx.save(); al(a); rr(x, y, w, h, r); ctx.fillStyle = fill; ctx.fill();
+  if (dash) ctx.setLineDash(dash);
+  ctx.strokeStyle = stroke; ctx.lineWidth = lw; if (glow){ ctx.shadowColor = stroke; ctx.shadowBlur = glow; } ctx.stroke(); ctx.restore();
+}
+function arrow(x1, y1, x2, y2, e, a, color = C.acc, lw = 3){
+  if (e <= 0 || a <= 0) return;
+  const x = lerp(x1, x2, e), y = lerp(y1, y2, e), ang = Math.atan2(y2 - y1, x2 - x1);
+  ctx.save(); al(a); ctx.strokeStyle = color; ctx.fillStyle = color; ctx.lineWidth = lw; ctx.lineCap = 'round';
+  ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x, y); ctx.stroke();
+  if (e > .85){ ctx.translate(x, y); ctx.rotate(ang); ctx.beginPath(); ctx.moveTo(4, 0); ctx.lineTo(-14, -9); ctx.lineTo(-14, 9); ctx.closePath(); ctx.fill(); }
+  ctx.restore();
+}
+function panel(x, y, w, h, title, a){
+  box(x, y, w, h, a, {fill:C.panel, stroke:'rgba(255,255,255,.1)', r:20});
+  if (a <= 0) return;
+  ctx.save(); al(a); ctx.strokeStyle = 'rgba(255,255,255,.07)'; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(x, y + 52); ctx.lineTo(x + w, y + 52); ctx.stroke();
+  ['#ff6b6b','#ffd166','#6ee7a0'].forEach((c, i) => { ctx.fillStyle = c; ctx.globalAlpha = clamp(SA*a*.8); ctx.beginPath(); ctx.arc(x + 30 + i*24, y + 26, 7, 0, 6.283); ctx.fill(); });
+  ctx.restore();
+  txt(title, x + w/2, y + 27, {size:22, weight:500, color:C.muted, font:MONO, alpha:a});
+}
+
+/* ============ 背景 ============ */
+const PARTS = (() => { const r = rnd(233); return Array.from({length:100}, () => ({
+  x:r()*W, y:r()*H, s:r()*2.2+.5, v:r()*12+4, ph:r()*6.283, c:r()<.25})); })();
+function background(t){
+  const g = ctx.createLinearGradient(0,0,W,H);
+  g.addColorStop(0,'#0a0916'); g.addColorStop(.55,'#110f24'); g.addColorStop(1,'#18122c');
+  ctx.globalAlpha = 1; ctx.fillStyle = g; ctx.fillRect(0,0,W,H);
+  const gx = W*.5 + Math.sin(t*.27)*140;
+  const rg = ctx.createRadialGradient(gx, H*.45, 0, gx, H*.45, 950);
+  rg.addColorStop(0,'rgba(103,232,249,0.09)'); rg.addColorStop(1,'rgba(103,232,249,0)');
+  ctx.fillStyle = rg; ctx.fillRect(0,0,W,H);
+  ctx.fillStyle = C.acc;
+  for (let x = 40; x < W; x += 80) for (let y = 40; y < H; y += 80){ ctx.globalAlpha = .06; ctx.fillRect(x, y, 2, 2); }
+  for (const q of PARTS){
+    const y = ((q.y - t*q.v) % H + H) % H, x = q.x + Math.sin(t*.35 + q.ph)*12;
+    ctx.globalAlpha = .2 + .3*(.5 + .5*Math.sin(t*1.2 + q.ph));
+    ctx.fillStyle = q.c ? C.acc : '#d8d0ff';
+    ctx.beginPath(); ctx.arc(x, y, q.s, 0, 6.283); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+}
+function vignette(){
+  const v = ctx.createRadialGradient(W/2, H/2, W*.28, W/2, H/2, W*.62);
+  v.addColorStop(0,'rgba(0,0,0,0)'); v.addColorStop(1,'rgba(0,0,0,.55)');
+  ctx.globalAlpha = 1; ctx.fillStyle = v; ctx.fillRect(0,0,W,H);
+}
+function codeLine(s, x, y, size, a, kw = /\b(public|class|static|void|new|return)\b/){
+  const parts = s.split(/("[^"]*"|\b(?:public|class|static|void|new|return|getstatic|ldc|invokevirtual)\b)/g);
+  ctx.save(); al(a); ctx.font = `500 ${size}px ${MONO}`; ctx.textBaseline = 'middle'; ctx.textAlign = 'left';
+  let xx = x;
+  for (const seg of parts){ if (!seg) continue;
+    ctx.fillStyle = seg.startsWith('"') ? C.mint : /^(public|class|static|void|new|return|getstatic|ldc|invokevirtual)$/.test(seg) ? C.acc : C.text;
+    ctx.fillText(seg, xx, y); xx += ctx.measureText(seg).width; }
+  ctx.restore();
+}
+
+function card(h, lines, x, y, w, hh, a, c = C.acc, o = {}){
+  const {hs=30, ls=22, lh=40} = o;
+  box(x, y, w, hh, a, {fill:'rgba(103,232,249,.05)', stroke:c === C.acc ? 'rgba(103,232,249,.5)' : c, r:20});
+  txt(h, x + 30, y + 44, {size:hs, weight:900, color:c, align:'left', alpha:a});
+  lines.forEach((s, i) => txt(s, x + 30, y + 96 + i*lh, {size:ls, weight:600, color:'#d9d2e4', align:'left', alpha:a}));
+}
+function layer(s, x, y, w, h, a, fill, stroke, o = {}){
+  const {size=26, color=C.text, sub} = o;
+  box(x, y, w, h, a, {fill, stroke, r:12});
+  txt(s, x + w/2, y + h/2 - (sub ? 12 : 0), {size, weight:800, color, alpha:a});
+  if (sub) txt(sub, x + w/2, y + h/2 + 20, {size:18, weight:600, color:C.muted, alpha:a});
+}
+function bar(label, x, y, w, frac, a, c, val){
+  txt(label, x, y, {size:26, weight:800, align:'left', alpha:a});
+  box(x + 150, y - 22, w, 44, a, {fill:'rgba(255,255,255,.04)', stroke:'rgba(255,255,255,.2)', r:10});
+  if (a > 0){ ctx.save(); al(a); ctx.fillStyle = c; rr(x + 152, y - 20, Math.max(0, (w - 4)*frac), 40, 9); ctx.fill(); ctx.restore(); }
+  if (val) txt(val, x + 170 + w, y, {size:24, weight:800, font:MONO, color:c, align:'left', alpha:a});
+}
+
+/* ============ 场景 1 · 钩子 (0–7s) ============ */
+function s1(t){
+  rise('「在我电脑上明明能跑啊！」', W/2, 130, t, .2, {size:58, weight:900});
+  const a = eo(p(t, 1, 1.5));
+  card('开发电脑', ['JDK 21', 'glibc 2.39', '配置文件在 ~/app.yml', '✓ 运行正常'], 180, 260, 640, 330, a, C.mint);
+  card('生产服务器', ['JDK 11', 'glibc 2.28', '配置文件不见了', '✗ 启动失败'], 1100, 260, 640, 330, eo(p(t, 1.8, 2.3)), C.rose);
+  txt('≠', W/2, 425, {size:90, weight:900, color:C.rose, alpha:eo(p(t, 2.4, 2.8))});
+  const k = p(t, 3.6, 4.2);
+  if (k > 0){
+    box(560, 680, 800, 150, clamp(k*2), {fill:'rgba(103,232,249,.12)', stroke:C.acc, r:24, glow:22});
+    txt('Docker：把应用和它的运行环境一起打包', W/2, 735, {size:36, weight:900, color:C.acc, alpha:clamp(k*2)});
+    txt('镜像 → 在哪都能一模一样地运行', W/2, 790, {size:26, weight:700, alpha:eo(p(t, 4.4, 4.8))});
+  }
+  rise('容器到底是什么？它是怎么做到的？', W/2, 930, t, 5.4, {size:34, weight:800, color:C.gold});
+}
+
+/* ============ 场景 2 · 容器 vs 虚拟机 (7–19s) ============ */
+function s2(t){
+  rise('容器 vs 虚拟机', W/2, 90, t, 7.2, {size:56, weight:900});
+  const a = eo(p(t, 7.6, 8.1)), g = 'rgba(255,255,255,.05)', gs = 'rgba(255,255,255,.25)';
+  txt('虚拟机', 520, 180, {size:38, weight:900, color:C.gold, alpha:a});
+  layer('硬件', 160, 760, 720, 70, a, g, gs); layer('宿主机操作系统', 160, 680, 720, 70, a, g, gs); layer('虚拟机管理程序（Hypervisor）', 160, 600, 720, 70, a, g, gs);
+  [0, 1, 2].forEach(i => { const e = eo(p(t, 8.4 + i*.3, 8.8 + i*.3)), x = 160 + i*245;
+    layer('客户机 OS', x, 440, 230, 150, e, 'rgba(255,211,138,.10)', C.gold, {sub:'完整的内核，GB 级'});
+    layer('应用 ' + 'ABC'[i], x, 350, 230, 80, e, 'rgba(255,255,255,.08)', gs); });
+  const b = eo(p(t, 10.4, 10.9));
+  txt('容器', 1400, 180, {size:38, weight:900, color:C.acc, alpha:b});
+  layer('硬件', 1040, 760, 720, 70, b, g, gs); layer('宿主机操作系统（共享同一个内核）', 1040, 680, 720, 70, b, g, gs); layer('容器运行时（Docker）', 1040, 600, 720, 70, b, g, gs);
+  [0, 1, 2].forEach(i => { const e = eo(p(t, 11.2 + i*.3, 11.6 + i*.3)), x = 1040 + i*245;
+    layer('应用 ' + 'ABC'[i], x, 440, 230, 150, e, 'rgba(103,232,249,.12)', C.acc, {sub:'+ 依赖库'}); });
+  [['启动', '分钟级', '毫秒～秒级'], ['大小', 'GB 级', 'MB 级'], ['隔离', '强（独立内核）', '较弱（共享内核）']].forEach(([k, v1, v2], i) => { const e = eo(p(t, 13 + i*.5, 13.4 + i*.5)), y = 880 + i*56;
+    txt(k, W/2, y, {size:26, weight:900, color:C.muted, alpha:e}); txt(v1, 520, y, {size:26, weight:700, color:C.gold, alpha:e}); txt(v2, 1400, y, {size:26, weight:700, color:C.acc, alpha:e}); });
+  rise('容器不是虚拟机：它就是宿主机上的普通进程，只是被「隔离」和「限制」了', W/2, 1045, t, 15.2, {size:28, weight:900, color:C.gold});
+}
+
+/* ============ 场景 3 · Namespace (19–32s) ============ */
+function s3(t){
+  rise('隔离：Namespace（命名空间）', W/2, 90, t, 19.2, {size:54, weight:900});
+  rise('让进程「看不见」容器外面的东西', W/2, 160, t, 19.6, {size:30, weight:700, color:C.muted});
+  const a = eo(p(t, 20.2, 20.7));
+  panel(120, 220, 760, 520, '宿主机看到的进程', a);
+  [['1', 'systemd'], ['812', 'sshd'], ['1024', 'mysqld'], ['4321', 'java -jar app.jar'], ['4388', 'sh']].forEach(([pid, n], i) => { const hi = i >= 3, e = eo(p(t, 20.6 + i*.2, 21 + i*.2)), y = 330 + i*76;
+    if (hi) box(150, y - 30, 700, 60, e, {fill:'rgba(103,232,249,.10)', stroke:'rgba(103,232,249,.5)', r:12});
+    txt(pid, 190, y, {size:26, weight:800, font:MONO, color:hi ? C.acc : C.muted, align:'left', alpha:e}); txt(n, 340, y, {size:26, weight:700, font:MONO, color:hi ? C.text : C.muted, align:'left', alpha:e}); });
+  const b = eo(p(t, 22.6, 23.1));
+  panel(1040, 220, 760, 520, '容器里看到的进程', b);
+  [['1', 'java -jar app.jar'], ['7', 'sh']].forEach(([pid, n], i) => { const y = 330 + i*76;
+    box(1070, y - 30, 700, 60, b, {fill:'rgba(103,232,249,.10)', stroke:'rgba(103,232,249,.5)', r:12});
+    txt(pid, 1110, y, {size:26, weight:800, font:MONO, color:C.acc, align:'left', alpha:b}); txt(n, 1260, y, {size:26, weight:700, font:MONO, align:'left', alpha:b}); });
+  txt('它以为自己是 1 号进程，也看不到其他进程', 1420, 560, {size:24, weight:800, color:C.gold, alpha:eo(p(t, 23.6, 24))});
+  arrow(890, 520, 1030, 400, eo(p(t, 23.2, 23.8)), b, C.acc, 3);
+  const items = [['PID', '进程编号'], ['NET', '网卡、IP、端口'], ['MNT', '文件系统挂载'], ['UTS', '主机名'], ['IPC', '进程间通信'], ['USER', '用户和权限']];
+  items.forEach(([k, v], i) => { const e = eo(p(t, 25 + i*.35, 25.4 + i*.35)), x = 220 + i*296;
+    box(x - 130, 800, 260, 120, e, {fill:'rgba(103,232,249,.07)', stroke:'rgba(103,232,249,.45)', r:18});
+    txt(k, x, 842, {size:34, weight:900, font:MONO, color:C.acc, alpha:e}); txt(v, x, 890, {size:22, weight:600, color:C.muted, alpha:e}); });
+  rise('每个容器有一套自己的「视图」：自己的进程、网络、文件系统、主机名', W/2, 1000, t, 28, {size:28, weight:800});
+}
+
+/* ============ 场景 4 · Cgroups (32–44s) ============ */
+function s4(t){
+  rise('限制：Cgroups（控制组）', W/2, 90, t, 32.2, {size:54, weight:900});
+  rise('让进程「用不多」：CPU、内存、磁盘 IO、进程数', W/2, 160, t, 32.6, {size:30, weight:700, color:C.muted});
+  panel(120, 230, 1000, 440, 'docker run --cpus=2 --memory=512m app', eo(p(t, 33, 33.5)));
+  const k = p(t, 34, 39), cpu = clamp(.3 + .6*k), mem = clamp(.2 + .95*k);
+  bar('CPU', 170, 350, 640, Math.min(cpu, 1), eo(p(t, 33.4, 33.9)), C.acc, Math.min(2, cpu*2.2).toFixed(1) + ' 核');
+  const memv = Math.min(mem, 1), over = mem >= 1;
+  bar('内存', 170, 450, 640, memv, eo(p(t, 33.6, 34.1)), over ? C.rose : C.mint, Math.round(memv*512) + ' MB');
+  bar('磁盘 IO', 170, 550, 640, .35 + .1*Math.sin(t*2), eo(p(t, 33.8, 34.3)), C.blue, '');
+  txt('CPU 超了：被限流，跑得慢一点', 640, 620, {size:22, weight:700, color:C.muted, alpha:eo(p(t, 36, 36.4))});
+  if (t > 39){ const e = eo(p(t, 39, 39.4));
+    box(1180, 380, 600, 180, e, {fill:'rgba(255,138,138,.10)', stroke:C.rose, r:20, glow:16});
+    txt('内存超了：OOM Killed', 1480, 440, {size:36, weight:900, color:C.rose, alpha:e}); txt('进程被内核直接杀掉（退出码 137）', 1480, 500, {size:24, weight:700, alpha:e}); }
+  const c = eo(p(t, 40.4, 40.9));
+  card('为什么重要', ['不设限制：一个容器就能吃光整台机器，拖垮其他服务', 'Java 应用：JDK 8u191 以后的版本会读取容器的内存限制，据此设置堆大小'], 120, 730, 1680, 210, c);
+}
+
+/* ============ 场景 5 · 镜像分层 (44–58s) ============ */
+function s5(t){
+  rise('镜像：一层一层叠起来的只读文件系统', W/2, 90, t, 44.2, {size:52, weight:900});
+  const L = [['FROM eclipse-temurin:21-jre', '基础镜像：精简的 Linux + Java 运行环境', 'rgba(255,255,255,.08)', 'rgba(255,255,255,.35)'],
+             ['COPY lib/ /app/lib/', '依赖 jar 包', 'rgba(103,232,249,.10)', 'rgba(103,232,249,.55)'],
+             ['COPY app.jar /app/', '你的代码', 'rgba(103,232,249,.18)', C.acc]];
+  L.forEach(([cmd, d, f, s], i) => { const e = eback(p(t, 45 + i*.8, 45.6 + i*.8)), y = 740 - i*130;
+    if (e <= 0) return; ctx.save(); ctx.translate(560, y + 55); ctx.scale(1, e); ctx.translate(-560, -(y + 55));
+    box(140, y, 840, 110, clamp(e), {fill:f, stroke:s, r:14}); ctx.restore();
+    txt(cmd, 170, y + 38, {size:24, weight:800, font:MONO, align:'left', alpha:clamp(e)}); txt(d, 170, y + 78, {size:20, weight:600, color:C.muted, align:'left', alpha:clamp(e)});
+    txt('只读层 ' + (i + 1), 1040, y + 55, {size:22, weight:800, color:C.muted, align:'left', alpha:clamp(e)}); });
+  const w = eo(p(t, 48.2, 48.8));
+  box(140, 350, 840, 100, w, {fill:'rgba(255,211,138,.10)', stroke:C.gold, r:14, dash:[10, 8]});
+  txt('容器层（可写）', 170, 385, {size:26, weight:900, color:C.gold, align:'left', alpha:w}); txt('运行时写的文件都在这里，容器删了就没了', 170, 425, {size:20, weight:600, color:C.muted, align:'left', alpha:w});
+  txt('镜像 + 可写层 = 容器', 1020, 400, {size:30, weight:900, color:C.gold, alpha:w, align:'left'});
+  txt('联合文件系统（OverlayFS）把这些层「叠」成一个完整的目录', 560, 290, {size:24, weight:800, color:C.text, alpha:eo(p(t, 49.4, 49.8))});
+  [['写时复制', ['改下层的文件时，先复制到可写层', '再修改，下层永远不变']], ['层可以共享', ['多个容器共用同一个镜像，', '只读层在磁盘上只存一份']], ['构建有缓存', ['某一层没变就直接复用，', '变化少的指令放前面']]].forEach(([h, d], i) => {
+    card(h, d, 1300, 210 + i*215, 520, 190, eo(p(t, 51 + i*1.2, 51.5 + i*1.2)), C.acc, {ls:20, lh:32}); });
+  rise('Dockerfile 中会修改文件系统的指令（FROM、COPY、RUN 等）各对应一层', 560, 900, t, 55, {size:24, weight:700, color:C.gold});
+}
+
+/* ============ 场景 6 · 构建、分发、运行 (58–69s) ============ */
+function s6(t){
+  rise('构建一次，到处运行', W/2, 90, t, 58.2, {size:56, weight:900});
+  const steps = [['Dockerfile', '描述环境', 58.8], ['镜像', 'docker build', 59.6], ['镜像仓库', 'docker push', 60.4], ['服务器', 'docker pull', 61.2], ['容器', 'docker run', 62]];
+  steps.forEach(([h, d, ts], i) => { const e = eback(p(t, ts, ts + .5)), x = 230 + i*365;
+    if (e > 0){ ctx.save(); ctx.translate(x, 280); ctx.scale(e, e); ctx.translate(-x, -280); box(x - 145, 220, 290, 120, clamp(e), {fill:'rgba(103,232,249,.10)', stroke:C.acc, r:20}); ctx.restore(); }
+    txt(h, x, 266, {size:32, weight:900, alpha:clamp(e)}); txt(d, x, 310, {size:20, weight:700, font:MONO, color:C.muted, alpha:clamp(e)});
+    if (i) arrow(x - 215, 280, x - 152, 280, e, clamp(e), C.acc, 3); });
+  panel(120, 420, 900, 520, 'Dockerfile', eo(p(t, 63, 63.5)));
+  [['FROM eclipse-temurin:21-jre', C.acc], ['WORKDIR /app', C.text], ['COPY target/app.jar app.jar', C.text], ['EXPOSE 8080', C.text], ['ENTRYPOINT ["java", "-jar", "app.jar"]', C.text]].forEach(([s, c], i) =>
+    txt(s, 160, 520 + i*60, {size:26, weight:600, font:MONO, color:c, align:'left', alpha:eo(p(t, 63.4 + i*.2, 63.8 + i*.2))}));
+  panel(1080, 420, 720, 520, '终端', eo(p(t, 64.8, 65.3)));
+  [['$ docker build -t myapp:1.0 .', C.text], ['$ docker push registry/myapp:1.0', C.text], ['# 在服务器上', C.muted], ['$ docker run -d \\', C.text], ['    -p 8080:8080 myapp:1.0', C.text]].forEach(([s, c], i) =>
+    txt(s, 1110, 520 + i*60, {size:24, weight:600, font:MONO, color:c, align:'left', alpha:eo(p(t, 65.2 + i*.3, 65.6 + i*.3))}));
+  rise('镜像带着全部环境，开发、测试、生产跑的是同一个东西', 560, 870, t, 66.6, {size:24, weight:800, color:C.gold});
+}
+
+/* ============ 场景 7 · 网络与存储 (69–78s) ============ */
+function s7(t){
+  rise('网络与数据', W/2, 90, t, 69.2, {size:56, weight:900});
+  const a = eo(p(t, 69.6, 70.1));
+  box(120, 180, 820, 560, a, {fill:'rgba(255,255,255,.03)', stroke:'rgba(255,255,255,.18)', r:24});
+  txt('端口映射', 530, 230, {size:34, weight:900, color:C.acc, alpha:a});
+  layer('宿主机 :8080', 330, 300, 400, 80, a, 'rgba(255,255,255,.07)', 'rgba(255,255,255,.35)');
+  layer('docker0 网桥', 330, 450, 400, 80, a, 'rgba(255,255,255,.07)', 'rgba(255,255,255,.35)');
+  ['容器 A', '容器 B'].forEach((s, i) => layer(s + '  172.17.0.' + (2 + i), 160 + i*400, 600, 360, 80, a, 'rgba(103,232,249,.12)', C.acc, {size:22}));
+  arrow(530, 382, 530, 448, eo(p(t, 70.4, 70.8)), a, C.acc, 3); arrow(480, 532, 340, 598, eo(p(t, 70.8, 71.2)), a, C.acc, 3); arrow(580, 532, 740, 598, eo(p(t, 70.8, 71.2)), a, C.muted, 3);
+  txt('-p 8080:8080：外部请求转发到容器内的端口', 530, 710, {size:22, weight:700, color:C.muted, alpha:a});
+  const b = eo(p(t, 72, 72.5));
+  box(980, 180, 820, 560, b, {fill:'rgba(255,255,255,.03)', stroke:'rgba(255,255,255,.18)', r:24});
+  txt('数据卷（Volume）', 1390, 230, {size:34, weight:900, color:C.acc, alpha:b});
+  txt('容器删除，可写层里的数据也跟着消失', 1390, 310, {size:26, weight:800, color:C.rose, alpha:b});
+  layer('MySQL 容器', 1090, 380, 300, 100, b, 'rgba(103,232,249,.12)', C.acc);
+  layer('/var/lib/mysql', 1450, 380, 300, 100, b, 'rgba(255,211,138,.10)', C.gold, {size:22, sub:'宿主机上的数据卷'});
+  arrow(1392, 430, 1446, 430, eo(p(t, 73, 73.4)), b, C.gold, 3);
+  txt('-v mysql-data:/var/lib/mysql', 1390, 560, {size:24, weight:700, font:MONO, alpha:eo(p(t, 73.4, 73.8))});
+  txt('数据存放在容器外，容器重建也不丢', 1390, 620, {size:24, weight:800, color:C.mint, alpha:eo(p(t, 73.8, 74.2))});
+  rise('容器多了，谁来调度、扩缩容、自动重启？→ Kubernetes', W/2, 840, t, 75.2, {size:32, weight:900, color:C.gold});
+}
+
+/* ============ 场景 8 · 收尾 (78–84s) ============ */
+function s8(t){
+  [['镜像', '应用 + 环境打包'], ['Namespace', '隔离：看不见'], ['Cgroups', '限制：用不多'], ['分层', '共享、缓存、写时复制']].forEach(([a, b], i) => {
+    const st = 78.2 + i*.25, e = eback(p(t, st, st + .5)); if (e <= 0) return;
+    const x = 330 + i*420, y = 330;
+    ctx.save(); ctx.translate(x, y); ctx.scale(e, e); ctx.translate(-x, -y);
+    box(x - 185, y - 90, 370, 180, clamp(e), {fill:'rgba(103,232,249,.08)', stroke:'rgba(103,232,249,.5)', r:26}); ctx.restore();
+    txt(a, x, y - 22, {size:40, weight:900, color:C.acc, alpha:clamp(e)}); txt(b, x, y + 40, {size:24, weight:600, color:C.muted, alpha:clamp(e)});
+  });
+  rise('容器，就是被隔离和限制的普通进程', W/2, 600, t, 79.2, {size:62, weight:900, glow:22});
+  rise('关注拾星，一起搞懂后端', W/2, 760, t, 80, {size:36, weight:500, color:C.muted});
+}
+/* ============ 总调度 ============ */
+const SCENES = [[s1,-1,7],[s2,7,19],[s3,19,32],[s4,32,44],[s5,44,58],[s6,58,69],[s7,69,78],[s8,78,84]];
+function draw(t){
+  t = clamp(t, 0, DUR);
+  ctx.save(); ctx.globalAlpha = 1; ctx.clearRect(0,0,W,H); background(t);
+  for (const [fn,a,b] of SCENES){
+    if (t < a || t > b) continue;
+    SA = sceneA(t, a, b, b === DUR ? .8 : .5);
+    if (SA > 0){ ctx.save(); fn(t); ctx.restore(); }
+  }
+  SA = 1; vignette();
+  const fo = p(t, DUR - .8, DUR);
+  if (fo > 0){ ctx.globalAlpha = fo; ctx.fillStyle = '#000'; ctx.fillRect(0,0,W,H); }
+  ctx.restore();
+}
+
+/* ============ 播放器 / 逐帧渲染接口 ============ */
+const isRender = new URLSearchParams(location.search).has('render');
+window.DURATION = DUR;
+window.renderFrame = t => draw(t);
+const btn = document.getElementById('btn'), seek = document.getElementById('seek'), timeEl = document.getElementById('time');
+const fmt = s => `${Math.floor(s/60)}:${String(Math.floor(s%60)).padStart(2,'0')}`;
+function fit(){
+  if (isRender){ cv.style.width = W+'px'; cv.style.height = H+'px'; return; }
+  const w = Math.min(innerWidth - 32, (innerHeight - 84)*16/9);
+  cv.style.width = w + 'px'; cv.style.height = w*9/16 + 'px';
+}
+addEventListener('resize', fit); fit();
+
+let cur = 0, playing = !isRender, last = null;
+function toggle(){ if (cur >= DUR) cur = 0; playing = !playing; }
+btn.onclick = toggle; cv.onclick = toggle;
+addEventListener('keydown', e => { if (e.code === 'Space'){ e.preventDefault(); toggle(); } });
+seek.oninput = () => { cur = +seek.value; draw(cur); };
+function loop(ts){
+  if (playing && last != null){ cur += (ts - last)/1000; if (cur >= DUR){ cur = DUR; playing = false; } }
+  last = ts; draw(cur);
+  seek.value = cur; timeEl.textContent = `${fmt(cur)} / ${fmt(DUR)}`;
+  btn.textContent = playing ? '❚❚' : (cur >= DUR ? '↺' : '▶');
+  requestAnimationFrame(loop);
+}
+document.fonts.ready.then(() => {
+  window.ready = true;
+  if (isRender) draw(0); else requestAnimationFrame(loop);
+});
+</script>
+</body>
+</html>

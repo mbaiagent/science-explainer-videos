@@ -1,0 +1,886 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>登录认证：Session、JWT 与 OAuth2，服务器怎么「记住」你 · 拾星</title>
+<meta name="description" content="HTTP 无状态与 Cookie、Session 与分布式会话共享、JWT 三段结构与签名校验、令牌失效与 refresh token 轮换、OAuth2 授权码 + PKCE、OAuth2 与 OIDC 的区别、Cookie 属性与 CSRF/XSS 防护、密码哈希存储，附五段可运行的 Python 演示">
+<link rel="stylesheet" href="../assets/article.css">
+<style>:root{--acc:#fda4af}</style>
+</head>
+<body>
+<div class="wrap">
+  <nav class="top"><a href="../index.html">← 拾星 · 全部内容</a><a class="watch" href="landscape.html">▶ 看视频</a></nav>
+  <header class="hero">
+    <div class="tag">拾星 · 计算机与后端</div>
+    <h1>登录认证：Session、JWT 与 OAuth2，服务器怎么「记住」你</h1>
+    <p>HTTP 无状态与 Cookie、Session 与分布式会话共享、JWT 三段结构与签名校验、令牌失效与 refresh token 轮换、OAuth2 授权码 + PKCE、OAuth2 与 OIDC 的区别、Cookie 属性与 CSRF/XSS 防护、密码哈希存储，附五段可运行的 Python 演示</p>
+    <div class="meta">约 54 分钟读完 · 配套视频 1:24</div>
+  </header>
+  <nav class="toc">
+<ul>
+<li><a href="#http">先说问题：HTTP 不记得你</a></li>
+<li><a href="#session">Session：状态存在服务端</a></li>
+<li><a href="#token-jwt">Token 与 JWT：把信息写进令牌，再签个名</a></li>
+<li><a href="#_5">无状态的代价：发出去的令牌收不回来</a></li>
+<li><a href="#oauth2">OAuth2：第三方登录到底授权了什么</a></li>
+<li><a href="#_9">安全底线</a></li>
+<li><a href="#_12">动手实验</a></li>
+<li><a href="#_14">工程实践与常见坑</a></li>
+<li><a href="#_15">高频面试题速答</a></li>
+<li><a href="#_16">总结</a></li>
+</ul>
+</nav>
+
+  <article>
+<figure><img src="img/f-6.4.jpg" alt="登录成功后，下一个请求服务器却不认识你" loading="lazy"><figcaption>登录成功后，下一个请求服务器却不认识你</figcaption></figure>
+<h2 id="http">先说问题：HTTP 不记得你</h2>
+<figure><img src="img/f-17.jpg" alt="Cookie：服务器下发、浏览器保存并自动携带" loading="lazy"><figcaption>Cookie：服务器下发、浏览器保存并自动携带</figcaption></figure>
+<p>你在登录页输入账号密码，服务器校验通过，返回「登录成功」。接着你点开「我的订单」，浏览器发出第二个请求——服务器怎么知道这个请求也是你发的？</p>
+<p>答案是：<strong>HTTP 本身不知道</strong>。HTTP 是一个<strong>无状态</strong>协议，每个请求都是独立的，服务器处理完就忘，协议层面没有「这个请求和上一个请求来自同一个人」的概念。无状态让服务器实现简单、容易横向扩展，但「登录」这件事天然需要状态：服务器得记住「你已经证明过自己是谁了」。</p>
+<p>所有登录方案要解决的都是同一个问题：<strong>让后续请求带上一个凭证，服务器看到凭证就知道是谁</strong>。区别只在于凭证是什么、放在哪、怎么验证。</p>
+<blockquote>
+<p>先分清两个词：<strong>认证</strong>（Authentication）回答「你是谁」，比如账号密码登录；<strong>授权</strong>（Authorization）回答「你能做什么」，比如「这个应用可以读你的相册，但不能发帖」。后面讲 OAuth2 和 OIDC 时，这个区别非常关键。</p>
+</blockquote>
+<h3 id="cookie">Cookie：浏览器替你保管的小纸条</h3>
+<p>Cookie 是 HTTP 的一个扩展机制（RFC 6265），流程只有两步：</p>
+<ol>
+<li>服务器在响应里加一个 <code>Set-Cookie</code> 头，比如 <code>Set-Cookie: sid=a1b2c3; HttpOnly; Secure; SameSite=Lax</code>；</li>
+<li>浏览器把它存下来，之后<strong>每次访问同一站点，自动在请求头里带上</strong> <code>Cookie: sid=a1b2c3</code>。</li>
+</ol>
+<p>几个要点：</p>
+<table>
+<thead>
+<tr>
+<th>属性</th>
+<th>作用</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>Domain</code> / <code>Path</code></td>
+<td>作用范围：哪些域名、哪些路径下的请求会携带它</td>
+</tr>
+<tr>
+<td><code>Expires</code> / <code>Max-Age</code></td>
+<td>过期时间；都不设就是「会话 Cookie」，通常关闭浏览器后失效</td>
+</tr>
+<tr>
+<td><code>HttpOnly</code></td>
+<td>JavaScript 读不到（<code>document.cookie</code> 里看不见），降低被 XSS 偷走的风险</td>
+</tr>
+<tr>
+<td><code>Secure</code></td>
+<td>只在 HTTPS 连接中发送</td>
+</tr>
+<tr>
+<td><code>SameSite</code></td>
+<td>限制跨站请求是否携带：<code>Strict</code> / <code>Lax</code> / <code>None</code></td>
+</tr>
+</tbody>
+</table>
+<p>RFC 6265 要求浏览器至少支持单个 Cookie 4096 字节、每个域名 50 个 Cookie，所以 Cookie 适合放<strong>小而关键</strong>的东西。</p>
+<p>Cookie 本身只是一个「携带工具」。里面放的东西决定了方案：放一个<strong>随机编号</strong>，服务器拿编号去查用户信息，这就是 <strong>Session</strong>；放一张<strong>自带用户信息和签名的令牌</strong>，服务器验签即可，这就是 <strong>Token</strong>（典型是 JWT）。</p>
+<h2 id="session">Session：状态存在服务端</h2>
+<figure><img src="img/f-29.4.jpg" alt="Session 存在服务端；多实例部署时用 Redis 集中存放" loading="lazy"><figcaption>Session 存在服务端；多实例部署时用 Redis 集中存放</figcaption></figure>
+<h3 id="_1">工作原理</h3>
+<ol>
+<li>用户登录成功，服务器生成一个<strong>随机且不可预测</strong>的 sessionId，在服务端存一条记录：<code>sessionId → { userId: 42, role: "user", ... }</code>；</li>
+<li>通过 <code>Set-Cookie</code> 把 sessionId 发给浏览器；</li>
+<li>之后每个请求带着 Cookie 过来，服务器用 sessionId 查到会话数据，就知道是谁了。</li>
+</ol>
+<p>Java 的 Servlet 容器（如 Tomcat）默认用名为 <code>JSESSIONID</code> 的 Cookie，PHP 默认是 <code>PHPSESSID</code>，原理都一样。</p>
+<p>浏览器手里只有一个毫无意义的随机串，所有用户数据都在服务器上。这带来两个好处：<strong>数据不出服务器</strong>，以及<strong>随时可以作废</strong>——退出登录、修改密码、封号，删掉服务端的那条记录，下一个请求就立即失效。</p>
+<h3 id="sessionid">sessionId 的要求</h3>
+<ul>
+<li><strong>足够随机</strong>：必须用密码学安全的随机数生成器，长度足够（OWASP 建议至少 64 位熵），不能用自增 ID 或时间戳，否则可以被猜出来；</li>
+<li><strong>登录后更换</strong>：如果登录前就有 sessionId，登录成功后要换一个新的。否则攻击者可以先把一个自己知道的 sessionId 塞给受害者，等受害者登录后直接冒用，这叫<strong>会话固定攻击</strong>（Session Fixation）；</li>
+<li><strong>设置过期</strong>：通常用「滑动过期」，比如 30 分钟无操作就失效；关键系统再加一个绝对过期时间。</li>
+</ul>
+<h3 id="session_1">分布式下的问题：Session 存在哪？</h3>
+<p>单机时 Session 放在进程内存里就行。但服务一旦部署多个实例，负载均衡把请求分到不同的机器上：在实例 A 上登录，下一个请求打到实例 B，B 的内存里没有这条会话，用户就被「踢」回了登录页。</p>
+<table>
+<thead>
+<tr>
+<th>方案</th>
+<th>做法</th>
+<th>问题</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>粘性会话</td>
+<td>负载均衡按 Cookie 或 IP 把同一用户固定到同一实例</td>
+<td>实例宕机或扩缩容时会话丢失，负载可能不均</td>
+</tr>
+<tr>
+<td>会话复制</td>
+<td>实例之间互相同步 Session</td>
+<td>实例多了以后同步开销大，基本不再使用</td>
+</tr>
+<tr>
+<td><strong>集中存储</strong></td>
+<td>所有实例都从 <strong>Redis</strong> 读写 Session</td>
+<td>多一次网络调用；Redis 要做高可用</td>
+</tr>
+</tbody>
+</table>
+<p>主流做法是<strong>集中存储到 Redis</strong>：sessionId 作为 key，会话数据作为 value，过期时间直接用 Redis 的 TTL。Java 生态里，Spring Session 可以几乎无侵入地把 <code>HttpSession</code> 换成 Redis 存储（参考写法，需要 Redis 环境，本文未运行）：</p>
+<pre><code class="language-java">// 依赖：spring-boot-starter-data-redis + spring-session-data-redis
+@Configuration
+@EnableRedisHttpSession(maxInactiveIntervalInSeconds = 1800)
+public class SessionConfig { }
+
+// 业务代码不用改，照常使用 HttpSession，数据实际存到了 Redis
+@PostMapping(&quot;/login&quot;)
+public String login(HttpServletRequest req, @RequestBody LoginForm form) {
+    User u = userService.check(form.username(), form.password());
+    req.changeSessionId();                       // 登录后更换 sessionId，防会话固定
+    req.getSession().setAttribute(&quot;userId&quot;, u.id());
+    return &quot;ok&quot;;
+}
+</code></pre>
+<p>Session 的代价也很清楚：<strong>每个请求都要查一次存储</strong>。对大多数业务这完全可以接受（Redis 一次查询通常在毫秒以内），但如果有大量服务都需要验证用户身份，都去访问同一个 Session 存储，就会形成耦合。这正是 Token 方案想解决的问题。</p>
+<h2 id="token-jwt">Token 与 JWT：把信息写进令牌，再签个名</h2>
+<figure><img src="img/f-41.jpg" alt="JWT 的三段结构：Header、Payload、Signature" loading="lazy"><figcaption>JWT 的三段结构：Header、Payload、Signature</figcaption></figure>
+<p>Token 方案的思路是：<strong>不在服务端存会话</strong>，而是把「你是谁、什么时候过期」直接写进令牌里交给客户端，再用签名保证它不能被伪造。服务器收到令牌后，只要验证签名有效、没过期，就可以信任里面的内容。</p>
+<p>最常用的令牌格式是 <strong>JWT</strong>（JSON Web Token，RFC 7519），读作 "jot"。</p>
+<h3 id="_2">三段结构</h3>
+<p>一个 JWT 长这样（为了便于阅读这里换了行，实际是一整行）：</p>
+<pre><code class="language-text">eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9
+.eyJzdWIiOiI0MiIsInJvbGUiOiJ1c2VyIiwiaWF0IjoxNzYwMDAwMDAwLCJleHAiOjE3NjAwMDA5MDB9
+.XzSDshbH0WW9Z8Nud0Nf2ne3O6RQ1qp0w4qNzcLJqbg
+</code></pre>
+<p>用 <code>.</code> 分成三段，每段都是 <strong>Base64URL 编码</strong>（把 Base64 的 <code>+/</code> 换成 <code>-_</code>，并去掉末尾的 <code>=</code>）：</p>
+<table>
+<thead>
+<tr>
+<th>段</th>
+<th>解码后</th>
+<th>作用</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Header</td>
+<td><code>{"alg":"HS256","typ":"JWT"}</code></td>
+<td>声明签名算法</td>
+</tr>
+<tr>
+<td>Payload</td>
+<td><code>{"sub":"42","role":"user","iat":1760000000,"exp":1760000900}</code></td>
+<td>声明（claims）：用户是谁、何时签发、何时过期</td>
+</tr>
+<tr>
+<td>Signature</td>
+<td>32 字节的 HMAC 结果</td>
+<td><code>HMAC-SHA256(header + "." + payload, 服务端密钥)</code></td>
+</tr>
+</tbody>
+</table>
+<p>RFC 7519 定义了几个<strong>注册声明</strong>：<code>iss</code>（签发者）、<code>sub</code>（主体，通常是用户 ID）、<code>aud</code>（接收方）、<code>exp</code>（过期时间）、<code>nbf</code>（生效时间）、<code>iat</code>（签发时间）、<code>jti</code>（令牌唯一 ID）。时间都是 Unix 秒数。</p>
+<h3 id="_3">签名不是加密</h3>
+<p>这是关于 JWT 最常见的误解。Header 和 Payload <strong>只是编码，不是加密</strong>，任何人拿到 token 都能解码看到内容——下面的实验里，不用密钥一行代码就能还原 payload。</p>
+<p>签名保证的是两件事：</p>
+<ul>
+<li><strong>完整性</strong>：内容没被改过。改了 payload 中任何一个字符，重新计算出的签名就对不上；</li>
+<li><strong>来源可信</strong>：只有持有密钥的一方才能生成有效签名。</li>
+</ul>
+<p>所以 <strong>payload 里不要放密码、手机号、身份证号等敏感信息</strong>。如果确实需要加密，要用 JWE（RFC 7516），但实践中很少这样做。严格来说，带签名的 JWT 是一个 JWS（JSON Web Signature，RFC 7515）。</p>
+<h3 id="vs">对称签名 vs 非对称签名</h3>
+<table>
+<thead>
+<tr>
+<th>算法</th>
+<th>密钥</th>
+<th>适合</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>HS256</strong>（HMAC-SHA256）</td>
+<td>签发和验证用<strong>同一个密钥</strong></td>
+<td>签发方和验证方是同一个服务</td>
+</tr>
+<tr>
+<td><strong>RS256 / ES256</strong>（RSA / ECDSA）</td>
+<td>私钥签发，<strong>公钥</strong>验证</td>
+<td>一个认证中心签发，多个服务验证</td>
+</tr>
+</tbody>
+</table>
+<p>在微服务里，常见做法是认证服务用私钥签发，其他服务从一个公开地址（JWKS，JSON Web Key Set）拿到公钥来验证。这样各个服务都能独立验证 token，却没有一个能伪造 token。</p>
+<h3 id="_4">无状态的好处</h3>
+<p>验证 JWT 只需要密钥（或公钥）和当前时间，<strong>不需要查任何存储</strong>：</p>
+<ul>
+<li>任何实例、任何服务拿到 token 都能直接验证，天然适合多实例和微服务；</li>
+<li>也适合跨域、移动端、服务间调用等不方便使用 Cookie 的场景，通常放在请求头 <code>Authorization: Bearer &lt;token&gt;</code> 里。</li>
+</ul>
+<h2 id="_5">无状态的代价：发出去的令牌收不回来</h2>
+<figure><img src="img/f-53.jpg" alt="JWT 难以主动失效：短期 access token + refresh token，或黑名单" loading="lazy"><figcaption>JWT 难以主动失效：短期 access token + refresh token，或黑名单</figcaption></figure>
+<p>JWT 的优点和缺点是同一件事：<strong>服务端不存状态</strong>。这意味着一旦签发，在 <code>exp</code> 之前它<strong>一直有效</strong>。用户点了「退出登录」、改了密码、账号被封，服务器都没有办法让已经发出去的 token 失效——它根本不记得自己发过哪些 token。</p>
+<h3 id="access-token-refresh-token">方案一：短期 access token + refresh token</h3>
+<p>最主流的做法是把令牌拆成两种：</p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>access token</th>
+<th>refresh token</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>有效期</td>
+<td><strong>短</strong>，常见几分钟到一小时</td>
+<td><strong>长</strong>，几天到几十天</td>
+</tr>
+<tr>
+<td>用途</td>
+<td>每个 API 请求都带上</td>
+<td>只用来换新的 access token</td>
+</tr>
+<tr>
+<td>校验</td>
+<td>无状态，只验签名和 exp</td>
+<td><strong>服务端存储并检查</strong>，可随时吊销</td>
+</tr>
+<tr>
+<td>发给谁</td>
+<td>资源服务器</td>
+<td>只发给认证服务器</td>
+</tr>
+</tbody>
+</table>
+<p>这样，「无状态」只保留在高频的 API 调用上，「可吊销」的检查放在低频的刷新动作上。用户被封号后，最多再撑一个 access token 的有效期（比如 15 分钟），之后刷新时就会被拒绝。</p>
+<p>refresh token 本身更值钱，需要额外保护：</p>
+<ul>
+<li><strong>轮换</strong>（rotation）：每次刷新都发一个新的 refresh token，旧的立即作废；</li>
+<li><strong>重用检测</strong>：如果一个已经用过的 refresh token 又被拿来刷新，说明它很可能被偷了。此时把这一整条刷新链全部吊销，让用户重新登录。这是 OAuth 2.0 安全最佳实践（RFC 9700）中推荐的做法之一。</li>
+</ul>
+<p>后面的实验三会实现这套逻辑。</p>
+<h3 id="_6">方案二：黑名单</h3>
+<p>退出登录时，把这个 token 的 <code>jti</code>（或者整个 token 的哈希）写进 Redis，过期时间设为 token 的剩余有效期；验签通过后，再查一次黑名单。</p>
+<p>这确实能做到立即失效，但每个请求又要查一次 Redis——<strong>又引入了状态</strong>，某种程度上回到了 Session 的老路。实践中黑名单一般和短期 access token 搭配：只有少量「需要立刻踢下线」的 token 进黑名单，而且黑名单里的记录很快就会过期。</p>
+<h3 id="_7">另一种思路：令牌版本号</h3>
+<p>在用户表里存一个 <code>token_version</code>，签发 token 时写进 payload。改密码或「退出所有设备」时把版本号加 1，校验时比较两者。这同样需要查一次用户数据（可以缓存），好处是一次操作就能让该用户的所有 token 失效。</p>
+<h3 id="session-jwt">Session 和 JWT 怎么选</h3>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>Session</th>
+<th>JWT</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>状态存在</td>
+<td>服务端（内存 / Redis）</td>
+<td>客户端（令牌本身）</td>
+</tr>
+<tr>
+<td>每次请求</td>
+<td>查一次存储</td>
+<td>只验签名</td>
+</tr>
+<tr>
+<td>主动失效</td>
+<td>删记录，立即生效</td>
+<td>难，需要短期令牌、黑名单等配合</td>
+</tr>
+<tr>
+<td>体积</td>
+<td>Cookie 里只有一个短 ID</td>
+<td>令牌较大，每个请求都带着</td>
+</tr>
+<tr>
+<td>适合</td>
+<td>传统 Web 应用、单体或少量服务</td>
+<td>微服务、移动端、跨域、服务间调用</td>
+</tr>
+</tbody>
+</table>
+<p>很多人默认「JWT 更先进」，其实不然。<strong>对于普通的网站，Session + Redis 往往更简单、更安全</strong>：失效可控、Cookie 有成熟的安全属性。JWT 的真正价值在于<strong>跨服务、跨组织地传递身份</strong>，比如下面要讲的 OAuth2 和 OIDC。</p>
+<h2 id="oauth2">OAuth2：第三方登录到底授权了什么</h2>
+<figure><img src="img/f-65.3.jpg" alt="OAuth2 授权码 + PKCE 流程" loading="lazy"><figcaption>OAuth2 授权码 + PKCE 流程</figcaption></figure>
+<p>你在某个应用上点「用 GitHub 账号登录」，或者授权一个工具读取你的网盘文件。这时有一个问题：<strong>这个应用需要访问你在另一个平台上的数据，但你不应该把那个平台的密码交给它</strong>。</p>
+<p>OAuth 2.0（RFC 6749）就是为此设计的<strong>授权框架</strong>。它有四个角色：</p>
+<table>
+<thead>
+<tr>
+<th>角色</th>
+<th>例子</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>资源所有者（Resource Owner）</td>
+<td>你，也就是用户</td>
+</tr>
+<tr>
+<td>客户端（Client）</td>
+<td>想访问你数据的应用</td>
+</tr>
+<tr>
+<td>授权服务器（Authorization Server）</td>
+<td>平台负责登录和发令牌的服务</td>
+</tr>
+<tr>
+<td>资源服务器（Resource Server）</td>
+<td>平台存着你数据的 API</td>
+</tr>
+</tbody>
+</table>
+<h3 id="authorization-code-pkce">授权码流程（Authorization Code）+ PKCE</h3>
+<p>这是目前推荐的流程，不论是有后端的 Web 应用、单页应用还是手机 App 都适用：</p>
+<ol>
+<li><strong>用户点击「用第三方账号登录」</strong>；</li>
+<li>应用把浏览器<strong>重定向到授权服务器</strong>，URL 中带上：<code>client_id</code>（应用是谁）、<code>redirect_uri</code>（授权后跳回哪里）、<code>scope</code>（要什么权限）、<code>state</code>（随机值，防 CSRF）、<code>code_challenge</code>（PKCE，见下文）；</li>
+<li>用户<strong>在授权服务器的页面上</strong>登录，并看到「某应用想要读取你的公开信息和邮箱」，点击同意。<strong>密码只交给了授权服务器</strong>；</li>
+<li>授权服务器把浏览器重定向回 <code>redirect_uri?code=xxx&amp;state=yyy</code>。应用检查 <code>state</code> 和自己发出去的一致；</li>
+<li>应用的后端拿着 <code>code</code> + <code>code_verifier</code>（机密客户端还要带 <code>client_secret</code>）向授权服务器的令牌端点<strong>换取令牌</strong>。这一步是服务器之间的直接调用，不经过浏览器；</li>
+<li>授权服务器返回 <code>access_token</code>（可能还有 <code>refresh_token</code>）；</li>
+<li>应用带着 <code>Authorization: Bearer &lt;access_token&gt;</code> 调用资源服务器的 API。</li>
+</ol>
+<p>为什么要先发一个 <code>code</code> 再换 token，而不是直接把 token 放在重定向 URL 里？因为浏览器的 URL 会出现在历史记录、日志、Referer 头里，容易泄露。授权码<strong>短期有效</strong>（RFC 6749 建议最长 10 分钟）且<strong>只能使用一次</strong>，真正的令牌通过后端直接获取。早期直接在 URL 里返回 token 的「隐式模式」（Implicit）已经不再推荐。</p>
+<h3 id="pkce">PKCE：截获了授权码也没用</h3>
+<p>授权码在第 4 步要经过浏览器，在手机上还可能经过系统的 URL 跳转，存在被恶意应用截获的可能。<strong>PKCE</strong>（Proof Key for Code Exchange，RFC 7636，读作 "pixy"）的做法是：</p>
+<ol>
+<li>客户端随机生成一个 <code>code_verifier</code>，自己留着；</li>
+<li>计算 <code>code_challenge = BASE64URL(SHA256(code_verifier))</code>，放在第 2 步的授权请求里；</li>
+<li>第 5 步换令牌时，必须提交原始的 <code>code_verifier</code>，授权服务器算一下哈希，和当初的 <code>code_challenge</code> 比对。</li>
+</ol>
+<p>攻击者即使截获了 <code>code</code>，也不知道 <code>code_verifier</code>（它从没离开过客户端），就换不到令牌。PKCE 最初是为手机 App 这类无法安全保存 <code>client_secret</code> 的「公开客户端」设计的，现在的安全最佳实践（RFC 9700）建议所有客户端都使用。</p>
+<h3 id="scope">scope：令牌能做什么</h3>
+<p><code>scope</code> 限定 access token 的权限范围，比如 <code>read:user</code>、<code>repo</code>。资源服务器在处理请求时要检查 token 的 scope 是否覆盖当前操作。按<strong>最小权限</strong>原则申请 scope，用户也更愿意授权。</p>
+<h3 id="_8">其他授权方式</h3>
+<table>
+<thead>
+<tr>
+<th>授权方式</th>
+<th>场景</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>授权码 + PKCE</td>
+<td>有用户参与的登录和授权，<strong>首选</strong></td>
+</tr>
+<tr>
+<td>客户端凭证（Client Credentials）</td>
+<td>服务和服务之间调用，没有用户参与</td>
+</tr>
+<tr>
+<td>设备码（Device Code，RFC 8628）</td>
+<td>电视、命令行工具等不方便输入的设备</td>
+</tr>
+<tr>
+<td>刷新令牌（Refresh Token）</td>
+<td>用 refresh token 换新的 access token</td>
+</tr>
+<tr>
+<td>~~密码模式~~、~~隐式模式~~</td>
+<td>已不推荐使用</td>
+</tr>
+</tbody>
+</table>
+<h3 id="oauth2-vs-oidc-vs">OAuth2 vs OIDC：授权 vs 认证</h3>
+<p>OAuth2 是<strong>授权</strong>协议：它回答「这个应用能不能读取你的相册」。access token 是给<strong>资源服务器</strong>看的通行证，对客户端来说，它应该被当作一串不透明的字符串，客户端不应该解析它，更不应该把它当作「用户是谁」的证明。</p>
+<p>但「用第三方账号登录」要的恰恰是<strong>认证</strong>：应用想知道「现在登录的是谁」。拿 access token 去调用户信息接口来推断身份，存在被「换 token」攻击的风险：攻击者把从别的应用拿到的、属于受害者的 access token 塞给你的应用，你的应用无法分辨这个 token 是不是发给自己的。</p>
+<p><strong>OIDC</strong>（OpenID Connect）在 OAuth2 之上补上了认证这一层：</p>
+<ul>
+<li>授权请求的 <code>scope</code> 里加上 <code>openid</code>；</li>
+<li>令牌端点除了 access token，还会返回一个 <strong>id_token</strong>，它是一个 JWT，专门给<strong>客户端</strong>看的「身份证明」；</li>
+<li>id_token 里有：<code>iss</code>（谁签发的）、<code>sub</code>（用户在该平台的唯一 ID）、<code>aud</code>（<strong>发给哪个客户端</strong>，必须等于自己的 client_id）、<code>exp</code>、<code>iat</code>，以及防重放的 <code>nonce</code> 等；</li>
+<li>客户端必须验证 id_token 的签名（用授权服务器公布的公钥）、<code>iss</code>、<code>aud</code>、<code>exp</code> 和 <code>nonce</code>。</li>
+</ul>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>OAuth2</th>
+<th>OIDC</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>解决的问题</td>
+<td>授权：应用能做什么</td>
+<td>认证：用户是谁</td>
+</tr>
+<tr>
+<td>核心产物</td>
+<td>access_token</td>
+<td><strong>id_token</strong>（JWT）+ access_token</td>
+</tr>
+<tr>
+<td>给谁看</td>
+<td>资源服务器</td>
+<td>客户端</td>
+</tr>
+<tr>
+<td>额外的东西</td>
+<td>—</td>
+<td>UserInfo 接口、发现文档 <code>/.well-known/openid-configuration</code></td>
+</tr>
+</tbody>
+</table>
+<p>并不是所有平台都实现了 OIDC。比如 GitHub 的 OAuth App 登录，就是拿 access token 调用户信息接口（<code>/user</code>）获取身份。接入这类平台时，要确保 token 确实是通过自己发起的授权码流程拿到的，不能接受从外部直接传进来的 access token。</p>
+<h2 id="_9">安全底线</h2>
+<figure><img src="img/f-77.3.jpg" alt="OAuth2 与 OIDC 的区别，以及 Cookie、CSRF、XSS、密码存储的安全要点" loading="lazy"><figcaption>OAuth2 与 OIDC 的区别，以及 Cookie、CSRF、XSS、密码存储的安全要点</figcaption></figure>
+<p>不管用哪种方案，下面这些都不能省。</p>
+<h3 id="cookie_1">Cookie 的三个属性</h3>
+<pre><code class="language-text">Set-Cookie: sid=...; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=1800
+</code></pre>
+<ul>
+<li><strong>HttpOnly</strong>：页面脚本读不到这个 Cookie，XSS 就无法直接把它偷走；</li>
+<li><strong>Secure</strong>：只通过 HTTPS 发送，避免在明文网络中泄露；</li>
+<li><strong>SameSite</strong>：从其他网站发起的请求是否携带 Cookie。<code>Strict</code> 完全不带；<code>Lax</code> 只在用户点击链接这类顶层 GET 跳转时携带，跨站的 POST、iframe、图片请求都不带；<code>None</code> 表示总是携带，此时必须同时设置 <code>Secure</code>。Chrome 等浏览器对没有声明 SameSite 的 Cookie 默认按 <code>Lax</code> 处理。</li>
+</ul>
+<h3 id="csrf-cookie">CSRF：借你的 Cookie 发请求</h3>
+<p>跨站请求伪造（CSRF）：你登录了银行网站，又打开了一个恶意网页，恶意网页里藏着一个自动提交的表单，目标是银行的转账接口。浏览器发送请求时<strong>自动带上了银行的 Cookie</strong>，银行以为是你本人操作。</p>
+<p>CSRF 的根源是「Cookie 自动携带」。防护手段：</p>
+<ul>
+<li><strong>SameSite=Lax 或 Strict</strong>：跨站的 POST 请求不再携带 Cookie，挡住了大部分 CSRF；</li>
+<li><strong>CSRF Token</strong>：服务端在表单或页面里放一个随机值，提交时校验。恶意网站读不到这个值，也就伪造不了请求；</li>
+<li><strong>校验 Origin / Referer 头</strong>，或者现代浏览器提供的 <code>Sec-Fetch-Site</code> 头；</li>
+<li><strong>会修改数据的操作不要用 GET</strong>，因为 <code>Lax</code> 对顶层 GET 跳转是放行的。</li>
+</ul>
+<p>用 <code>Authorization: Bearer</code> 头传 token 的接口天然不受 CSRF 影响，因为浏览器不会自动添加这个头。</p>
+<h3 id="xss">XSS：注入脚本，什么都能做</h3>
+<p>跨站脚本（XSS）：攻击者设法让自己的脚本在你的页面上运行，比如在评论区里提交了一段没被转义的 <code>&lt;script&gt;</code>。脚本运行在你的域名下，可以读取 <code>localStorage</code>、调用接口、修改页面。</p>
+<ul>
+<li><strong>防护的根本</strong>是输出时正确转义、不拼接 HTML，配合 <strong>CSP</strong>（内容安全策略）限制可以执行的脚本来源；</li>
+<li>如果 token 放在 <code>localStorage</code>，XSS 可以直接把它发到攻击者的服务器，之后在任何地方使用；放在 HttpOnly Cookie 里，脚本读不到，但<strong>仍然可以在页面内以你的身份发请求</strong>。HttpOnly 能减少损失，但不能代替修复 XSS 本身；</li>
+<li>对于浏览器里的单页应用，一种越来越常见的做法是 <strong>BFF</strong>（Backend for Frontend）：由同域的后端完成 OAuth 流程、保管令牌，浏览器和 BFF 之间只用 HttpOnly 的 Session Cookie。</li>
+</ul>
+<h3 id="_10">密码：用慢哈希，加盐</h3>
+<p><strong>永远不要存明文密码，也不要用 MD5、SHA-256 直接哈希</strong>。通用哈希被设计得非常快，一张显卡每秒可以尝试数十亿次，泄露的哈希库很快就会被暴力破解出大部分弱密码。</p>
+<p>应该使用专门的<strong>密码哈希算法</strong>，它们故意设计得很慢，还可以调节成本：</p>
+<table>
+<thead>
+<tr>
+<th>算法</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Argon2id</strong></td>
+<td>密码哈希竞赛（PHC）的胜出算法，同时消耗内存和 CPU，OWASP 首选</td>
+</tr>
+<tr>
+<td><strong>scrypt</strong></td>
+<td>也是内存困难型，Python 标准库 <code>hashlib.scrypt</code> 即可使用</td>
+</tr>
+<tr>
+<td><strong>bcrypt</strong></td>
+<td>久经考验，各语言都有成熟实现；注意输入超过 72 字节的部分会被忽略</td>
+</tr>
+<tr>
+<td>PBKDF2</td>
+<td>有 FIPS 认证要求时使用，需要很高的迭代次数</td>
+</tr>
+</tbody>
+</table>
+<p>每个密码都要使用独立的随机<strong>盐</strong>，这样相同的密码哈希结果不同，彩虹表就失效了。成熟的库（如 Spring Security 的 <code>BCryptPasswordEncoder</code>、Python 的 <code>argon2-cffi</code>）会自动处理盐，并把算法参数和盐一起存进结果字符串。实验四用标准库的 scrypt 演示这一点。</p>
+<h3 id="_11">其他</h3>
+<ul>
+<li><strong>全站 HTTPS</strong>：Cookie、token、密码在明文网络中都是「裸奔」（见本系列《HTTPS》）；</li>
+<li><strong>登录接口限流</strong>、连续失败后加验证码或临时锁定，防止撞库和暴力破解（见本系列《限流算法》）；</li>
+<li>登录失败时统一提示「账号或密码错误」，不要透露账号是否存在；</li>
+<li>敏感操作（改密码、转账）要求重新验证身份。</li>
+</ul>
+<h2 id="_12">动手实验</h2>
+<p>下面的代码都只依赖 Python 标准库（实验一最后的交叉验证用了 PyJWT），在 Python 3.13 下运行。</p>
+<h3 id="hs256-jwt">实验一：手写 HS256 JWT 的签发与校验</h3>
+<pre><code class="language-python">import base64, hashlib, hmac, json, time
+
+def b64url_encode(data: bytes) -&gt; str:
+    return base64.urlsafe_b64encode(data).rstrip(b&quot;=&quot;).decode()
+
+def b64url_decode(s: str) -&gt; bytes:
+    return base64.urlsafe_b64decode(s + &quot;=&quot; * (-len(s) % 4))
+
+def sign(payload: dict, key: bytes) -&gt; str:
+    header = {&quot;alg&quot;: &quot;HS256&quot;, &quot;typ&quot;: &quot;JWT&quot;}
+    h = b64url_encode(json.dumps(header, separators=(&quot;,&quot;, &quot;:&quot;)).encode())
+    p = b64url_encode(json.dumps(payload, separators=(&quot;,&quot;, &quot;:&quot;)).encode())
+    sig = hmac.new(key, f&quot;{h}.{p}&quot;.encode(), hashlib.sha256).digest()
+    return f&quot;{h}.{p}.{b64url_encode(sig)}&quot;
+
+class InvalidToken(Exception):
+    pass
+
+def verify(token: str, key: bytes, now: float | None = None, leeway: int = 0) -&gt; dict:
+    try:
+        h, p, s = token.split(&quot;.&quot;)
+    except ValueError:
+        raise InvalidToken(&quot;格式错误：应为三段&quot;)
+    header = json.loads(b64url_decode(h))
+    if header.get(&quot;alg&quot;) != &quot;HS256&quot;:                 # 只接受服务端预期的算法，拒绝 none 等
+        raise InvalidToken(f&quot;不接受的算法：{header.get('alg')}&quot;)
+    expected = hmac.new(key, f&quot;{h}.{p}&quot;.encode(), hashlib.sha256).digest()
+    if not hmac.compare_digest(expected, b64url_decode(s)):   # 常量时间比较
+        raise InvalidToken(&quot;签名不匹配&quot;)
+    payload = json.loads(b64url_decode(p))
+    now = time.time() if now is None else now
+    if &quot;exp&quot; in payload and now &gt; payload[&quot;exp&quot;] + leeway:
+        raise InvalidToken(&quot;已过期&quot;)
+    return payload
+
+KEY = b&quot;server-side-secret-at-least-32-bytes!!&quot;
+
+if __name__ == &quot;__main__&quot;:
+    iat = 1_760_000_000                                  # 为了输出可复现，固定「现在」的时间
+    token = sign({&quot;sub&quot;: &quot;42&quot;, &quot;role&quot;: &quot;user&quot;, &quot;iat&quot;: iat, &quot;exp&quot;: iat + 900}, KEY)
+    print(&quot;token:&quot;, token)
+
+    # 1. 签名不是加密：不需要密钥就能看到 payload
+    print(&quot;\n[1] 不用密钥直接解码 payload:&quot;, b64url_decode(token.split(&quot;.&quot;)[1]).decode())
+
+    # 2. 正常校验
+    print(&quot;[2] 校验通过:&quot;, verify(token, KEY, now=iat + 60))
+
+    def try_verify(label, tok, key=KEY, now=iat + 60):
+        try:
+            verify(tok, key, now=now); print(f&quot;[{label}] 竟然通过了！&quot;)
+        except InvalidToken as e:
+            print(f&quot;[{label}] 拒绝：{e}&quot;)
+
+    # 3. 篡改 payload：把 role 改成 admin，签名保持原样
+    h, p, s = token.split(&quot;.&quot;)
+    evil = json.loads(b64url_decode(p)); evil[&quot;role&quot;] = &quot;admin&quot;
+    forged = f&quot;{h}.{b64url_encode(json.dumps(evil, separators=(',', ':')).encode())}.{s}&quot;
+    try_verify(&quot;3 篡改 payload&quot;, forged)
+
+    # 4. 用错误的密钥自己重新签一个
+    try_verify(&quot;4 攻击者自签&quot;, sign({**evil, &quot;exp&quot;: iat + 900}, b&quot;guessed-key&quot;))
+
+    # 5. alg=none 攻击：去掉签名、声明不签名
+    none_h = b64url_encode(b'{&quot;alg&quot;:&quot;none&quot;,&quot;typ&quot;:&quot;JWT&quot;}')
+    try_verify(&quot;5 alg=none&quot;, f&quot;{none_h}.{p}.&quot;)
+
+    # 6. 过期判断（exp = iat + 900 秒）
+    try_verify(&quot;6 15 分钟后&quot;, token, now=iat + 901)
+    print(&quot;[7] 允许 30 秒时钟偏差时:&quot;, &quot;通过&quot; if verify(token, KEY, now=iat + 901, leeway=30) else &quot;&quot;)
+</code></pre>
+<p>输出：</p>
+<pre><code class="language-text">token: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiI0MiIsInJvbGUiOiJ1c2VyIiwiaWF0IjoxNzYwMDAwMDAwLCJleHAiOjE3NjAwMDA5MDB9.XzSDshbH0WW9Z8Nud0Nf2ne3O6RQ1qp0w4qNzcLJqbg
+
+[1] 不用密钥直接解码 payload: {&quot;sub&quot;:&quot;42&quot;,&quot;role&quot;:&quot;user&quot;,&quot;iat&quot;:1760000000,&quot;exp&quot;:1760000900}
+[2] 校验通过: {'sub': '42', 'role': 'user', 'iat': 1760000000, 'exp': 1760000900}
+[3 篡改 payload] 拒绝：签名不匹配
+[4 攻击者自签] 拒绝：签名不匹配
+[5 alg=none] 拒绝：不接受的算法：none
+[6 15 分钟后] 拒绝：已过期
+[7] 允许 30 秒时钟偏差时: 通过
+</code></pre>
+<p>几个值得注意的细节：</p>
+<ul>
+<li><strong>签名比较用 <code>hmac.compare_digest</code></strong>：普通的 <code>==</code> 在第一个不同的字节就返回，耗时会泄露「前面有几个字节是对的」，理论上可以被用来逐字节猜签名（计时攻击）；</li>
+<li><strong>算法由服务端决定，而不是读 token 里的 <code>alg</code></strong>：历史上一些 JWT 库会「听 token 的话」，接受 <code>alg: none</code>（不签名），或者在本该用 RS256 公钥验证时被诱导用 HS256，把公开的公钥当成 HMAC 密钥，导致任何人都能伪造 token。RFC 8725（JWT 最佳实践）要求验证方明确限定允许的算法；</li>
+<li><strong>HS256 的密钥至少 256 位</strong>（RFC 7518 的要求），而且必须是随机生成的，不能是 <code>secret</code>、<code>123456</code> 这种可以离线暴力猜解的字符串；</li>
+<li><code>leeway</code> 用来容忍服务器之间几秒到几十秒的时钟偏差。</li>
+</ul>
+<p>用成熟的库 PyJWT 做交叉验证，手写实现生成的 token 与库生成的逐字节相同：</p>
+<pre><code class="language-python">import jwt                      # PyJWT，只用来交叉验证我们手写的实现
+from jwt_hs256 import sign, KEY
+iat = 1_760_000_000
+mine = sign({&quot;sub&quot;: &quot;42&quot;, &quot;role&quot;: &quot;user&quot;, &quot;iat&quot;: iat, &quot;exp&quot;: iat + 900}, KEY)
+lib = jwt.encode({&quot;sub&quot;: &quot;42&quot;, &quot;role&quot;: &quot;user&quot;, &quot;iat&quot;: iat, &quot;exp&quot;: iat + 900}, KEY, algorithm=&quot;HS256&quot;)
+print(&quot;与 PyJWT 生成的完全一致:&quot;, mine == lib)
+print(&quot;PyJWT 校验手写的 token:&quot;, jwt.decode(mine, KEY, algorithms=[&quot;HS256&quot;], options={&quot;verify_exp&quot;: False}))
+</code></pre>
+<pre><code class="language-text">与 PyJWT 生成的完全一致: True
+PyJWT 校验手写的 token: {'sub': '42', 'role': 'user', 'iat': 1760000000, 'exp': 1760000900}
+</code></pre>
+<blockquote>
+<p>生产环境请使用成熟的库，并且像上面一样<strong>显式传入 <code>algorithms=["HS256"]</code></strong>。手写只是为了看清原理。</p>
+</blockquote>
+<h3 id="session_2">实验二：一个最小的 Session 登录</h3>
+<p>用标准库起一个 HTTP 服务，<code>http.cookiejar</code> 扮演浏览器保存 Cookie：</p>
+<pre><code class="language-python">import http.cookiejar, json, secrets, threading, time, urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.cookies import SimpleCookie
+
+SESSIONS = {}            # sessionId -&gt; {&quot;user&quot;: ..., &quot;expires&quot;: ...}；生产环境放 Redis
+TTL = 30 * 60            # 30 分钟无操作过期（滑动过期）
+USERS = {&quot;alice&quot;: &quot;correct-horse&quot;}   # 仅演示；真实系统存的是密码哈希
+
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, *args):        # 关掉默认访问日志
+        pass
+
+    def current_session(self):
+        cookie = SimpleCookie(self.headers.get(&quot;Cookie&quot;, &quot;&quot;))
+        sid = cookie[&quot;sid&quot;].value if &quot;sid&quot; in cookie else None
+        s = SESSIONS.get(sid)
+        if not s or s[&quot;expires&quot;] &lt; time.time():
+            SESSIONS.pop(sid, None)
+            return None, None
+        s[&quot;expires&quot;] = time.time() + TTL                  # 每次访问续期
+        return sid, s
+
+    def reply(self, code, body, set_cookie=None):
+        self.send_response(code)
+        self.send_header(&quot;Content-Type&quot;, &quot;application/json&quot;)
+        if set_cookie:
+            self.send_header(&quot;Set-Cookie&quot;, set_cookie)
+        self.end_headers()
+        self.wfile.write(json.dumps(body, ensure_ascii=False).encode())
+
+    def do_POST(self):
+        form = json.loads(self.rfile.read(int(self.headers[&quot;Content-Length&quot;])))
+        if self.path == &quot;/login&quot;:
+            if USERS.get(form[&quot;user&quot;]) != form[&quot;password&quot;]:
+                return self.reply(401, {&quot;error&quot;: &quot;账号或密码错误&quot;})
+            old_sid, _ = self.current_session()
+            SESSIONS.pop(old_sid, None)                     # 登录后换新 sessionId，防会话固定
+            sid = secrets.token_urlsafe(32)                 # 不可预测的随机编号
+            SESSIONS[sid] = {&quot;user&quot;: form[&quot;user&quot;], &quot;expires&quot;: time.time() + TTL}
+            # 本地演示走 http，所以没加 Secure；线上必须加
+            return self.reply(200, {&quot;ok&quot;: True}, f&quot;sid={sid}; HttpOnly; SameSite=Lax; Path=/; Max-Age={TTL}&quot;)
+        if self.path == &quot;/logout&quot;:
+            sid, _ = self.current_session()
+            SESSIONS.pop(sid, None)                         # 服务端删除，立即失效
+            return self.reply(200, {&quot;ok&quot;: True}, &quot;sid=; Max-Age=0; Path=/&quot;)
+
+    def do_GET(self):
+        sid, s = self.current_session()
+        if self.path == &quot;/me&quot;:
+            if not s:
+                return self.reply(401, {&quot;error&quot;: &quot;未登录&quot;})
+            return self.reply(200, {&quot;user&quot;: s[&quot;user&quot;]})
+
+server = ThreadingHTTPServer((&quot;127.0.0.1&quot;, 0), Handler)
+threading.Thread(target=server.serve_forever, daemon=True).start()
+base = f&quot;http://127.0.0.1:{server.server_port}&quot;
+
+jar = http.cookiejar.CookieJar()                           # 扮演浏览器保存 Cookie
+opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
+
+def call(method, path, body=None):
+    req = urllib.request.Request(base + path, method=method,
+                                 data=json.dumps(body).encode() if body is not None else None)
+    try:
+        with opener.open(req) as r:
+            return r.status, json.loads(r.read()), r.headers.get(&quot;Set-Cookie&quot;)
+    except urllib.error.HTTPError as e:
+        return e.code, json.loads(e.read()), None
+
+print(&quot;1. 未登录访问 /me      -&gt;&quot;, call(&quot;GET&quot;, &quot;/me&quot;)[:2])
+code, body, sc = call(&quot;POST&quot;, &quot;/login&quot;, {&quot;user&quot;: &quot;alice&quot;, &quot;password&quot;: &quot;correct-horse&quot;})
+print(&quot;2. 登录                -&gt;&quot;, code, body)
+print(&quot;   Set-Cookie:&quot;, sc.split(&quot;=&quot;, 1)[0] + &quot;=&lt;43 位随机串&gt;;&quot; + sc.split(&quot;;&quot;, 1)[1])
+print(&quot;   浏览器保存的 Cookie:&quot;, [c.name for c in jar])
+print(&quot;3. 再访问 /me          -&gt;&quot;, call(&quot;GET&quot;, &quot;/me&quot;)[:2])
+print(&quot;   服务端会话数:&quot;, len(SESSIONS), &quot;；sid 长度:&quot;, len(next(iter(SESSIONS))))
+print(&quot;4. 退出登录            -&gt;&quot;, call(&quot;POST&quot;, &quot;/logout&quot;, {})[:2])
+print(&quot;5. 退出后访问 /me      -&gt;&quot;, call(&quot;GET&quot;, &quot;/me&quot;)[:2], &quot;；服务端会话数:&quot;, len(SESSIONS))
+server.shutdown()
+</code></pre>
+<p>输出：</p>
+<pre><code class="language-text">1. 未登录访问 /me      -&gt; (401, {'error': '未登录'})
+2. 登录                -&gt; 200 {'ok': True}
+   Set-Cookie: sid=&lt;43 位随机串&gt;; HttpOnly; SameSite=Lax; Path=/; Max-Age=1800
+   浏览器保存的 Cookie: ['sid']
+3. 再访问 /me          -&gt; (200, {'user': 'alice'})
+   服务端会话数: 1 ；sid 长度: 43
+4. 退出登录            -&gt; (200, {'ok': True})
+5. 退出后访问 /me      -&gt; (401, {'error': '未登录'}) ；服务端会话数: 0
+</code></pre>
+<p>第 3 步里客户端代码没有手动处理任何 Cookie，是 CookieJar 自动带上的，这就是浏览器的行为。第 5 步展示了 Session 最大的优势：<strong>服务端删掉记录，立即失效</strong>。把 <code>SESSIONS</code> 这个字典换成 Redis 的 <code>SET sid value EX 1800</code> 和 <code>GET sid</code>，就是分布式 Session 的雏形。</p>
+<h3 id="refresh-token">实验三：refresh token 轮换与重用检测</h3>
+<p>复用实验一的 <code>sign</code> / <code>verify</code>：</p>
+<pre><code class="language-python">import hashlib, secrets
+from jwt_hs256 import sign, verify, KEY, InvalidToken
+
+ACCESS_TTL = 15 * 60
+REFRESH = {}   # sha256(refresh_token) -&gt; {&quot;user&quot;, &quot;family&quot;, &quot;used&quot;}；生产环境放数据库 / Redis
+REVOKED_FAMILIES = set()
+
+def h(tok): return hashlib.sha256(tok.encode()).hexdigest()   # 只存哈希，库泄露也拿不到原值
+
+def issue(user, family, now):
+    access = sign({&quot;sub&quot;: user, &quot;iat&quot;: now, &quot;exp&quot;: now + ACCESS_TTL}, KEY)
+    refresh = secrets.token_urlsafe(32)
+    REFRESH[h(refresh)] = {&quot;user&quot;: user, &quot;family&quot;: family, &quot;used&quot;: False}
+    return access, refresh
+
+def login(user, now):
+    return issue(user, family=secrets.token_hex(4), now=now)
+
+def refresh(token, now):
+    rec = REFRESH.get(h(token))
+    if rec is None or rec[&quot;family&quot;] in REVOKED_FAMILIES:
+        raise InvalidToken(&quot;refresh token 无效或已吊销&quot;)
+    if rec[&quot;used&quot;]:                                  # 旧 token 被再次使用 → 很可能泄露了
+        REVOKED_FAMILIES.add(rec[&quot;family&quot;])          # 整个家族全部作废，强制重新登录
+        raise InvalidToken(&quot;检测到 refresh token 被重复使用，已吊销整个会话&quot;)
+    rec[&quot;used&quot;] = True                               # 轮换：每个 refresh token 只能用一次
+    return issue(rec[&quot;user&quot;], rec[&quot;family&quot;], now)
+
+t0 = 1_760_000_000
+a1, r1 = login(&quot;42&quot;, t0)
+print(&quot;登录后 access 有效:&quot;, verify(a1, KEY, now=t0 + 60)[&quot;sub&quot;])
+try:
+    verify(a1, KEY, now=t0 + 16 * 60)
+except InvalidToken as e:
+    print(&quot;16 分钟后 access:&quot;, e)
+a2, r2 = refresh(r1, t0 + 16 * 60)
+print(&quot;用 r1 换到新的 access:&quot;, verify(a2, KEY, now=t0 + 17 * 60)[&quot;sub&quot;], &quot;| r1 与 r2 不同:&quot;, r1 != r2)
+
+# 攻击者此前偷到了 r1，现在拿来用
+try:
+    refresh(r1, t0 + 20 * 60)
+except InvalidToken as e:
+    print(&quot;攻击者重放 r1:&quot;, e)
+# 连带着，合法用户手里的 r2 也失效了
+try:
+    refresh(r2, t0 + 31 * 60)
+except InvalidToken as e:
+    print(&quot;合法用户用 r2:&quot;, e)
+</code></pre>
+<p>输出：</p>
+<pre><code class="language-text">登录后 access 有效: 42
+16 分钟后 access: 已过期
+用 r1 换到新的 access: 42 | r1 与 r2 不同: True
+攻击者重放 r1: 检测到 refresh token 被重复使用，已吊销整个会话
+合法用户用 r2: refresh token 无效或已吊销
+</code></pre>
+<p>服务端分不清谁是攻击者、谁是合法用户，所以选择「全部作废、重新登录」，宁可让用户多登录一次。真实系统中，用户主动退出或修改密码时，也是把对应的 family 加入吊销列表。</p>
+<h3 id="_13">实验四：密码加盐慢哈希</h3>
+<pre><code class="language-python">import hashlib, hmac, os, time
+
+# scrypt 参数取 OWASP 密码存储备忘单给出的最低配置：N=2^17, r=8, p=1（约 128 MiB 内存）
+N, R, P = 2**17, 8, 1
+
+def hash_password(password: str) -&gt; str:
+    salt = os.urandom(16)                                  # 每个密码独立的随机盐
+    dk = hashlib.scrypt(password.encode(), salt=salt, n=N, r=R, p=P, maxmem=256 * 1024 * 1024, dklen=32)
+    return f&quot;scrypt${N}${R}${P}${salt.hex()}${dk.hex()}&quot;   # 参数、盐和结果一起存
+
+def check_password(password: str, stored: str) -&gt; bool:
+    _, n, r, p, salt, dk = stored.split(&quot;$&quot;)
+    got = hashlib.scrypt(password.encode(), salt=bytes.fromhex(salt), n=int(n), r=int(r), p=int(p),
+                         maxmem=256 * 1024 * 1024, dklen=32)
+    return hmac.compare_digest(got.hex(), dk)
+
+h1, h2 = hash_password(&quot;123456&quot;), hash_password(&quot;123456&quot;)
+print(&quot;同一个密码，两次结果不同（盐不同）:&quot;)
+print(&quot; &quot;, h1[:60] + &quot;...&quot;)
+print(&quot; &quot;, h2[:60] + &quot;...&quot;)
+print(&quot;正确密码:&quot;, check_password(&quot;123456&quot;, h1), &quot; 错误密码:&quot;, check_password(&quot;1234567&quot;, h1))
+
+t = time.perf_counter(); check_password(&quot;123456&quot;, h1); slow = time.perf_counter() - t
+t = time.perf_counter()
+for _ in range(10000): hashlib.sha256(b&quot;123456&quot;).digest()
+fast = (time.perf_counter() - t) / 10000
+print(f&quot;scrypt 一次约 {slow*1000:.0f} ms；SHA-256 一次约 {fast*1e6:.2f} µs，相差约 {slow/fast:,.0f} 倍&quot;)
+</code></pre>
+<p>输出（盐是随机的，耗时取决于机器）：</p>
+<pre><code class="language-text">同一个密码，两次结果不同（盐不同）:
+  scrypt$131072$8$1$88483d4d5be142fe44281a7d1e90b6a8$33f941d89...
+  scrypt$131072$8$1$cbf19719554d2fa736784f039bbb1c09$eab9878ea...
+正确密码: True  错误密码: False
+scrypt 一次约 590 ms；SHA-256 一次约 0.45 µs，相差约 1,320,989 倍
+</code></pre>
+<p>对正常用户来说，登录时多等几百毫秒感觉不到；但对拿着泄露哈希库暴力破解的攻击者来说，每次尝试都慢了上百万倍，还要占用大量内存，显卡并行的优势也被大幅削弱。实际项目中参数要根据服务器能力和登录 QPS 来调。</p>
+<h3 id="pkce-code_challenge">实验五：PKCE 的 code_challenge</h3>
+<pre><code class="language-python">import base64, hashlib, secrets
+
+def b64url(b: bytes) -&gt; str:
+    return base64.urlsafe_b64encode(b).rstrip(b&quot;=&quot;).decode()
+
+def make_pkce():
+    verifier = b64url(secrets.token_bytes(32))              # 43 个字符，只留在客户端
+    challenge = b64url(hashlib.sha256(verifier.encode()).digest())
+    return verifier, challenge
+
+v, c = make_pkce()
+print(&quot;code_verifier  (留在客户端):&quot;, v)
+print(&quot;code_challenge (放进授权请求):&quot;, c)
+
+# 授权服务器在用 code 换令牌时校验：SHA256(verifier) 是否等于当初的 challenge
+check = lambda verifier, challenge: b64url(hashlib.sha256(verifier.encode()).digest()) == challenge
+print(&quot;持有 verifier 的客户端:&quot;, check(v, c))
+print(&quot;只截获了 code 的攻击者:&quot;, check(make_pkce()[0], c))
+
+# RFC 7636 附录 B 的官方测试向量
+rv = &quot;dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk&quot;
+print(&quot;RFC 7636 测试向量:&quot;, b64url(hashlib.sha256(rv.encode()).digest()))
+</code></pre>
+<p>输出（前两行每次运行不同）：</p>
+<pre><code class="language-text">code_verifier  (留在客户端): BLd-srwStA6IDONzaIJyWh_KfUzQhCcTObZfA_25tuE
+code_challenge (放进授权请求): GsFcPKIBI0KVDVN_KB2wCfx-frzibLlMD44s7brBRQ8
+持有 verifier 的客户端: True
+只截获了 code 的攻击者: False
+RFC 7636 测试向量: E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM
+</code></pre>
+<p>最后一行与 RFC 7636 附录 B 中给出的结果 <code>E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM</code> 一致。SHA-256 是单向的，攻击者看到 <code>code_challenge</code> 也反推不出 <code>code_verifier</code>。</p>
+<h2 id="_14">工程实践与常见坑</h2>
+<ul>
+<li><strong>别自己发明协议</strong>：密码哈希、JWT、OAuth2 都用成熟的库和框架（如 Spring Security、各语言的 OIDC 客户端库），自己写的只用于理解原理；</li>
+<li><strong>JWT 不是越大越好</strong>：只放必要的声明（用户 ID、过期时间、少量角色），权限变化频繁的数据别放进去，否则改了权限要等 token 过期才生效；</li>
+<li><strong>校验要完整</strong>：签名、算法白名单、<code>exp</code>、<code>iss</code>、<code>aud</code> 一个都不能少。只验签名不验 <code>aud</code>，别的系统签给别人的 token 也能用在你这里；</li>
+<li><strong>注意时钟</strong>：多台服务器之间时钟不一致会导致刚签发的 token 被判「未生效」或「已过期」，用 NTP 同步，并留几十秒的 leeway；</li>
+<li><strong>密钥要能轮换</strong>：在 Header 里带上 <code>kid</code>（密钥 ID），新旧密钥并存一段时间，再下线旧密钥；</li>
+<li><strong>OAuth2 的 redirect_uri 要精确匹配</strong>：授权服务器只接受预先注册的完整地址，模糊匹配曾导致授权码被重定向到攻击者的域名；</li>
+<li><strong><code>state</code> 和 <code>nonce</code> 都要校验</strong>：<code>state</code> 防止授权回调被 CSRF，<code>nonce</code> 防止 id_token 被重放；</li>
+<li><strong>退出登录要做全</strong>：Session 方案删除服务端记录；JWT 方案吊销 refresh token，必要时把 access token 加入黑名单；接了 OIDC 的还要考虑是否同时退出授权服务器（单点登出）；</li>
+<li><strong>日志里别打印 token 和 Cookie</strong>：它们就是用户的「钥匙」。</li>
+</ul>
+<h2 id="_15">高频面试题速答</h2>
+<p><strong>Q：Cookie 和 Session 有什么区别？</strong>
+Cookie 是存在浏览器、每次请求自动携带的数据；Session 是存在服务端的会话数据。常见组合是 Cookie 里只放 sessionId，服务器用它查 Session。</p>
+<p><strong>Q：分布式环境下 Session 怎么共享？</strong>
+主流做法是把 Session 集中存储在 Redis 里（如 Spring Session），所有实例都从 Redis 读写；也可以用粘性会话，但实例故障时会话会丢失。</p>
+<p><strong>Q：JWT 由哪几部分组成？安全吗？</strong>
+Header、Payload、Signature 三段，各自 Base64URL 编码后用「.」连接。签名保证不被篡改，但 Payload 不加密，任何人都能解码，所以不能放敏感信息。</p>
+<p><strong>Q：JWT 如何实现退出登录 / 主动失效？</strong>
+JWT 本身无法撤回。常用做法：短期 access token + 可吊销的 refresh token；退出时把 jti 加入 Redis 黑名单（TTL 为剩余有效期）；或在用户表维护 token 版本号。</p>
+<p><strong>Q：Session 和 JWT 怎么选？</strong>
+需要随时踢人下线、单体或少量服务的 Web 应用，Session + Redis 更简单；微服务、移动端、跨域或跨组织传递身份时，JWT 更合适。</p>
+<p><strong>Q：OAuth2 授权码模式的流程是什么？为什么需要授权码？</strong>
+重定向到授权服务器 → 用户登录并同意 → 带 code 跳回 → 后端用 code（+ PKCE verifier / client_secret）换 access token → 调 API。授权码短期一次性，真正的 token 通过后端直连获取，不暴露在浏览器 URL 中。</p>
+<p><strong>Q：PKCE 解决什么问题？</strong>
+防止授权码被截获后被换成令牌。客户端发送 code_verifier 的哈希，换令牌时提交原值，只有发起请求的客户端才知道原值。</p>
+<p><strong>Q：OAuth2 和 OIDC 的区别？</strong>
+OAuth2 是授权协议，产物是给资源服务器用的 access token；OIDC 在 OAuth2 之上加了认证，额外返回 id_token（JWT），告诉客户端「谁登录了」。</p>
+<p><strong>Q：CSRF 和 XSS 有什么区别，怎么防？</strong>
+CSRF 是借用户的 Cookie 从其他网站发请求，防护用 SameSite、CSRF Token、校验 Origin；XSS 是在页面里注入脚本，防护用输出转义和 CSP，HttpOnly 可以防止 Cookie 被脚本读取。</p>
+<p><strong>Q：密码应该怎么存？</strong>
+用 Argon2id、scrypt 或 bcrypt 这类慢哈希算法，每个密码独立加盐，不能存明文，也不能只做一次 MD5 / SHA-256。</p>
+<h2 id="_16">总结</h2>
+<figure><img src="img/f-83.jpg" alt="四个关键概念" loading="lazy"><figcaption>四个关键概念</figcaption></figure>
+<ul>
+<li>HTTP 是<strong>无状态</strong>的，登录方案的本质都是「让后续请求带上凭证」；</li>
+<li><strong>Cookie</strong> 是浏览器自动携带的小纸条，配合 <code>HttpOnly</code>、<code>Secure</code>、<code>SameSite</code> 使用；</li>
+<li><strong>Session</strong>：状态存在服务端，Cookie 里只放随机的 sessionId；多实例用 <strong>Redis</strong> 集中存储；可以随时作废；</li>
+<li><strong>JWT</strong>：Header.Payload.Signature，<strong>签名不是加密</strong>；无状态、易扩展，但难以主动失效，靠<strong>短期 access token + 可吊销、会轮换的 refresh token</strong> 弥补；</li>
+<li><strong>OAuth2</strong> 是授权：授权码 + <strong>PKCE</strong>，应用拿不到用户密码，只拿到限定 scope 的 access token；<strong>OIDC</strong> 在其上加了认证，用 <strong>id_token</strong> 告诉客户端「谁登录了」；</li>
+<li>安全底线：全站 HTTPS、防 CSRF 与 XSS、密码用 Argon2id / scrypt / bcrypt 加盐存储、校验时限定算法。</li>
+</ul>
+<div class="refs">
+<h3 id="_17">参考资料</h3>
+<ul>
+<li>RFC 6265：HTTP State Management Mechanism（Cookie）.</li>
+<li>RFC 7519：JSON Web Token (JWT)；RFC 7515：JSON Web Signature (JWS)；RFC 7516：JSON Web Encryption (JWE)；RFC 7518：JSON Web Algorithms (JWA).</li>
+<li>RFC 8725：JSON Web Token Best Current Practices.</li>
+<li>RFC 6749：The OAuth 2.0 Authorization Framework；RFC 6750：Bearer Token Usage.</li>
+<li>RFC 7636：Proof Key for Code Exchange by OAuth Public Clients (PKCE).</li>
+<li>RFC 9700：Best Current Practice for OAuth 2.0 Security.</li>
+<li>RFC 8628：OAuth 2.0 Device Authorization Grant.</li>
+<li>OpenID Connect Core 1.0（OpenID Foundation）.</li>
+<li>OWASP Cheat Sheet Series：Session Management、Password Storage、Cross-Site Request Forgery Prevention、JSON Web Token for Java.</li>
+<li>Spring Session 文档：Spring Session with Redis.</li>
+<li>Python 文档：hmac、hashlib、secrets、http.cookies、http.cookiejar.</li>
+</ul>
+</div>
+  </article>
+  <div class="foot"><a href="../index.html">← 拾星首页</a><a href="landscape.html">▶ 看配套视频</a></div>
+</div>
+</body>
+</html>

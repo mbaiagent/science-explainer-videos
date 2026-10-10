@@ -1,0 +1,396 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>分布式 ID：雪花算法 · 拾星</title>
+<style>
+  :root{--bg:#07080f;--fg:#f4ede4;--muted:#9a93a8;--acc:#bae6fd}
+  html,body{margin:0;height:100%;background:var(--bg);color:var(--fg);
+    font-family:-apple-system,"PingFang SC","Noto Sans SC","Noto Sans CJK SC","Microsoft YaHei",sans-serif}
+  body{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;overflow:hidden}
+  #stage{display:block;background:#07080f;border-radius:12px;box-shadow:0 20px 60px rgba(0,0,0,.55);cursor:pointer}
+  #bar{display:flex;align-items:center;gap:12px;width:min(calc(100vw - 32px),640px)}
+  #btn{width:40px;height:40px;border-radius:50%;border:1px solid rgba(186,230,253,.5);background:transparent;
+    color:var(--acc);font-size:16px;cursor:pointer;flex:none}
+  #seek{flex:1;accent-color:var(--acc)}
+  #time{font-variant-numeric:tabular-nums;font-size:13px;color:var(--muted);min-width:84px;text-align:right}
+  body.render{display:block}
+  body.render #bar{display:none}
+  body.render #stage{border-radius:0;box-shadow:none}
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="bar">
+  <button id="btn" aria-label="播放/暂停">❚❚</button>
+  <input id="seek" type="range" min="0" max="84" step="0.01" value="0">
+  <span id="time">0:00 / 1:24</span>
+</div>
+<script>
+/* ============ 基础设置（横屏 1920×1080） ============ */
+const W = 1920, H = 1080, DUR = 84;
+const cv = document.getElementById('stage'), ctx = cv.getContext('2d');
+cv.width = W; cv.height = H;
+const FONT = '"PingFang SC","Noto Sans SC","Noto Sans CJK SC","Source Han Sans SC","Microsoft YaHei",sans-serif';
+const MONO = '"JetBrains Mono","SF Mono",Menlo,Consolas,"DejaVu Sans Mono","Noto Sans Mono CJK SC","PingFang SC","Microsoft YaHei",monospace';
+const C = {acc:'#bae6fd', mint:'#6ee7c8', gold:'#ffd38a', coral:'#ff9e7a', rose:'#ff8a8a', blue:'#9cc3ff', text:'#f4ede4', muted:'#9a93a8', dim:'#4a4558', panel:'#0f0e1f'};
+
+const clamp = (x,a=0,b=1) => Math.max(a, Math.min(b, x));
+const lerp = (a,b,t) => a + (b-a)*t;
+const p = (t,a,b) => clamp((t-a)/(b-a));
+const eo = x => 1 - Math.pow(1-x, 3);
+const eio = x => x < .5 ? 4*x*x*x : 1 - Math.pow(-2*x+2, 3)/2;
+const eback = x => { const c1=1.70158, c3=c1+1; return 1 + c3*Math.pow(x-1,3) + c1*Math.pow(x-1,2); };
+function rnd(seed){ let s = seed>>>0; return () => { s = (s*1664525 + 1013904223)>>>0; return s/4294967296; }; }
+
+let SA = 1;
+const al = a => { ctx.globalAlpha = clamp(SA*a); };
+const sceneA = (t,a,b,f=.5) => Math.min(p(t,a,a+f), 1 - p(t,b-f,b));
+
+function txt(s, x, y, o = {}){
+  const {size=64, weight=700, color=C.text, alpha=1, align='center', glow=0, scale=1, font=FONT} = o;
+  if (alpha <= 0) return;
+  ctx.save(); al(alpha);
+  ctx.font = `${weight} ${size}px ${font}`;
+  ctx.textAlign = align; ctx.textBaseline = 'middle'; ctx.fillStyle = color;
+  if (glow){ ctx.shadowColor = color; ctx.shadowBlur = glow; }
+  if (scale !== 1){ ctx.translate(x, y); ctx.scale(scale, scale); ctx.fillText(s, 0, 0); }
+  else ctx.fillText(s, x, y);
+  ctx.restore();
+}
+function rise(s, x, y, t, t0, o = {}, d = .7){
+  const e = eo(p(t, t0, t0+d));
+  if (e <= 0) return;
+  txt(s, x, y + (1-e)*36, {...o, alpha:(o.alpha ?? 1)*e});
+}
+function rr(x,y,w,h,r){ ctx.beginPath(); ctx.roundRect(x,y,w,h,r); }
+function box(x, y, w, h, a, o = {}){
+  const {fill='rgba(255,255,255,.05)', stroke='rgba(186,230,253,.35)', lw=2, glow=0, r=18, dash=null} = o;
+  if (a <= 0) return;
+  ctx.save(); al(a); rr(x, y, w, h, r); ctx.fillStyle = fill; ctx.fill();
+  if (dash) ctx.setLineDash(dash);
+  ctx.strokeStyle = stroke; ctx.lineWidth = lw; if (glow){ ctx.shadowColor = stroke; ctx.shadowBlur = glow; } ctx.stroke(); ctx.restore();
+}
+function arrow(x1, y1, x2, y2, e, a, color = C.acc, lw = 3){
+  if (e <= 0 || a <= 0) return;
+  const x = lerp(x1, x2, e), y = lerp(y1, y2, e), ang = Math.atan2(y2 - y1, x2 - x1);
+  ctx.save(); al(a); ctx.strokeStyle = color; ctx.fillStyle = color; ctx.lineWidth = lw; ctx.lineCap = 'round';
+  ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x, y); ctx.stroke();
+  if (e > .85){ ctx.translate(x, y); ctx.rotate(ang); ctx.beginPath(); ctx.moveTo(4, 0); ctx.lineTo(-14, -9); ctx.lineTo(-14, 9); ctx.closePath(); ctx.fill(); }
+  ctx.restore();
+}
+function panel(x, y, w, h, title, a){
+  box(x, y, w, h, a, {fill:C.panel, stroke:'rgba(255,255,255,.1)', r:20});
+  if (a <= 0) return;
+  ctx.save(); al(a); ctx.strokeStyle = 'rgba(255,255,255,.07)'; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(x, y + 52); ctx.lineTo(x + w, y + 52); ctx.stroke();
+  ['#ff6b6b','#ffd166','#6ee7a0'].forEach((c, i) => { ctx.fillStyle = c; ctx.globalAlpha = clamp(SA*a*.8); ctx.beginPath(); ctx.arc(x + 30 + i*24, y + 26, 7, 0, 6.283); ctx.fill(); });
+  ctx.restore();
+  txt(title, x + w/2, y + 27, {size:22, weight:500, color:C.muted, font:MONO, alpha:a});
+}
+
+/* ============ 背景 ============ */
+const PARTS = (() => { const r = rnd(271); return Array.from({length:100}, () => ({
+  x:r()*W, y:r()*H, s:r()*2.2+.5, v:r()*12+4, ph:r()*6.283, c:r()<.25})); })();
+function background(t){
+  const g = ctx.createLinearGradient(0,0,W,H);
+  g.addColorStop(0,'#0a0916'); g.addColorStop(.55,'#110f24'); g.addColorStop(1,'#18122c');
+  ctx.globalAlpha = 1; ctx.fillStyle = g; ctx.fillRect(0,0,W,H);
+  const gx = W*.5 + Math.sin(t*.27)*140;
+  const rg = ctx.createRadialGradient(gx, H*.45, 0, gx, H*.45, 950);
+  rg.addColorStop(0,'rgba(186,230,253,0.09)'); rg.addColorStop(1,'rgba(186,230,253,0)');
+  ctx.fillStyle = rg; ctx.fillRect(0,0,W,H);
+  ctx.fillStyle = C.acc;
+  for (let x = 40; x < W; x += 80) for (let y = 40; y < H; y += 80){ ctx.globalAlpha = .06; ctx.fillRect(x, y, 2, 2); }
+  for (const q of PARTS){
+    const y = ((q.y - t*q.v) % H + H) % H, x = q.x + Math.sin(t*.35 + q.ph)*12;
+    ctx.globalAlpha = .2 + .3*(.5 + .5*Math.sin(t*1.2 + q.ph));
+    ctx.fillStyle = q.c ? C.acc : '#d8d0ff';
+    ctx.beginPath(); ctx.arc(x, y, q.s, 0, 6.283); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+}
+function vignette(){
+  const v = ctx.createRadialGradient(W/2, H/2, W*.28, W/2, H/2, W*.62);
+  v.addColorStop(0,'rgba(0,0,0,0)'); v.addColorStop(1,'rgba(0,0,0,.55)');
+  ctx.globalAlpha = 1; ctx.fillStyle = v; ctx.fillRect(0,0,W,H);
+}
+function codeLine(s, x, y, size, a, kw = /\b(public|class|static|void|new|return)\b/){
+  const parts = s.split(/("[^"]*"|\b(?:public|class|static|void|new|return|getstatic|ldc|invokevirtual)\b)/g);
+  ctx.save(); al(a); ctx.font = `500 ${size}px ${MONO}`; ctx.textBaseline = 'middle'; ctx.textAlign = 'left';
+  let xx = x;
+  for (const seg of parts){ if (!seg) continue;
+    ctx.fillStyle = seg.startsWith('"') ? C.mint : /^(public|class|static|void|new|return|getstatic|ldc|invokevirtual)$/.test(seg) ? C.acc : C.text;
+    ctx.fillText(seg, xx, y); xx += ctx.measureText(seg).width; }
+  ctx.restore();
+}
+
+function card(h, lines, x, y, w, hh, a, c = C.acc, o = {}){
+  const {hs=30, ls=22, lh=40} = o;
+  box(x, y, w, hh, a, {fill:'rgba(186,230,253,.05)', stroke:c === C.acc ? 'rgba(186,230,253,.5)' : c, r:20});
+  txt(h, x + 30, y + 44, {size:hs, weight:900, color:c, align:'left', alpha:a});
+  lines.forEach((s, i) => txt(s, x + 30, y + 96 + i*lh, {size:ls, weight:600, color:'#d9d2e4', align:'left', alpha:a}));
+}
+function sfTable(title, x, y, w, rows, t0, t, c){
+  const a = eo(p(t, t0, t0 + .5));
+  panel(x, y, w, 90 + rows.length*64, title, a);
+  txt('id', x + 50, y + 90, {size:22, weight:800, color:C.muted, align:'left', alpha:a, font:MONO});
+  txt('user', x + 230, y + 90, {size:22, weight:800, color:C.muted, align:'left', alpha:a, font:MONO});
+  txt('amount', x + 430, y + 90, {size:22, weight:800, color:C.muted, align:'left', alpha:a, font:MONO});
+  rows.forEach(([id, u, m, hi], i) => { const e = eo(p(t, t0 + .5 + i*.35, t0 + .9 + i*.35)), yy = y + 150 + i*60;
+    if (hi) box(x + 24, yy - 26, w - 48, 52, e*clamp(p(t, 3.2, 3.6)), {fill:'rgba(255,138,138,.14)', stroke:C.rose, r:10});
+    txt(id, x + 50, yy, {size:26, weight:800, color:hi && t > 3.2 ? C.rose : c, align:'left', alpha:e, font:MONO});
+    txt(u, x + 230, yy, {size:24, weight:600, align:'left', alpha:e, font:MONO});
+    txt(m, x + 430, yy, {size:24, weight:600, align:'left', alpha:e, font:MONO}); });
+}
+function cell(x, y, w, h, a, fill, stroke){ box(x, y, w, h, a, {fill, stroke, r:4, lw:1.5}); }
+function token(s, x, y, a, c, w = 250){
+  box(x - w/2, y - 24, w, 48, a, {fill:'rgba(255,255,255,.06)', stroke:c, r:10});
+  txt(s, x, y, {size:22, weight:700, font:MONO, color:c, alpha:a});
+}
+
+/* ============ 场景 1 · 钩子 (0–7s) ============ */
+function s1(t){
+  rise('分库分表之后，两个订单的 id 都是 1001', W/2, 110, t, .2, {size:54, weight:900});
+  sfTable('db_0.orders  AUTO_INCREMENT', 200, 200, 660, [['999', 'u_05', '18.00'], ['1000', 'u_17', '59.00'], ['1001', 'u_23', '128.50', 1]], .8, t, C.acc);
+  sfTable('db_1.orders  AUTO_INCREMENT', 1060, 200, 660, [['999', 'u_31', '76.00'], ['1000', 'u_42', '9.90'], ['1001', 'u_88', '300.00', 1]], 1.4, t, C.acc);
+  const k = p(t, 3.2, 3.8);
+  if (k > 0){
+    arrow(530, 505, 800, 650, eo(k), 1, C.rose, 3); arrow(1390, 505, 1120, 650, eo(k), 1, C.rose, 3);
+    const e = eo(p(t, 3.6, 4.1));
+    box(560, 660, 800, 140, e, {fill:'rgba(255,138,138,.10)', stroke:C.rose, r:22, glow:18});
+    txt('汇总到数仓 / 合并数据 / 对外展示', W/2, 705, {size:26, weight:700, color:C.muted, alpha:e});
+    txt('id = 1001 出现两次：主键冲突！', W/2, 760, {size:36, weight:900, color:C.rose, alpha:e});
+  }
+  rise('数据库自增主键，只在「一张表」里唯一', W/2, 880, t, 4.6, {size:32, weight:800, color:C.gold});
+  rise('全局唯一的 ID，到底该怎么生成？', W/2, 970, t, 5.4, {size:38, weight:900, color:C.acc});
+}
+
+/* ============ 场景 2 · 合格的分布式 ID (7–19s) ============ */
+function s2(t){
+  rise('一个合格的分布式 ID 要满足什么', W/2, 90, t, 7.2, {size:54, weight:900});
+  [['全局唯一', '不能重复，这是底线', C.acc], ['趋势递增', '整体越来越大，B+ 树索引写入更高效', C.mint], ['高性能', '下单高峰每秒要发出大量 ID，延迟要低', C.acc], ['高可用', '发号服务一挂，下单也跟着挂', C.acc], ['不易暴露业务量', '连续的 ID 会被人推算出每天的订单量', C.gold]].forEach(([h, d, c], i) => {
+    const e = eo(p(t, 7.8 + i*.5, 8.3 + i*.5)), y = 190 + i*150;
+    box(110, y, 820, 124, e, {fill:'rgba(186,230,253,.05)', stroke:c === C.acc ? 'rgba(186,230,253,.45)' : c, r:18});
+    txt((i + 1) + '', 160, y + 62, {size:40, weight:900, color:c, alpha:e, font:MONO});
+    txt(h, 220, y + 42, {size:32, weight:900, color:c, align:'left', alpha:e});
+    txt(d, 220, y + 90, {size:22, weight:600, color:C.muted, align:'left', alpha:e}); });
+  // 右侧：有序 vs 随机写入 B+ 树叶子页
+  const a = eo(p(t, 10.6, 11.1));
+  box(1000, 190, 820, 340, a, {fill:'rgba(255,255,255,.03)', stroke:'rgba(255,255,255,.18)', r:22});
+  txt('有序 ID：总是追加到最右边的页', 1410, 240, {size:28, weight:900, color:C.mint, alpha:a});
+  const fill = [1, 1, 1, 1, clamp(.15 + .85*p(t, 11.4, 14))];
+  fill.forEach((f, i) => { const x = 1040 + i*152;
+    box(x, 330, 136, 110, a, {fill:'rgba(255,255,255,.04)', stroke:'rgba(255,255,255,.3)', r:10});
+    if (a > 0){ ctx.save(); al(a*.8); ctx.fillStyle = 'rgba(110,231,200,.45)'; rr(x + 6, 336 + 98*(1 - f), 124, 98*f, 6); ctx.fill(); ctx.restore(); } });
+  arrow(1724, 290, 1724, 326, eo(p(t, 11.4, 11.8)), a, C.mint, 3);
+  txt('页几乎写满再开新页，顺序写，很少分裂', 1410, 485, {size:22, weight:600, color:C.muted, alpha:a});
+  const b = eo(p(t, 12.6, 13.1));
+  box(1000, 560, 820, 360, b, {fill:'rgba(255,255,255,.03)', stroke:'rgba(255,255,255,.18)', r:22});
+  txt('随机 ID（如 UUID）：插到任意位置', 1410, 610, {size:28, weight:900, color:C.rose, alpha:b});
+  const R = rnd(271), hits = Array.from({length:14}, () => [Math.floor(R()*5), R()]);
+  [0, 1, 2, 3, 4].forEach(i => { const x = 1040 + i*152, split = i === 2 && t > 15;
+    box(x, 680, split ? 64 : 136, 110, b, {fill:'rgba(255,255,255,.04)', stroke:split ? C.rose : 'rgba(255,255,255,.3)', r:10});
+    if (split) box(x + 72, 680, 64, 110, b, {fill:'rgba(255,138,138,.10)', stroke:C.rose, r:10}); });
+  hits.forEach(([i, yy], k) => { const e = eo(p(t, 13.2 + k*.13, 13.5 + k*.13)); if (e <= 0) return;
+    ctx.save(); al(b*e); ctx.fillStyle = C.rose; ctx.beginPath(); ctx.arc(1070 + i*152 + (k*37 % 76), 700 + yy*70, 7, 0, 6.283); ctx.fill(); ctx.restore(); });
+  txt('页分裂', 1384, 830, {size:24, weight:900, color:C.rose, alpha:eo(p(t, 15, 15.4))});
+  txt('频繁页分裂、页利用率低、缓存命中差', 1410, 880, {size:22, weight:600, color:C.muted, alpha:eo(p(t, 15.4, 15.8))});
+  rise('趋势递增 ≠ 严格连续：只要整体在变大就够了', W/2, 1000, t, 16.2, {size:30, weight:800, color:C.gold});
+}
+
+/* ============ 场景 3 · 方案对比 (19–32s) ============ */
+function s3(t){
+  rise('常见方案一览', W/2, 90, t, 19.2, {size:56, weight:900});
+  const cols = [[110, '方案'], [420, '原理'], [900, '优点'], [1330, '缺点']];
+  const a = eo(p(t, 19.6, 20.1));
+  cols.forEach(([x, h]) => txt(h, x + 20, 190, {size:26, weight:900, color:C.muted, align:'left', alpha:a}));
+  if (a > 0){ ctx.save(); al(a*.5); ctx.strokeStyle = 'rgba(255,255,255,.3)'; ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(110, 222); ctx.lineTo(1810, 222); ctx.stroke(); ctx.restore(); }
+  const rows = [
+    ['UUID', '本地随机生成 128 位', '简单，不依赖任何服务', '无序、36 个字符，索引性能差', C.rose],
+    ['数据库自增 + 步长', '各库起点不同、步长相同', '简单，单库内有序', '依赖数据库，扩容要重设步长', C.text],
+    ['号段模式', '一次从库里领一段，如 1001–2000', '性能高，库短暂故障也能撑', '重启浪费号段，ID 较连续', C.text],
+    ['Redis INCR', '原子自增命令', '性能好，有序', '依赖 Redis，宕机恢复可能回退', C.text],
+    ['雪花算法', '时间戳 + 机器 ID + 序列号', '本地生成，极快，趋势递增', '依赖时钟，要分配机器 ID', C.acc]];
+  rows.forEach((r, i) => { const e = eo(p(t, 20.4 + i*1.1, 20.9 + i*1.1)), y = 290 + i*118, last = i === 4;
+    if (last) box(110, y - 50, 1700, 100, e*(.7 + .3*Math.sin(t*3)), {fill:'rgba(186,230,253,.10)', stroke:C.acc, r:16, glow:16});
+    else box(110, y - 50, 1700, 100, e, {fill:'rgba(255,255,255,.03)', stroke:'rgba(255,255,255,.12)', r:16});
+    txt(r[0], 130, y, {size:28, weight:900, color:r[4], align:'left', alpha:e});
+    txt(r[1], 440, y, {size:23, weight:600, align:'left', alpha:e});
+    txt(r[2], 920, y, {size:23, weight:600, color:C.mint, align:'left', alpha:e});
+    txt(r[3], 1350, y, {size:23, weight:600, color:C.coral, align:'left', alpha:e}); });
+  rise('实践中最常用的是号段模式和雪花算法（美团 Leaf 两种都提供）', W/2, 960, t, 27, {size:30, weight:800, color:C.gold});
+  rise('UUID 的新版本 v7 以时间开头、可排序，但仍是 128 位', W/2, 1025, t, 28.2, {size:24, weight:700, color:C.muted});
+}
+
+/* ============ 场景 4 · 64 位结构 (32–45s) ============ */
+function s4(t){
+  rise('雪花算法：把一个 64 位整数拆成四段', W/2, 90, t, 32.2, {size:54, weight:900});
+  const x0 = 112, cw = 26.5, y0 = 250, ch = 72;
+  const grp = i => i === 0 ? 0 : i <= 41 ? 1 : i <= 51 ? 2 : 3;
+  const GC = [['rgba(255,255,255,.10)', 'rgba(255,255,255,.4)'], ['rgba(186,230,253,.22)', C.acc], ['rgba(255,211,138,.22)', C.gold], ['rgba(110,231,200,.22)', C.mint]];
+  for (let i = 0; i < 64; i++){ const e = eo(p(t, 32.8 + i*.03, 33.2 + i*.03)), g = grp(i);
+    cell(x0 + i*cw + 1, y0, cw - 2, ch, e, GC[g][0], GC[g][1]);
+    txt(g === 0 ? '0' : '', x0 + i*cw + cw/2, y0 + ch/2, {size:22, weight:800, font:MONO, alpha:e}); }
+  txt('64 位', x0, 190, {size:26, weight:800, color:C.muted, align:'left', alpha:eo(p(t, 33, 33.4))});
+  const lab = [[0, 1, '符号', '1', 'rgba(255,255,255,.6)', 34.8], [1, 41, '时间戳', '41 位', C.acc, 35.4], [42, 10, '机器 ID', '10 位', C.gold, 36], [52, 12, '序列号', '12 位', C.mint, 36.6]];
+  lab.forEach(([s, n, h, b, c, ts]) => { const e = eo(p(t, ts, ts + .5)), xa = x0 + s*cw + 2, xb = x0 + (s + n)*cw - 2, xm = (xa + xb)/2;
+    if (e <= 0) return;
+    ctx.save(); al(e); ctx.strokeStyle = c; ctx.lineWidth = 3; ctx.beginPath(); ctx.moveTo(xa, 342); ctx.lineTo(xa, 352); ctx.lineTo(xb, 352); ctx.lineTo(xb, 342); ctx.stroke(); ctx.restore();
+    if (n > 1){ txt(h + ' · ' + b, xm, 390, {size:28, weight:900, color:c, alpha:e}); }
+    else txt('符号位恒为 0（保证是正数）', xa - 2, 390, {size:22, weight:700, color:C.muted, align:'left', alpha:e}); });
+  card('时间戳 · 41 位', ['当前毫秒数 − 自定义起始时间', '2^41 毫秒 ≈ 69 年'], 112, 460, 540, 200, eo(p(t, 37.6, 38.1)), C.acc, {ls:24});
+  card('机器 ID · 10 位', ['2^10 = 最多 1024 个节点', '常拆成 5 位机房 + 5 位机器'], 690, 460, 540, 200, eo(p(t, 38.4, 38.9)), C.gold, {ls:24});
+  card('序列号 · 12 位', ['同一毫秒内的计数器', '每台每毫秒最多 4096 个'], 1268, 460, 540, 200, eo(p(t, 39.2, 39.7)), C.mint, {ls:24});
+  const f = eo(p(t, 40.4, 40.9));
+  box(260, 720, 1400, 110, f, {fill:C.panel, stroke:'rgba(186,230,253,.5)', r:18});
+  txt('id = (时间戳 << 22) | (机器ID << 12) | 序列号', W/2, 775, {size:34, weight:700, font:MONO, color:C.acc, alpha:f});
+  rise('时间在最高位 → 后生成的 ID 更大，天然趋势递增', W/2, 900, t, 41.6, {size:30, weight:800, color:C.gold});
+  rise('单台理论上限：4096 × 1000 ≈ 每秒 409 万个', W/2, 970, t, 42.4, {size:26, weight:700, color:C.muted});
+}
+
+/* ============ 场景 5 · 生成过程 (45–56s) ============ */
+function s5(t){
+  rise('一毫秒之内，靠序列号区分', W/2, 90, t, 45.2, {size:54, weight:900});
+  const a = eo(p(t, 45.6, 46.1));
+  panel(90, 170, 860, 760, 'nextId()', a);
+  const code = [['synchronized long nextId() {', 0], ['  long now = currentMillis();', 0], ['  if (now == lastTs) {', 1], ['    seq = (seq + 1) & 4095;', 1], ['    if (seq == 0)    // 本毫秒用完', 3], ['      now = waitNextMillis(lastTs);', 3], ['  } else {', 2], ['    seq = 0;         // 新的一毫秒', 2], ['  }', 0], ['  lastTs = now;', 0], ['  return (now - EPOCH) << 22', 0], ['       | workerId << 12 | seq;', 0], ['}', 0]];
+  const phase = t < 48.6 ? 1 : t < 50.6 ? 2 : 3;
+  code.forEach(([s, g], i) => { const e = eo(p(t, 46 + i*.12, 46.4 + i*.12)), y = 260 + i*50, on = g === phase && t > 46.8;
+    if (on) box(110, y - 22, 820, 44, e, {fill:'rgba(186,230,253,.10)', stroke:'rgba(186,230,253,.0)', r:8});
+    txt(s, 120, y, {size:24, weight:600, font:MONO, color:s.includes('//') ? (g === 3 ? C.rose : C.mint) : C.text, align:'left', alpha:e}); });
+  // 右侧：毫秒格子
+  const b = eo(p(t, 46.4, 46.9)), cols = [['第 1000 毫秒', 1150], ['第 1001 毫秒', 1420], ['第 1002 毫秒', 1690]];
+  cols.forEach(([h, x], i) => { const e = b*clamp(p(t, 46.4 + i*.2, 46.8 + i*.2));
+    box(x - 125, 180, 250, 640, e, {fill:'rgba(255,255,255,.03)', stroke:'rgba(255,255,255,.18)', r:18});
+    txt(h, x, 220, {size:24, weight:800, color:C.muted, alpha:e}); });
+  const toks = [[0, 0, 47], [0, 1, 47.5], [0, 2, 48], [1, 0, 48.8], [1, 1, 49.2], [1, 2, 49.6]];
+  toks.forEach(([c, s, ts]) => { const e = eo(p(t, ts, ts + .4)), x = cols[c][1], y = 290 + s*70;
+    token('1000'.slice(0, 3) + (c ? '1' : '0') + '|7|' + s, x, y - (1 - e)*30, e, c ? C.acc : C.mint, 220); });
+  const k = p(t, 50.2, 50.6);
+  txt('⋮', 1420, 500, {size:30, weight:900, color:C.muted, alpha:k});
+  token('1001|7|4095', 1420, 570, eo(p(t, 50.5, 50.9)), C.gold, 220);
+  const w = eo(p(t, 51, 51.4));
+  txt('序列号用完', 1420, 640, {size:22, weight:800, color:C.rose, alpha:w});
+  txt('自旋等到下一毫秒', 1420, 676, {size:22, weight:800, color:C.rose, alpha:w});
+  arrow(1540, 570, 1630, 300, eo(p(t, 51.6, 52.2)), w, C.rose, 3);
+  token('1002|7|0', 1690, 290, eo(p(t, 52.2, 52.6)), C.mint, 220);
+  txt('格式：时间戳|机器|序列号', 1420, 780, {size:20, weight:600, color:C.muted, alpha:b});
+  rise('全程只在本机内存里计算：不访问网络，不依赖数据库', 1420, 900, t, 53, {size:26, weight:800, color:C.gold});
+  rise('多台机器的 ID 靠机器 ID 区分，不会相撞', 1420, 960, t, 53.8, {size:24, weight:700, color:C.muted});
+}
+
+/* ============ 场景 6 · 时钟回拨 (56–67s) ============ */
+function s6(t){
+  rise('最大的坑：时钟回拨', W/2, 90, t, 56.2, {size:56, weight:900});
+  const a = eo(p(t, 56.6, 57.1)), y = 260;
+  if (a > 0){ ctx.save(); al(a); ctx.strokeStyle = 'rgba(255,255,255,.35)'; ctx.lineWidth = 3; ctx.beginPath(); ctx.moveTo(200, y); ctx.lineTo(1720, y); ctx.stroke(); ctx.restore(); }
+  const ticks = [[999, 400], [1000, 700], [1001, 1000], [1002, 1300]];
+  ticks.forEach(([v, x]) => { txt(v + ' ms', x, y + 46, {size:24, weight:800, font:MONO, color:C.muted, alpha:a});
+    box(x - 3, y - 14, 6, 28, a, {fill:C.muted, stroke:C.muted, r:2}); });
+  const k = eio(p(t, 57.2, 59)), k2 = eio(p(t, 59.6, 60.6));
+  const cx = k2 > 0 ? lerp(1300, 400, k2) : lerp(700, 1300, k);
+  if (a > 0){ ctx.save(); al(a); ctx.fillStyle = k2 > 0 ? C.rose : C.acc; ctx.beginPath(); ctx.arc(cx, y, 14, 0, 6.283); ctx.fill(); ctx.restore(); }
+  token('1001|7|0', 1000, 170, eo(p(t, 58, 58.4)), C.acc, 200);
+  if (k2 > 0){
+    ctx.save(); al(a); ctx.strokeStyle = C.rose; ctx.lineWidth = 3; ctx.setLineDash([10, 8]); ctx.beginPath(); ctx.moveTo(1300, y + 80); ctx.quadraticCurveTo(850, y + 170, 400 + 900*(1 - k2), y + 80); ctx.stroke(); ctx.restore();
+    txt('NTP 校时：系统时间被往回拨了 3 毫秒', 850, y + 170, {size:26, weight:800, color:C.rose, alpha:eo(p(t, 60, 60.4))});
+  }
+  const d = eo(p(t, 61, 61.5));
+  txt('不检查的话：时间再走到 1001 毫秒，序列号又从 0 开始 → ', 1060, 520, {size:26, weight:700, alpha:d, align:'right'});
+  token('1001|7|0', 1200, 520, d, C.rose, 200);
+  txt('重复！', 1340, 520, {size:30, weight:900, color:C.rose, alpha:d, align:'left'});
+  [['等待', ['回拨只有几毫秒：', '睡到时间追上来再发号']], ['报错', ['回拨幅度大：拒绝发号、告警，', '让流量切到其他节点']], ['回拨位', ['从机器 ID 里借 1～2 位，', '每回拨一次就加 1，换个「身份」']], ['借用未来时间', ['不每次读系统时钟，', '自己维护一个只增不减的逻辑时间']]].forEach(([h, ls], i) => {
+    card(h, ls, 110 + i*430, 620, 400, 230, eo(p(t, 62 + i*.6, 62.5 + i*.6)), i === 1 ? C.coral : C.acc, {ls:21, lh:38}); });
+  rise('回拨来源：NTP 同步、手动改时间、虚拟机迁移……概率不高，但一旦重复就是事故', W/2, 940, t, 64.8, {size:26, weight:800, color:C.gold});
+}
+
+/* ============ 场景 7 · 机器 ID 与前端精度 (67–78s) ============ */
+function s7(t){
+  rise('落地前还有两件事', W/2, 90, t, 67.2, {size:56, weight:900});
+  const a = eo(p(t, 67.6, 68.1));
+  box(100, 170, 820, 760, a, {fill:'rgba(255,255,255,.03)', stroke:'rgba(255,255,255,.18)', r:24});
+  txt('机器 ID 怎么分配', 510, 225, {size:34, weight:900, color:C.gold, alpha:a});
+  [['配置文件 / 环境变量', '最简单，但要靠人保证不重复'], ['ZooKeeper 顺序节点', '启动时注册，拿到唯一序号'], ['数据库注册表', '启动时插入一行，用它的 id'], ['K8s StatefulSet', 'Pod 自带序号：order-0、order-1']].forEach(([h, d], i) => {
+    const e = eo(p(t, 68.2 + i*.5, 68.7 + i*.5)), y = 300 + i*150;
+    box(140, y, 740, 124, e, {fill:'rgba(255,211,138,.06)', stroke:'rgba(255,211,138,.45)', r:16});
+    txt(h, 170, y + 42, {size:28, weight:900, align:'left', alpha:e});
+    txt(d, 170, y + 88, {size:22, weight:600, color:C.muted, align:'left', alpha:e}); });
+  const b = eo(p(t, 70.6, 71.1));
+  box(1000, 170, 820, 760, b, {fill:'rgba(255,255,255,.03)', stroke:'rgba(255,255,255,.18)', r:24});
+  txt('前端的坑：精度丢失', 1410, 225, {size:34, weight:900, color:C.rose, alpha:b});
+  txt('后端返回', 1040, 300, {size:24, weight:800, color:C.muted, align:'left', alpha:eo(p(t, 71.4, 71.8))});
+  txt('{"id": 1843236713291886593}', 1040, 350, {size:28, weight:700, font:MONO, align:'left', alpha:eo(p(t, 71.4, 71.8))});
+  txt('JavaScript 解析后', 1040, 420, {size:24, weight:800, color:C.muted, align:'left', alpha:eo(p(t, 72.2, 72.6))});
+  txt('1843236713291886600', 1040, 470, {size:28, weight:700, font:MONO, color:C.rose, align:'left', alpha:eo(p(t, 72.2, 72.6))});
+  txt('← 末尾变了', 1440, 470, {size:24, weight:800, color:C.rose, align:'left', alpha:eo(p(t, 72.6, 73))});
+  txt('Number 是双精度浮点数，超过 2^53 的整数无法精确表示', 1410, 550, {size:22, weight:700, alpha:eo(p(t, 73.2, 73.6))});
+  txt('雪花 ID 的时间戳只要超过约 25 天，就一定大于 2^53', 1410, 595, {size:22, weight:700, color:C.gold, alpha:eo(p(t, 73.8, 74.2))});
+  const c = eo(p(t, 74.6, 75.1));
+  box(1040, 650, 740, 220, c, {fill:'rgba(110,231,200,.08)', stroke:C.mint, r:18});
+  txt('对策：ID 以字符串返回给前端', 1410, 700, {size:28, weight:900, color:C.mint, alpha:c});
+  txt('{"id": "1843236713291886593"}', 1410, 760, {size:26, weight:700, font:MONO, alpha:c});
+  txt('Java：Jackson 用 ToStringSerializer', 1410, 820, {size:22, weight:600, color:C.muted, alpha:eo(p(t, 75.2, 75.6))});
+}
+
+/* ============ 场景 8 · 收尾 (78–84s) ============ */
+function s8(t){
+  [['64 位', '时间 + 机器 + 序列号'], ['趋势递增', '对 B+ 树索引友好'], ['时钟回拨', '等待、报错、回拨位'], ['给前端', '用字符串，防丢精度']].forEach(([a, b], i) => {
+    const st = 78.2 + i*.25, e = eback(p(t, st, st + .5)); if (e <= 0) return;
+    const x = 330 + i*420, y = 330;
+    ctx.save(); ctx.translate(x, y); ctx.scale(e, e); ctx.translate(-x, -y);
+    box(x - 185, y - 90, 370, 180, clamp(e), {fill:'rgba(186,230,253,.08)', stroke:'rgba(186,230,253,.5)', r:26}); ctx.restore();
+    txt(a, x, y - 22, {size:40, weight:900, color:C.acc, alpha:clamp(e)}); txt(b, x, y + 40, {size:24, weight:600, color:C.muted, alpha:clamp(e)});
+  });
+  rise('时间排先后，机器分你我，序列号补位', W/2, 600, t, 79.2, {size:60, weight:900, glow:22});
+  rise('关注拾星，一起搞懂后端', W/2, 760, t, 80, {size:36, weight:500, color:C.muted});
+}
+/* ============ 总调度 ============ */
+const SCENES = [[s1,-1,7],[s2,7,19],[s3,19,32],[s4,32,45],[s5,45,56],[s6,56,67],[s7,67,78],[s8,78,84]];
+function draw(t){
+  t = clamp(t, 0, DUR);
+  ctx.save(); ctx.globalAlpha = 1; ctx.clearRect(0,0,W,H); background(t);
+  for (const [fn,a,b] of SCENES){
+    if (t < a || t > b) continue;
+    SA = sceneA(t, a, b, b === DUR ? .8 : .5);
+    if (SA > 0){ ctx.save(); fn(t); ctx.restore(); }
+  }
+  SA = 1; vignette();
+  const fo = p(t, DUR - .8, DUR);
+  if (fo > 0){ ctx.globalAlpha = fo; ctx.fillStyle = '#000'; ctx.fillRect(0,0,W,H); }
+  ctx.restore();
+}
+
+/* ============ 播放器 / 逐帧渲染接口 ============ */
+const isRender = new URLSearchParams(location.search).has('render');
+window.DURATION = DUR;
+window.renderFrame = t => draw(t);
+const btn = document.getElementById('btn'), seek = document.getElementById('seek'), timeEl = document.getElementById('time');
+const fmt = s => `${Math.floor(s/60)}:${String(Math.floor(s%60)).padStart(2,'0')}`;
+function fit(){
+  if (isRender){ cv.style.width = W+'px'; cv.style.height = H+'px'; return; }
+  const w = Math.min(innerWidth - 32, (innerHeight - 84)*16/9);
+  cv.style.width = w + 'px'; cv.style.height = w*9/16 + 'px';
+}
+addEventListener('resize', fit); fit();
+
+let cur = 0, playing = !isRender, last = null;
+function toggle(){ if (cur >= DUR) cur = 0; playing = !playing; }
+btn.onclick = toggle; cv.onclick = toggle;
+addEventListener('keydown', e => { if (e.code === 'Space'){ e.preventDefault(); toggle(); } });
+seek.oninput = () => { cur = +seek.value; draw(cur); };
+function loop(ts){
+  if (playing && last != null){ cur += (ts - last)/1000; if (cur >= DUR){ cur = DUR; playing = false; } }
+  last = ts; draw(cur);
+  seek.value = cur; timeEl.textContent = `${fmt(cur)} / ${fmt(DUR)}`;
+  btn.textContent = playing ? '❚❚' : (cur >= DUR ? '↺' : '▶');
+  requestAnimationFrame(loop);
+}
+document.fonts.ready.then(() => {
+  window.ready = true;
+  if (isRender) draw(0); else requestAnimationFrame(loop);
+});
+</script>
+</body>
+</html>

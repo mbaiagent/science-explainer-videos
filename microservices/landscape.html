@@ -1,0 +1,397 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>微服务：拆开之后的那些组件 · 拾星</title>
+<style>
+  :root{--bg:#07080f;--fg:#f4ede4;--muted:#9a93a8;--acc:#a5b4fc}
+  html,body{margin:0;height:100%;background:var(--bg);color:var(--fg);
+    font-family:-apple-system,"PingFang SC","Noto Sans SC","Noto Sans CJK SC","Microsoft YaHei",sans-serif}
+  body{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;overflow:hidden}
+  #stage{display:block;background:#07080f;border-radius:12px;box-shadow:0 20px 60px rgba(0,0,0,.55);cursor:pointer}
+  #bar{display:flex;align-items:center;gap:12px;width:min(calc(100vw - 32px),640px)}
+  #btn{width:40px;height:40px;border-radius:50%;border:1px solid rgba(165,180,252,.5);background:transparent;
+    color:var(--acc);font-size:16px;cursor:pointer;flex:none}
+  #seek{flex:1;accent-color:var(--acc)}
+  #time{font-variant-numeric:tabular-nums;font-size:13px;color:var(--muted);min-width:84px;text-align:right}
+  body.render{display:block}
+  body.render #bar{display:none}
+  body.render #stage{border-radius:0;box-shadow:none}
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="bar">
+  <button id="btn" aria-label="播放/暂停">❚❚</button>
+  <input id="seek" type="range" min="0" max="84" step="0.01" value="0">
+  <span id="time">0:00 / 1:24</span>
+</div>
+<script>
+/* ============ 基础设置（横屏 1920×1080） ============ */
+const W = 1920, H = 1080, DUR = 84;
+const cv = document.getElementById('stage'), ctx = cv.getContext('2d');
+cv.width = W; cv.height = H;
+const FONT = '"PingFang SC","Noto Sans SC","Noto Sans CJK SC","Source Han Sans SC","Microsoft YaHei",sans-serif';
+const MONO = '"JetBrains Mono","SF Mono",Menlo,Consolas,"DejaVu Sans Mono","Noto Sans Mono CJK SC","PingFang SC","Microsoft YaHei",monospace';
+const C = {acc:'#a5b4fc', mint:'#6ee7c8', gold:'#ffd38a', coral:'#ff9e7a', rose:'#ff8a8a', blue:'#9cc3ff', text:'#f4ede4', muted:'#9a93a8', dim:'#4a4558', panel:'#0f0e1f'};
+
+const clamp = (x,a=0,b=1) => Math.max(a, Math.min(b, x));
+const lerp = (a,b,t) => a + (b-a)*t;
+const p = (t,a,b) => clamp((t-a)/(b-a));
+const eo = x => 1 - Math.pow(1-x, 3);
+const eio = x => x < .5 ? 4*x*x*x : 1 - Math.pow(-2*x+2, 3)/2;
+const eback = x => { const c1=1.70158, c3=c1+1; return 1 + c3*Math.pow(x-1,3) + c1*Math.pow(x-1,2); };
+function rnd(seed){ let s = seed>>>0; return () => { s = (s*1664525 + 1013904223)>>>0; return s/4294967296; }; }
+
+let SA = 1;
+const al = a => { ctx.globalAlpha = clamp(SA*a); };
+const sceneA = (t,a,b,f=.5) => Math.min(p(t,a,a+f), 1 - p(t,b-f,b));
+
+function txt(s, x, y, o = {}){
+  const {size=64, weight=700, color=C.text, alpha=1, align='center', glow=0, scale=1, font=FONT} = o;
+  if (alpha <= 0) return;
+  ctx.save(); al(alpha);
+  ctx.font = `${weight} ${size}px ${font}`;
+  ctx.textAlign = align; ctx.textBaseline = 'middle'; ctx.fillStyle = color;
+  if (glow){ ctx.shadowColor = color; ctx.shadowBlur = glow; }
+  if (scale !== 1){ ctx.translate(x, y); ctx.scale(scale, scale); ctx.fillText(s, 0, 0); }
+  else ctx.fillText(s, x, y);
+  ctx.restore();
+}
+function rise(s, x, y, t, t0, o = {}, d = .7){
+  const e = eo(p(t, t0, t0+d));
+  if (e <= 0) return;
+  txt(s, x, y + (1-e)*36, {...o, alpha:(o.alpha ?? 1)*e});
+}
+function rr(x,y,w,h,r){ ctx.beginPath(); ctx.roundRect(x,y,w,h,r); }
+function box(x, y, w, h, a, o = {}){
+  const {fill='rgba(255,255,255,.05)', stroke='rgba(165,180,252,.35)', lw=2, glow=0, r=18, dash=null} = o;
+  if (a <= 0) return;
+  ctx.save(); al(a); rr(x, y, w, h, r); ctx.fillStyle = fill; ctx.fill();
+  if (dash) ctx.setLineDash(dash);
+  ctx.strokeStyle = stroke; ctx.lineWidth = lw; if (glow){ ctx.shadowColor = stroke; ctx.shadowBlur = glow; } ctx.stroke(); ctx.restore();
+}
+function arrow(x1, y1, x2, y2, e, a, color = C.acc, lw = 3){
+  if (e <= 0 || a <= 0) return;
+  const x = lerp(x1, x2, e), y = lerp(y1, y2, e), ang = Math.atan2(y2 - y1, x2 - x1);
+  ctx.save(); al(a); ctx.strokeStyle = color; ctx.fillStyle = color; ctx.lineWidth = lw; ctx.lineCap = 'round';
+  ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x, y); ctx.stroke();
+  if (e > .85){ ctx.translate(x, y); ctx.rotate(ang); ctx.beginPath(); ctx.moveTo(4, 0); ctx.lineTo(-14, -9); ctx.lineTo(-14, 9); ctx.closePath(); ctx.fill(); }
+  ctx.restore();
+}
+function panel(x, y, w, h, title, a){
+  box(x, y, w, h, a, {fill:C.panel, stroke:'rgba(255,255,255,.1)', r:20});
+  if (a <= 0) return;
+  ctx.save(); al(a); ctx.strokeStyle = 'rgba(255,255,255,.07)'; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(x, y + 52); ctx.lineTo(x + w, y + 52); ctx.stroke();
+  ['#ff6b6b','#ffd166','#6ee7a0'].forEach((c, i) => { ctx.fillStyle = c; ctx.globalAlpha = clamp(SA*a*.8); ctx.beginPath(); ctx.arc(x + 30 + i*24, y + 26, 7, 0, 6.283); ctx.fill(); });
+  ctx.restore();
+  txt(title, x + w/2, y + 27, {size:22, weight:500, color:C.muted, font:MONO, alpha:a});
+}
+
+/* ============ 背景 ============ */
+const PARTS = (() => { const r = rnd(251); return Array.from({length:100}, () => ({
+  x:r()*W, y:r()*H, s:r()*2.2+.5, v:r()*12+4, ph:r()*6.283, c:r()<.25})); })();
+function background(t){
+  const g = ctx.createLinearGradient(0,0,W,H);
+  g.addColorStop(0,'#0a0916'); g.addColorStop(.55,'#110f24'); g.addColorStop(1,'#18122c');
+  ctx.globalAlpha = 1; ctx.fillStyle = g; ctx.fillRect(0,0,W,H);
+  const gx = W*.5 + Math.sin(t*.27)*140;
+  const rg = ctx.createRadialGradient(gx, H*.45, 0, gx, H*.45, 950);
+  rg.addColorStop(0,'rgba(165,180,252,0.09)'); rg.addColorStop(1,'rgba(165,180,252,0)');
+  ctx.fillStyle = rg; ctx.fillRect(0,0,W,H);
+  ctx.fillStyle = C.acc;
+  for (let x = 40; x < W; x += 80) for (let y = 40; y < H; y += 80){ ctx.globalAlpha = .06; ctx.fillRect(x, y, 2, 2); }
+  for (const q of PARTS){
+    const y = ((q.y - t*q.v) % H + H) % H, x = q.x + Math.sin(t*.35 + q.ph)*12;
+    ctx.globalAlpha = .2 + .3*(.5 + .5*Math.sin(t*1.2 + q.ph));
+    ctx.fillStyle = q.c ? C.acc : '#d8d0ff';
+    ctx.beginPath(); ctx.arc(x, y, q.s, 0, 6.283); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+}
+function vignette(){
+  const v = ctx.createRadialGradient(W/2, H/2, W*.28, W/2, H/2, W*.62);
+  v.addColorStop(0,'rgba(0,0,0,0)'); v.addColorStop(1,'rgba(0,0,0,.55)');
+  ctx.globalAlpha = 1; ctx.fillStyle = v; ctx.fillRect(0,0,W,H);
+}
+function codeLine(s, x, y, size, a, kw = /\b(public|class|static|void|new|return)\b/){
+  const parts = s.split(/("[^"]*"|\b(?:public|class|static|void|new|return|getstatic|ldc|invokevirtual)\b)/g);
+  ctx.save(); al(a); ctx.font = `500 ${size}px ${MONO}`; ctx.textBaseline = 'middle'; ctx.textAlign = 'left';
+  let xx = x;
+  for (const seg of parts){ if (!seg) continue;
+    ctx.fillStyle = seg.startsWith('"') ? C.mint : /^(public|class|static|void|new|return|getstatic|ldc|invokevirtual)$/.test(seg) ? C.acc : C.text;
+    ctx.fillText(seg, xx, y); xx += ctx.measureText(seg).width; }
+  ctx.restore();
+}
+
+function card(h, lines, x, y, w, hh, a, c = C.acc, o = {}){
+  const {hs=30, ls=22, lh=40, lc=[]} = o;
+  box(x, y, w, hh, a, {fill:'rgba(165,180,252,.05)', stroke:c === C.acc ? 'rgba(165,180,252,.5)' : c, r:20});
+  txt(h, x + 30, y + 44, {size:hs, weight:900, color:c, align:'left', alpha:a});
+  lines.forEach((s, i) => txt(s, x + 30, y + 96 + i*lh, {size:ls, weight:600, color:lc[i] || '#d9d2e4', align:'left', alpha:a}));
+}
+function layer(s, x, y, w, h, a, fill, stroke, o = {}){
+  const {size=26, color=C.text, sub, subFont=FONT} = o;
+  box(x, y, w, h, a, {fill, stroke, r:12});
+  txt(s, x + w/2, y + h/2 - (sub ? 14 : 0), {size, weight:800, color, alpha:a});
+  if (sub) txt(sub, x + w/2, y + h/2 + 20, {size:18, weight:600, color:C.muted, font:subFont, alpha:a});
+}
+function dbc(x, y, w, h, a, c, label){
+  if (a <= 0) return;
+  const ry = 9;
+  ctx.save(); al(a); ctx.strokeStyle = c; ctx.lineWidth = 2; ctx.fillStyle = 'rgba(255,211,138,.10)';
+  ctx.beginPath(); ctx.ellipse(x, y + ry, w/2, ry, 0, Math.PI, 0); ctx.lineTo(x + w/2, y + h - ry);
+  ctx.ellipse(x, y + h - ry, w/2, ry, 0, 0, Math.PI); ctx.closePath(); ctx.fill(); ctx.stroke();
+  ctx.beginPath(); ctx.ellipse(x, y + ry, w/2, ry, 0, 0, Math.PI); ctx.stroke(); ctx.restore();
+  if (label) txt(label, x, y + h/2 + 5, {size:20, weight:800, color:c, alpha:a});
+}
+function chip(s, x, y, w, a, c = C.acc, o = {}){
+  const {size=24, h=56, hi=0, font=FONT} = o;
+  box(x - w/2, y - h/2, w, h, a, {fill: hi ? 'rgba(165,180,252,' + (.08 + .22*hi) + ')' : 'rgba(165,180,252,.07)', stroke: hi ? C.acc : 'rgba(165,180,252,.45)', r:14, glow: hi ? 14*hi : 0});
+  txt(s, x, y, {size, weight:800, color:c, font, alpha:a});
+}
+function dot(x, y, r, a, c){
+  if (a <= 0) return;
+  ctx.save(); al(a); ctx.fillStyle = c; ctx.shadowColor = c; ctx.shadowBlur = 12; ctx.beginPath(); ctx.arc(x, y, r, 0, 6.283); ctx.fill(); ctx.restore();
+}
+
+/* ============ 场景 1 · 钩子 (0–7s) ============ */
+function s1(t){
+  rise('改一行代码，整个系统都要重新发布', W/2, 100, t, .2, {size:54, weight:900});
+  const crash = eo(p(t, 3, 3.4)), a = eo(p(t, .8, 1.3));
+  box(560, 170, 800, 430, a, {fill:'rgba(255,255,255,.03)', stroke: crash > 0 ? C.rose : 'rgba(255,255,255,.3)', r:24, glow:crash*24});
+  txt('单体应用 shop.jar', 960, 210, {size:28, weight:900, color: crash > .5 ? C.rose : C.gold, alpha:a});
+  ['用户', '商品', '订单', '库存', '支付', '评论'].forEach((s, i) => { const e = eo(p(t, 1 + i*.12, 1.4 + i*.12)), x = 600 + (i % 3)*250, y = 260 + Math.floor(i/3)*130;
+    const bad = i === 5 && t > 2.3, red = bad || crash > .5;
+    layer(s + '模块', x, y, 220, 100, e, red ? 'rgba(255,138,138,.14)' : 'rgba(165,180,252,.08)', red ? C.rose : 'rgba(165,180,252,.5)', {color: red ? C.rose : C.text, sub: bad ? '内存泄漏' : ''}); });
+  txt('一个进程 · 一个代码库 · 一个数据库', 960, 555, {size:22, weight:700, color:C.muted, alpha:a});
+  txt('一个模块 OOM → 整个进程挂掉，全站不可用', 960, 645, {size:30, weight:900, color:C.rose, alpha:crash});
+  [['发布慢', '改一行也要整体构建、整体发布'], ['牵一发动全身', '一个模块出错，所有功能陪葬'], ['扩容不精准', '只有订单忙，也得整个复制']].forEach(([h, d], i) => {
+    const e = eo(p(t, 3.7 + i*.45, 4.1 + i*.45)), x = 400 + i*560;
+    txt(h, x, 750, {size:34, weight:900, color:C.gold, alpha:e}); txt(d, x, 805, {size:24, weight:600, color:C.muted, alpha:e}); });
+  rise('拆开它：微服务。可拆开之后，又冒出来一堆新组件……', W/2, 920, t, 5.3, {size:36, weight:900, color:C.acc});
+}
+
+/* ============ 场景 2 · 单体 vs 微服务 (7–19s) ============ */
+function s2(t){
+  rise('从单体到微服务', W/2, 90, t, 7.2, {size:56, weight:900});
+  const a = eo(p(t, 7.6, 8.1));
+  txt('单体', 500, 175, {size:36, weight:900, color:C.gold, alpha:a});
+  box(140, 210, 720, 280, a, {fill:'rgba(255,211,138,.05)', stroke:'rgba(255,211,138,.5)', r:20});
+  ['用户', '商品', '订单', '库存', '支付', '评论'].forEach((s, i) => layer(s, 170 + (i % 3)*225, 235 + Math.floor(i/3)*125, 210, 100, a, 'rgba(255,255,255,.05)', 'rgba(255,255,255,.25)'));
+  arrow(500, 495, 500, 545, a, a, C.gold, 3);
+  dbc(500, 550, 220, 80, a, C.gold, '一个数据库');
+  txt('一起开发、一起测试、一起上线', 500, 680, {size:24, weight:700, color:C.muted, alpha:a});
+
+  const b = eo(p(t, 9, 9.5));
+  txt('微服务', 1420, 175, {size:36, weight:900, color:C.acc, alpha:b});
+  const sx = [1150, 1420, 1690];
+  ['用户服务', '商品服务', '订单服务', '库存服务', '支付服务', '评论服务'].forEach((s, i) => { const e = eo(p(t, 9.2 + i*.18, 9.6 + i*.18)), x = sx[i % 3], y = 215 + Math.floor(i/3)*190;
+    if (i === 2){ const k = eo(p(t, 11.6, 12.2)); [2, 1].forEach(j => box(x - 115 + j*10*k, y - j*10*k, 230, 76, e*k*.8, {fill:'rgba(165,180,252,.08)', stroke:'rgba(165,180,252,.5)', r:12})); }
+    layer(s, x - 115, y, 230, 76, e, 'rgba(165,180,252,.10)', C.acc, {size:24});
+    dbc(x, y + 92, 110, 50, e, C.gold, 'DB'); });
+  txt('大促：只给订单服务加实例 ×3', 1690, 185 - 10, {size:22, weight:800, color:C.gold, alpha:eo(p(t, 12.2, 12.6))});
+  [['独立开发', 1150], ['独立部署', 1420], ['独立扩容', 1690]].forEach(([s, x], i) => chip(s, x, 610, 230, eo(p(t, 10.6 + i*.4, 11 + i*.4)), C.mint));
+  txt('每个服务一个小团队、一个代码库、一个数据库', 1420, 680, {size:24, weight:700, color:C.muted, alpha:eo(p(t, 12.6, 13))});
+
+  card('代价', ['函数调用变成网络调用：会变慢、会失败、会超时', '一个下单请求要穿过好几个服务：排查难，数据一致性更难', '几十个服务要部署、配置、监控：运维成本陡增'], 140, 730, 1640, 225, eo(p(t, 13.8, 14.3)), C.rose, {ls:25, lh:42});
+  rise('微服务把「代码的复杂度」换成了「分布式系统的复杂度」', W/2, 1010, t, 16, {size:30, weight:900, color:C.gold});
+}
+
+/* ============ 场景 3 · 注册与发现 (19–31s) ============ */
+function s3(t){
+  rise('服务注册与发现：服务在哪儿？', W/2, 90, t, 19.2, {size:54, weight:900});
+  rise('实例的 IP 一直在变：扩容、缩容、宕机、重新部署', W/2, 155, t, 19.6, {size:28, weight:700, color:C.muted});
+  const a = eo(p(t, 20, 20.5)), dead = t > 24.5, gone = p(t, 26.2, 26.9);
+  const ips = ['10.0.0.11', '10.0.0.12', '10.0.0.13'];
+  ips.forEach((ip, i) => { const e = eo(p(t, 20.2 + i*.25, 20.6 + i*.25)), y = 260 + i*170, d = i === 2 && dead;
+    layer(d ? '✗ 实例 #3 宕机' : '订单服务 #' + (i + 1), 150, y, 320, 100, e, d ? 'rgba(255,138,138,.14)' : 'rgba(165,180,252,.10)', d ? C.rose : C.acc, {size:26, sub: ip + ':8080', subFont:MONO, color: d ? C.rose : C.text});
+    const x1 = 480, y1 = y + 50, x2 = 770, y2 = 450 + i*60;
+    arrow(x1, y1, x2, y2, eo(p(t, 21 + i*.3, 21.6 + i*.3)), e*.9, C.acc, 3);
+    for (let k = 0; k < 8; k++){ const ts = 22.2 + k*1.1 + i*.25, f = p(t, ts, ts + .7);
+      if (f > 0 && f < 1 && !(i === 2 && ts > 24.3)) dot(lerp(x1, x2, f), lerp(y1, y2, f), 7, 1, C.mint); } });
+  txt('① 启动时注册', 625, 255, {size:24, weight:900, color:C.acc, alpha:eo(p(t, 21.2, 21.6))});
+  txt('② 每隔几秒发心跳', 625, 760, {size:24, weight:900, color:C.mint, alpha:eo(p(t, 22.4, 22.8))});
+
+  const r = eo(p(t, 20.4, 20.9));
+  box(780, 330, 380, 360, r, {fill:'rgba(165,180,252,.10)', stroke:C.acc, r:24, glow:16});
+  txt('注册中心', 970, 380, {size:36, weight:900, color:C.acc, alpha:r});
+  txt('order-service', 970, 430, {size:22, weight:700, font:MONO, color:C.muted, alpha:r});
+  ips.forEach((ip, i) => { const e = eo(p(t, 21.3 + i*.3, 21.7 + i*.3)), y = 490 + i*60, rm = i === 2 ? gone : 0, bad = i === 2 && t > 25.6;
+    if (rm >= 1) return;
+    txt(ip + (bad ? '  ✗' : '  ✓'), 970, y, {size:24, weight:700, font:MONO, color: bad ? C.rose : C.mint, alpha:e*(1 - rm)}); });
+  txt('心跳超时 → 剔除', 970, 660, {size:22, weight:900, color:C.rose, alpha:eo(p(t, 25.8, 26.2))*(1 - p(t, 28, 28.4))});
+
+  const c = eo(p(t, 23, 23.5));
+  layer('用户服务', 1460, 420, 320, 160, c, 'rgba(255,255,255,.06)', 'rgba(255,255,255,.35)', {size:30, sub:'调用方（消费者）'});
+  arrow(1450, 470, 1170, 470, eo(p(t, 23.4, 24)), c, C.gold, 3);
+  txt('③ 拉取实例列表', 1310, 435, {size:22, weight:800, color:C.gold, alpha:eo(p(t, 23.8, 24.2))});
+  const pu = eo(p(t, 26.8, 27.3));
+  arrow(1170, 540, 1450, 540, pu, pu, C.gold, 3);
+  txt('④ 推送变更', 1310, 578, {size:22, weight:800, color:C.gold, alpha:pu});
+  txt('本地缓存列表，直接调用实例', 1620, 625, {size:22, weight:700, color:C.muted, alpha:eo(p(t, 24.4, 24.8))});
+  txt('列表更新：只剩 2 个实例', 1620, 670, {size:24, weight:900, color:C.mint, alpha:eo(p(t, 27.4, 27.8))});
+
+  ['Nacos', 'Eureka', 'Consul', 'ZooKeeper', 'K8s Service'].forEach((s, i) => chip(s, 330 + i*315, 880, 280, eo(p(t, 28.2 + i*.2, 28.6 + i*.2)), C.acc, {font:MONO}));
+  rise('Kubernetes 里，Service + DNS 承担了注册与发现', W/2, 975, t, 29.4, {size:26, weight:700, color:C.muted});
+}
+
+/* ============ 场景 4 · 配置中心 (31–42s) ============ */
+function s4(t){
+  rise('配置中心：改配置，不用重新发布', W/2, 90, t, 31.2, {size:54, weight:900});
+  const a = eo(p(t, 31.6, 32.1)), flip = t > 34.6;
+  panel(120, 170, 740, 470, 'order-service.yaml', a);
+  const L = [['order:', C.muted], ['  timeout-ms: 3000', C.text], ['  max-retry: 2', C.text], ['feature:', C.muted], ['  new-checkout: ' + (flip ? 'true' : 'false'), flip ? C.gold : C.text], ['datasource:', C.muted], ['  url: jdbc:mysql://db/order', C.text]];
+  L.forEach(([s, c], i) => txt(s, 160, 260 + i*50, {size:26, weight:600, font:MONO, color:c, align:'left', alpha:eo(p(t, 32 + i*.12, 32.4 + i*.12))}));
+  if (flip) box(150, 438, 520, 44, eo(p(t, 34.6, 35)), {fill:'rgba(255,211,138,.10)', stroke:C.gold, r:10});
+  txt('改一个开关 → 发布（版本 v13）', 490, 610, {size:22, weight:800, color:C.gold, alpha:eo(p(t, 34.8, 35.2))});
+
+  const k = eo(p(t, 35.2, 35.8));
+  arrow(870, 405, 1050, 405, k, k, C.gold, 4);
+  txt('推送', 960, 370, {size:22, weight:800, color:C.gold, alpha:k});
+  txt('长连接 / 长轮询', 960, 440, {size:20, weight:600, color:C.muted, alpha:k});
+  const b = eo(p(t, 32.6, 33.1));
+  txt('order-service × 6', 1430, 190, {size:26, weight:800, color:C.muted, alpha:b});
+  for (let i = 0; i < 6; i++){ const x = 1080 + (i % 3)*245, y = 230 + Math.floor(i/3)*200, ts = i < 2 ? 36 : 38.2, on = t > ts, f = eo(p(t, ts, ts + .4));
+    box(x, y, 225, 170, b, {fill: on ? 'rgba(255,211,138,.10)' : 'rgba(165,180,252,.08)', stroke: on ? C.gold : 'rgba(165,180,252,.5)', r:16, glow: on ? 18*(1 - p(t, ts + .4, ts + 1.2)) : 0});
+    txt('实例 ' + (i + 1), x + 112, y + 50, {size:26, weight:800, alpha:b});
+    txt('new-checkout', x + 112, y + 100, {size:20, weight:600, font:MONO, color:C.muted, alpha:b});
+    txt(on ? 'true' : 'false', x + 112, y + 135, {size:22, weight:800, font:MONO, color: on ? C.gold : C.muted, alpha:b}); }
+  txt('灰度：先推 2 台，观察没问题再全量', 1430, 655, {size:24, weight:900, color:C.gold, alpha:eo(p(t, 36.4, 36.8))});
+
+  [['集中管理', ['所有服务的配置放一处', '按环境隔离：开发/测试/生产']], ['动态刷新', ['几秒内推到所有实例', '不重启、不重新打包']], ['灰度发布', ['先推给部分实例', '没问题再扩大范围']], ['版本回滚', ['每次修改都有记录', '出问题一键回滚']]].forEach(([h, ls], i) =>
+    card(h, ls, 120 + i*426, 710, 400, 210, eo(p(t, 38.6 + i*.35, 39 + i*.35)), C.acc, {ls:22, lh:40}));
+  rise('常见：Nacos、Apollo、Spring Cloud Config、Consul KV', W/2, 985, t, 40.2, {size:26, weight:700, color:C.muted});
+}
+
+/* ============ 场景 5 · API 网关 (42–53s) ============ */
+function s5(t){
+  rise('API 网关：所有请求的统一入口', W/2, 90, t, 42.2, {size:54, weight:900});
+  const a = eo(p(t, 42.6, 43.1)), cy = [230, 350, 470, 590];
+  ['App', 'Web', '小程序', '第三方'].forEach((s, i) => layer(s, 120, cy[i] - 45, 220, 90, eo(p(t, 42.8 + i*.15, 43.2 + i*.15)), 'rgba(255,255,255,.06)', 'rgba(255,255,255,.35)'));
+  const g = eo(p(t, 43.4, 43.9));
+  box(600, 170, 520, 500, g, {fill:'rgba(165,180,252,.10)', stroke:C.acc, r:24, glow:16});
+  txt('API 网关', 860, 220, {size:38, weight:900, color:C.acc, alpha:g});
+  // 一次请求：App → 网关（鉴权 → 限流 → 路由）→ 订单服务
+  const hl = (a0, a1) => clamp(p(t, a0, a0 + .2) - p(t, a1, a1 + .3));
+  const fn = [['身份鉴权', 47.2, 47.9], ['限流', 47.9, 48.6], ['路由转发', 48.6, 49.3], ['协议转换', 99, 99], ['日志监控', 99, 99], ['灰度路由', 99, 99]];
+  fn.forEach(([s, h0, h1], i) => chip(s, 735 + (i % 2)*250, 300 + Math.floor(i/2)*90, 220, eo(p(t, 44 + i*.2, 44.4 + i*.2)), C.text, {hi: hl(h0, h1)}));
+  txt('Spring Cloud Gateway · Kong · APISIX', 860, 600, {size:20, weight:700, color:C.muted, alpha:eo(p(t, 45.4, 45.8))});
+  const svc = ['用户服务', '商品服务', '订单服务', '支付服务'], rt = ['/api/user/**', '/api/item/**', '/api/order/**', '/api/pay/**'];
+  svc.forEach((s, i) => { const e = eo(p(t, 44.4 + i*.15, 44.8 + i*.15));
+    layer(s, 1580, cy[i] - 45, 220, 90, e, 'rgba(165,180,252,.10)', C.acc);
+    arrow(1130, cy[i], 1570, cy[i], eo(p(t, 45 + i*.15, 45.6 + i*.15)), e*.8, C.acc, 3);
+    txt(rt[i], 1350, cy[i] - 24, {size:20, weight:700, font:MONO, color:C.muted, alpha:eo(p(t, 45.4 + i*.15, 45.8 + i*.15))}); });
+  [0, 1, 2, 3].forEach(i => arrow(350, cy[i], 590, lerp(cy[i], 420, .5), eo(p(t, 43.6 + i*.1, 44.2 + i*.1)), a*.6, 'rgba(255,255,255,.5)', 3));
+  // 正常请求
+  const k1 = p(t, 46.2, 47.2), k2 = p(t, 49.3, 50.2);
+  if (k1 > 0 && k1 < 1) dot(lerp(340, 600, eio(k1)), lerp(230, 330, eio(k1)), 10, 1, C.mint);
+  if (t >= 47.2 && t < 49.3) dot(600, 330, 10, 1, C.mint);
+  if (k2 > 0 && k2 < 1) dot(lerp(1130, 1570, eio(k2)), 470, 10, 1, C.mint);
+  txt('GET /api/order/42  ✓', 1350, 518, {size:20, weight:800, font:MONO, color:C.mint, alpha:eo(p(t, 50, 50.4))});
+  // 没带令牌的请求被拦下
+  const k3 = p(t, 49.4, 50.2);
+  if (k3 > 0 && k3 < 1) dot(lerp(340, 600, eio(k3)), lerp(590, 505, eio(k3)), 10, 1, C.rose);
+  txt('无令牌 → 401', 470, 655, {size:24, weight:900, color:C.rose, alpha:eo(p(t, 50.2, 50.6))});
+
+  card('为什么需要网关', ['客户端只认一个地址，不用关心后面有多少服务、部署在哪里', '鉴权、限流、日志这类「横切」逻辑只做一次，不用每个服务各写一遍', '网关自己也要多实例部署，否则它就成了新的单点'], 120, 730, 1680, 230, eo(p(t, 50.8, 51.3)), C.acc, {ls:25, lh:42, lc:[0, 0, C.gold]});
+}
+
+/* ============ 场景 6 · 服务调用与负载均衡 (53–65s) ============ */
+function s6(t){
+  rise('服务之间怎么调用？', W/2, 90, t, 53.2, {size:56, weight:900});
+  card('HTTP / REST', ['POST /stock/deduct  {"id":42}', '通用、跨语言、好调试', '例：OpenFeign、RestTemplate'], 120, 170, 760, 260, eo(p(t, 53.6, 54.1)), C.acc, {hs:34, ls:24, lh:46});
+  card('RPC', ['stockClient.deduct(42, 1)', '像调本地方法；二进制序列化，更高效', '例：gRPC、Dubbo'], 120, 460, 760, 260, eo(p(t, 54.4, 54.9)), C.gold, {hs:34, ls:24, lh:46});
+
+  rise('负载均衡：这次请求交给哪个实例？', 1400, 190, t, 55.2, {size:30, weight:900, color:C.acc});
+  const a = eo(p(t, 55.6, 56.1)), iy = [300, 470, 640];
+  layer('订单服务', 980, 410, 240, 120, a, 'rgba(255,255,255,.06)', 'rgba(255,255,255,.35)', {size:28, sub:'调用方'});
+  const T0 = 56.6, gap = .55, n = 16;
+  iy.forEach((y, j) => { let cnt = 0;
+    for (let k = j; k < n; k += 3) if (t > T0 + k*gap + .5) cnt++;
+    const e = eo(p(t, 55.8 + j*.15, 56.2 + j*.15));
+    layer('库存服务 #' + (j + 1), 1560, y - 55, 250, 110, e, 'rgba(165,180,252,.10)', C.acc, {size:26, sub:'已处理 ' + cnt + ' 次'});
+    arrow(1230, 470, 1550, y, e, e*.35, C.acc, 2); });
+  for (let k = 0; k < n; k++){ const f = p(t, T0 + k*gap, T0 + k*gap + .5);
+    if (f > 0 && f < 1) dot(lerp(1230, 1550, f), lerp(470, iy[k % 3], f), 9, 1, C.mint); }
+  txt('轮询：1 → 2 → 3 → 1 …', 1100, 585, {size:22, weight:800, color:C.mint, alpha:eo(p(t, 57.4, 57.8))});
+  ['轮询', '加权轮询', '随机', '最少连接', '一致性哈希'].forEach((s, i) => chip(s, 1060 + i*175, 775, 160, eo(p(t, 59 + i*.2, 59.4 + i*.2)), C.text, {size:22}));
+  rise('客户端负载均衡：调用方从注册中心拿到列表，自己挑（Spring Cloud LoadBalancer、Dubbo）', W/2, 870, t, 60.6, {size:26, weight:700});
+  rise('服务端负载均衡：请求先到 Nginx、K8s Service 这样的中间层，由它转发', W/2, 925, t, 61.4, {size:26, weight:700});
+  rise('每次远程调用都要设超时：网络调用不是函数调用', W/2, 1005, t, 62.4, {size:30, weight:900, color:C.gold});
+}
+
+/* ============ 场景 7 · 配套问题与拆分原则 (65–78s) ============ */
+function s7(t){
+  rise('拆开之后，还要面对这些问题', W/2, 90, t, 65.2, {size:54, weight:900});
+  [['熔断降级', ['下游挂了就快速失败，', '别把自己也拖垮'], '本系列《熔断与降级》'], ['限流', ['流量超过承受能力时，', '主动拒绝一部分请求'], '本系列《限流算法》'], ['链路追踪', ['一个 TraceId 串起', '跨服务的整条调用链'], 'SkyWalking、Zipkin'], ['分布式事务', ['跨服务、跨库的一致性', '常用最终一致代替强一致'], '本系列《CAP 与 BASE》']].forEach(([h, ls, ref], i) =>
+    card(h, [...ls, ref], 120 + i*426, 160, 400, 220, eo(p(t, 65.6 + i*.4, 66.1 + i*.4)), C.acc, {ls:22, lh:38, lc:[0, 0, C.muted]}));
+  rise('怎么拆？', W/2, 440, t, 68.4, {size:36, weight:900, color:C.acc});
+  [['按业务边界拆', ['参考 DDD 的「限界上下文」：', '用户、订单、库存各管一摊']], ['数据库各自独立', ['不直接查别的服务的表，', '只通过接口拿数据']], ['别拆太细', ['一次请求串十几个服务，', '延迟和故障率层层叠加']]].forEach(([h, ls], i) =>
+    card(h, ls, 120 + i*570, 485, 540, 185, eo(p(t, 69 + i*.5, 69.5 + i*.5)), C.mint, {hs:28, ls:22, lh:38}));
+  const c = eo(p(t, 72.4, 72.9));
+  card('什么时候不该上微服务', ['团队只有几个人、业务还在快速试错', '还没有自动化部署、监控、链路追踪这些基础设施', '更好的起点：先做「模块化单体」，边界清楚了再拆'], 120, 715, 1680, 240, c, C.rose, {hs:30, ls:25, lh:44, lc:[0, 0, C.mint]});
+}
+
+/* ============ 场景 8 · 收尾 (78–84s) ============ */
+function s8(t){
+  [['注册发现', '服务在哪儿'], ['配置中心', '配置随时改'], ['API 网关', '统一入口'], ['调用治理', '负载均衡、熔断、追踪']].forEach(([a, b], i) => {
+    const st = 78.2 + i*.25, e = eback(p(t, st, st + .5)); if (e <= 0) return;
+    const x = 330 + i*420, y = 330;
+    ctx.save(); ctx.translate(x, y); ctx.scale(e, e); ctx.translate(-x, -y);
+    box(x - 185, y - 90, 370, 180, clamp(e), {fill:'rgba(165,180,252,.08)', stroke:'rgba(165,180,252,.5)', r:26}); ctx.restore();
+    txt(a, x, y - 22, {size:40, weight:900, color:C.acc, alpha:clamp(e)}); txt(b, x, y + 40, {size:24, weight:600, color:C.muted, alpha:clamp(e)});
+  });
+  rise('拆的是业务边界，不是代码行数', W/2, 600, t, 79.2, {size:62, weight:900, glow:22});
+  rise('关注拾星，一起搞懂后端', W/2, 760, t, 80, {size:36, weight:500, color:C.muted});
+}
+/* ============ 总调度 ============ */
+const SCENES = [[s1,-1,7],[s2,7,19],[s3,19,31],[s4,31,42],[s5,42,53],[s6,53,65],[s7,65,78],[s8,78,84]];
+function draw(t){
+  t = clamp(t, 0, DUR);
+  ctx.save(); ctx.globalAlpha = 1; ctx.clearRect(0,0,W,H); background(t);
+  for (const [fn,a,b] of SCENES){
+    if (t < a || t > b) continue;
+    SA = sceneA(t, a, b, b === DUR ? .8 : .5);
+    if (SA > 0){ ctx.save(); fn(t); ctx.restore(); }
+  }
+  SA = 1; vignette();
+  const fo = p(t, DUR - .8, DUR);
+  if (fo > 0){ ctx.globalAlpha = fo; ctx.fillStyle = '#000'; ctx.fillRect(0,0,W,H); }
+  ctx.restore();
+}
+
+/* ============ 播放器 / 逐帧渲染接口 ============ */
+const isRender = new URLSearchParams(location.search).has('render');
+window.DURATION = DUR;
+window.renderFrame = t => draw(t);
+const btn = document.getElementById('btn'), seek = document.getElementById('seek'), timeEl = document.getElementById('time');
+const fmt = s => `${Math.floor(s/60)}:${String(Math.floor(s%60)).padStart(2,'0')}`;
+function fit(){
+  if (isRender){ cv.style.width = W+'px'; cv.style.height = H+'px'; return; }
+  const w = Math.min(innerWidth - 32, (innerHeight - 84)*16/9);
+  cv.style.width = w + 'px'; cv.style.height = w*9/16 + 'px';
+}
+addEventListener('resize', fit); fit();
+
+let cur = 0, playing = !isRender, last = null;
+function toggle(){ if (cur >= DUR) cur = 0; playing = !playing; }
+btn.onclick = toggle; cv.onclick = toggle;
+addEventListener('keydown', e => { if (e.code === 'Space'){ e.preventDefault(); toggle(); } });
+seek.oninput = () => { cur = +seek.value; draw(cur); };
+function loop(ts){
+  if (playing && last != null){ cur += (ts - last)/1000; if (cur >= DUR){ cur = DUR; playing = false; } }
+  last = ts; draw(cur);
+  seek.value = cur; timeEl.textContent = `${fmt(cur)} / ${fmt(DUR)}`;
+  btn.textContent = playing ? '❚❚' : (cur >= DUR ? '↺' : '▶');
+  requestAnimationFrame(loop);
+}
+document.fonts.ready.then(() => {
+  window.ready = true;
+  if (isRender) draw(0); else requestAnimationFrame(loop);
+});
+</script>
+</body>
+</html>
