@@ -53,6 +53,7 @@
 | volatile 与 Java 内存模型 | `volatile-jmm/landscape.html` | 横屏 1920×1080 | 84s |
 | Raft：让多台机器达成一致 | `raft/landscape.html` | 横屏 1920×1080 | 84s |
 | Git 原理：一个内容寻址的文件系统 | `git-internals/landscape.html` | 横屏 1920×1080 | 84s |
+| 可观测性：日志、指标与链路追踪 | `observability/landscape.html` | 横屏 1920×1080 | 84s |
 
 ### 幸福的科学
 钩子 → 享乐适应（快乐曲线 + 跑步机）→ 哈佛成人发展研究（关系网络）→ 心流（挑战 × 技能坐标图）→ 今晚就能做的 3 件事 → 收尾
@@ -188,6 +189,9 @@ CPU 轮流切换 → 进程与隔离 → 线程与竞态条件 → 上下文切�
 
 ### Git 原理：一个内容寻址的文件系统
 钩子（每次 commit 到底存了什么）→ 内容寻址 → blob、tree、commit 三种对象 → 快照而不是差异 → 分支与 HEAD 只是指针 → 工作区、暂存区、仓库 → merge vs rebase 与 reflog → 收尾
+
+### 可观测性：日志、指标与链路追踪
+钩子（监控大盘全绿，用户却说付款卡死）→ 监控 vs 可观测性 → 日志 → 指标与 Prometheus → RED/USE 与 P99 → 链路追踪与 OpenTelemetry → 联动排查与 SLO 告警 → 收尾
 
 ## 预览
 

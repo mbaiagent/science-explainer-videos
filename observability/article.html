@@ -1,0 +1,1006 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>可观测性：日志、指标与链路追踪 · 拾星</title>
+<meta name="description" content="监控与可观测性的区别，结构化日志与 traceId，Counter/Gauge/Histogram 与 Prometheus 拉模型，RED/USE 方法与为什么看 P99，trace/span 与 W3C traceparent，OpenTelemetry，基于 SLO 和错误预算的告警，以及三者联动排查一次线上故障，附四段可运行的 Python 演示">
+<link rel="stylesheet" href="../assets/article.css">
+<style>:root{--acc:#e9d5ff}</style>
+</head>
+<body>
+<div class="wrap">
+  <nav class="top"><a href="../index.html">← 拾星 · 全部内容</a><a class="watch" href="landscape.html">▶ 看视频</a></nav>
+  <header class="hero">
+    <div class="tag">拾星 · 计算机与后端</div>
+    <h1>可观测性：日志、指标与链路追踪</h1>
+    <p>监控与可观测性的区别，结构化日志与 traceId，Counter/Gauge/Histogram 与 Prometheus 拉模型，RED/USE 方法与为什么看 P99，trace/span 与 W3C traceparent，OpenTelemetry，基于 SLO 和错误预算的告警，以及三者联动排查一次线上故障，附四段可运行的 Python 演示</p>
+    <div class="meta">约 56 分钟读完 · 配套视频 1:24</div>
+  </header>
+  <nav class="toc">
+<ul>
+<li><a href="#_1">大盘一片绿，用户却在骂</a></li>
+<li><a href="#vs">监控 vs 可观测性</a></li>
+<li><a href="#_4">日志：发生了什么</a></li>
+<li><a href="#_8">指标：有多少、有多快</a></li>
+<li><a href="#reduse">看哪些指标：RED、USE 与分位数</a></li>
+<li><a href="#_12">链路追踪：一个请求到底慢在哪一跳</a></li>
+<li><a href="#python">动手：用 Python 标准库串起三根支柱</a></li>
+<li><a href="#_15">告警与联动排查</a></li>
+<li><a href="#promql-opentelemetry">参考写法：PromQL、告警规则与 OpenTelemetry</a></li>
+<li><a href="#_17">工程实践与常见坑</a></li>
+<li><a href="#_18">高频面试题速答</a></li>
+<li><a href="#_19">总结</a></li>
+</ul>
+</nav>
+
+  <article>
+<figure><img src="img/f-6.jpg" alt="监控大盘一片绿，用户却在抱怨付款卡死" loading="lazy"><figcaption>监控大盘一片绿，用户却在抱怨付款卡死</figcaption></figure>
+<h2 id="_1">大盘一片绿，用户却在骂</h2>
+<p>这是很多后端工程师都经历过的一幕：用户群里有人说「付款一直在转圈」「点了三次才成功」，你打开监控大盘：CPU 38%、内存 52%、错误率 0.3%、平均耗时 149ms，全是绿的。</p>
+<p>问题出在哪？可能是：</p>
+<ul>
+<li><strong>平均值骗了你</strong>：1000 个请求里 970 个只要几十毫秒，30 个要 1.5～3 秒，平均下来还是很「正常」的 149ms；</li>
+<li><strong>不知道慢在哪一跳</strong>：一次付款要经过网关、订单服务、用户服务、库存服务、支付服务、数据库……大盘只告诉你「订单服务有点慢」，没告诉你慢在它调用的哪一个下游；</li>
+<li><strong>不知道为什么慢</strong>：就算找到了是支付服务慢，日志有几十 GB，从哪里开始翻？</li>
+</ul>
+<p>这些问题有一个共同点：<strong>你事先没有想到要问它们</strong>。你不可能为「支付服务在连接池满时排队」预先建一块仪表盘。能不能在出事之后，借助系统已经输出的数据，把这些问题一路追问下去并找到答案，这种能力就叫<strong>可观测性</strong>（Observability）。</p>
+<p>这篇文章会讲清楚：</p>
+<ol>
+<li>监控和可观测性有什么区别；</li>
+<li>三大支柱：<strong>日志</strong>、<strong>指标</strong>、<strong>链路追踪</strong>分别是什么、怎么用；</li>
+<li>为什么要看 <strong>P99</strong> 而不是平均值；</li>
+<li><strong>traceId</strong> 怎么在服务之间传递，OpenTelemetry 又是什么；</li>
+<li>怎样基于 <strong>SLO 和错误预算</strong>告警，以及三者怎么配合排查一次线上故障。</li>
+</ol>
+<h2 id="vs">监控 vs 可观测性</h2>
+<figure><img src="img/f-18.jpg" alt="监控与可观测性的区别，以及三大支柱" loading="lazy"><figcaption>监控与可观测性的区别，以及三大支柱</figcaption></figure>
+<h3 id="_2">两个词的区别</h3>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>监控（Monitoring）</th>
+<th>可观测性（Observability）</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>关注的问题</td>
+<td>系统坏了<strong>没有</strong>？</td>
+<td>系统<strong>为什么</strong>坏？坏在<strong>哪里</strong>？</td>
+</tr>
+<tr>
+<td>工作方式</td>
+<td>预先定义好指标、仪表盘和告警阈值</td>
+<td>采集足够丰富、能互相关联的数据，事后任意切分、下钻</td>
+</tr>
+<tr>
+<td>擅长</td>
+<td>「已知的未知」：知道可能出什么问题，提前盯着</td>
+<td>「未知的未知」：从没见过的故障，也能一步步查下去</td>
+</tr>
+<tr>
+<td>典型产物</td>
+<td>仪表盘、告警</td>
+<td>带上下文的日志、高维度的指标、完整的调用链</td>
+</tr>
+</tbody>
+</table>
+<p>「可观测性」这个词来自控制理论：如果能通过一个系统的<strong>外部输出</strong>推断出它的<strong>内部状态</strong>，这个系统就是可观测的。放到软件里，就是：只看服务吐出来的日志、指标和追踪数据，不用登录机器加日志、不用重新发版，就能弄明白里面发生了什么。</p>
+<p>两者不是替代关系。监控是可观测性的一部分：先由监控和告警发现「出事了」，再用可观测性的数据去定位「为什么」。</p>
+<h3 id="_3">三大支柱</h3>
+<table>
+<thead>
+<tr>
+<th>支柱</th>
+<th>回答的问题</th>
+<th>数据形态</th>
+<th>特点</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>日志</strong>（Logs）</td>
+<td>发生了什么？</td>
+<td>一条条离散的事件记录</td>
+<td>最详细；量最大，存储和检索成本最高</td>
+</tr>
+<tr>
+<td><strong>指标</strong>（Metrics）</td>
+<td>有多少？有多快？</td>
+<td>按时间聚合的数字（时间序列）</td>
+<td>便宜、可长期保存，适合看趋势和告警；但丢失了单个请求的细节</td>
+</tr>
+<tr>
+<td><strong>链路追踪</strong>（Traces）</td>
+<td>一个请求经过了哪里？每一跳花了多久？</td>
+<td>一棵由 span 组成的树</td>
+<td>天然跨服务；通常需要采样</td>
+</tr>
+</tbody>
+</table>
+<p>三者各有盲区，单独使用都不够：指标告诉你 P99 涨了，但不知道是哪些请求；日志里有错误详情，但不知道它和哪次用户请求有关；追踪能看到慢在哪一跳，但看不到那一跳里面具体发生了什么。<strong>把它们串起来的，是同一个 traceId。</strong></p>
+<p>近年来也常把<strong>持续性能剖析</strong>（Continuous Profiling，持续采集 CPU、内存火焰图）称为「第四根支柱」，用来回答「这段代码为什么慢」。</p>
+<h2 id="_4">日志：发生了什么</h2>
+<figure><img src="img/f-30.jpg" alt="纯文本日志与结构化日志、日志级别与采集链路" loading="lazy"><figcaption>纯文本日志与结构化日志、日志级别与采集链路</figcaption></figure>
+<h3 id="_5">结构化日志</h3>
+<p>传统的日志是给人看的一行文本：</p>
+<pre><code class="language-text">14:03:22 WARN 支付超时 用户42 耗时2300ms
+</code></pre>
+<p>人能看懂，但机器很难处理：想统计「过去一小时耗时超过 2 秒的支付有多少笔」，就得写正则去抠数字，格式稍微一变就失效。</p>
+<p><strong>结构化日志</strong>把每条日志写成一个 JSON 对象（或其他键值格式）：</p>
+<pre><code class="language-json">{&quot;time&quot;: &quot;2026-10-10T14:03:22Z&quot;, &quot;level&quot;: &quot;WARN&quot;, &quot;service&quot;: &quot;payment&quot;,
+ &quot;msg&quot;: &quot;支付超时&quot;, &quot;uid&quot;: 42, &quot;durationMs&quot;: 2300,
+ &quot;traceId&quot;: &quot;4bf92f3577b34da6a3ce929d0e0e4736&quot;, &quot;spanId&quot;: &quot;00f067aa0ba902b7&quot;}
+</code></pre>
+<p>好处是每个字段都能直接检索、过滤、聚合：<code>service="payment" AND durationMs &gt; 2000</code>。</p>
+<p>写好结构化日志的几个要点：</p>
+<ul>
+<li><strong>固定的公共字段</strong>：时间（带时区，最好是 UTC）、级别、服务名、实例、环境、版本；</li>
+<li><strong>带上 traceId 和 spanId</strong>：这是日志和追踪关联的关键。Java 里通常把它们放进 SLF4J 的 <strong>MDC</strong>，日志格式里引用；OpenTelemetry 的 Java Agent 可以自动完成注入；</li>
+<li><strong>消息文本固定，变量放字段</strong>：写 <code>msg="支付超时", uid=42</code>，而不是 <code>msg="用户 42 支付超时"</code>，这样同一类事件可以被聚合；</li>
+<li><strong>不要打印敏感信息</strong>：密码、完整的手机号和身份证号、Token 要脱敏或干脆不打；</li>
+<li><strong>输出到 stdout</strong>：在容器环境里（见本系列《Kubernetes 入门》），应用把日志写到标准输出，由节点上的采集器统一收集，比每个应用自己管日志文件简单得多。</li>
+</ul>
+<h3 id="_6">日志级别</h3>
+<table>
+<thead>
+<tr>
+<th>级别</th>
+<th>用途</th>
+<th>例子</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>DEBUG</td>
+<td>开发调试的细节，生产环境一般关闭</td>
+<td>SQL 参数、中间变量</td>
+</tr>
+<tr>
+<td>INFO</td>
+<td>关键业务事件，事后用来还原发生了什么</td>
+<td>订单创建、支付成功、服务启动</td>
+</tr>
+<tr>
+<td>WARN</td>
+<td>不正常，但系统还能自己处理</td>
+<td>重试成功、降级、连接池接近用满</td>
+</tr>
+<tr>
+<td>ERROR</td>
+<td>失败了，需要人来关注</td>
+<td>请求最终失败、数据不一致</td>
+</tr>
+</tbody>
+</table>
+<p>常见的问题是级别用得太随意：把每一次可预期的业务失败（比如用户密码输错）都打成 ERROR，ERROR 日志多到没人看，真正的错误被淹没。<strong>ERROR 的标准应该是「值得有人去看一眼」。</strong></p>
+<h3 id="_7">日志的采集与存储</h3>
+<pre><code class="language-text">应用（stdout / 文件）→ 采集 Agent（Filebeat、Fluent Bit、Vector…）→ 缓冲（可选：Kafka）→ 存储与索引（Elasticsearch、Loki…）→ 查询界面（Kibana、Grafana）
+</code></pre>
+<p>两种主流的存储思路：</p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>Elasticsearch（ELK / EFK）</th>
+<th>Grafana Loki</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>索引方式</td>
+<td>对日志内容建<strong>全文倒排索引</strong></td>
+<td><strong>只索引标签</strong>（服务名、环境、Pod 等），日志正文压缩存储</td>
+</tr>
+<tr>
+<td>查询</td>
+<td>任意字段、全文检索都很快</td>
+<td>先按标签缩小范围，再在这些日志里扫描过滤</td>
+</tr>
+<tr>
+<td>成本</td>
+<td>索引体积大，存储和内存成本高</td>
+<td>便宜得多，适合海量日志</td>
+</tr>
+</tbody>
+</table>
+<p>日志是三大支柱里最贵的。控制成本的常用办法：生产环境默认 INFO 级别、对高频日志采样、按价值分级设置保留时间（比如热数据 7 天、归档 90 天），以及把「统计类」需求交给指标而不是日志。</p>
+<h2 id="_8">指标：有多少、有多快</h2>
+<figure><img src="img/f-42.jpg" alt="三种指标类型与 Prometheus 的拉模型" loading="lazy"><figcaption>三种指标类型与 Prometheus 的拉模型</figcaption></figure>
+<h3 id="_9">指标是什么</h3>
+<p>指标是<strong>按时间聚合的数字</strong>。一个指标由「名字 + 一组标签」唯一确定一条时间序列，比如：</p>
+<pre><code class="language-text">http_requests_total{service=&quot;payment&quot;, method=&quot;POST&quot;, status=&quot;200&quot;}
+</code></pre>
+<p>每隔一段时间记录一个值，就得到一条随时间变化的曲线。和日志相比，指标不管来了一亿个请求还是一百个请求，存储量都差不多，所以可以<strong>长期保存、快速查询</strong>，非常适合画趋势图和做告警。</p>
+<h3 id="_10">三种基本类型</h3>
+<table>
+<thead>
+<tr>
+<th>类型</th>
+<th>特点</th>
+<th>例子</th>
+<th>怎么用</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Counter</strong> 计数器</td>
+<td>只增不减（进程重启时归零）</td>
+<td>请求总数、错误总数、发送的字节数</td>
+<td>看绝对值没意义，要用 <code>rate()</code> 算「每秒增长多少」</td>
+</tr>
+<tr>
+<td><strong>Gauge</strong> 仪表盘</td>
+<td>可增可减，表示「当前值」</td>
+<td>内存使用量、在途请求数、队列长度、连接池活跃数</td>
+<td>直接看当前值和变化趋势</td>
+</tr>
+<tr>
+<td><strong>Histogram</strong> 直方图</td>
+<td>把观测值按区间<strong>分桶计数</strong>，同时记录总和与总个数</td>
+<td>请求耗时、响应体大小</td>
+<td>用 <code>histogram_quantile()</code> 估算 P95、P99</td>
+</tr>
+</tbody>
+</table>
+<p>Prometheus 还有一种 <strong>Summary</strong> 类型，在客户端直接算好分位数。缺点是分位数<strong>不能跨实例聚合</strong>（10 个实例各自的 P99 求平均，并不是整体的 P99），所以服务端聚合的场景更推荐 Histogram。</p>
+<p>一个常见的错误：把耗时用 Gauge 记录「最近一次请求的耗时」。每次抓取只能看到某一个瞬间的值，中间的几千个请求全丢了。<strong>耗时一定要用 Histogram。</strong></p>
+<h3 id="prometheus">Prometheus 的拉模型</h3>
+<p>Prometheus 是最流行的开源指标系统，也是继 Kubernetes 之后第二个从 CNCF 毕业的项目。它的工作方式是<strong>拉</strong>（pull）：</p>
+<ol>
+<li>每个服务暴露一个 HTTP 接口（通常是 <code>/metrics</code>），返回当前所有指标的文本；</li>
+<li>Prometheus 按配置的间隔（常配 15 秒）去每个目标「抓取」（scrape）一次，存进自己的时序数据库；</li>
+<li>用 <strong>PromQL</strong> 查询、画图（通常配合 Grafana），并按规则计算告警，交给 Alertmanager 去分组、去重、通知。</li>
+</ol>
+<p>拉模型的好处：</p>
+<ul>
+<li>服务端只需要暴露一个接口，不需要知道监控系统在哪里；</li>
+<li>Prometheus 掌握抓取节奏，不会被某个服务「推爆」；</li>
+<li><strong>抓不到本身就是信号</strong>：每个目标都有一个自动生成的 <code>up</code> 指标，<code>up == 0</code> 说明这个实例挂了或者网络不通。</li>
+</ul>
+<p>对于运行时间很短、来不及被抓取的批处理任务，可以用 Pushgateway 中转；OpenTelemetry 的场景下也可以由 Collector 统一接收应用推来的指标，再暴露给 Prometheus。机器层面的指标（CPU、内存、磁盘、网络）由 node_exporter 之类的 <strong>exporter</strong> 提供，MySQL、Redis 等中间件也都有对应的 exporter。</p>
+<h3 id="_11">标签基数：指标系统最常见的坑</h3>
+<p>每一种标签值的组合都是一条独立的时间序列。如果把 <code>userId</code>、<code>orderId</code>、完整 URL（带参数）这样<strong>取值无穷多</strong>的东西放进标签，时间序列的数量会爆炸（「高基数」问题），Prometheus 的内存很快被撑爆。</p>
+<p>原则是：<strong>标签只放取值有限的维度</strong>（服务、接口模板、状态码、实例、区域）；要按用户、按订单去查，那是日志和追踪的活。</p>
+<h2 id="reduse">看哪些指标：RED、USE 与分位数</h2>
+<figure><img src="img/f-54.jpg" alt="RED 与 USE 方法，以及平均值掩盖的长尾" loading="lazy"><figcaption>RED 与 USE 方法，以及平均值掩盖的长尾</figcaption></figure>
+<h3 id="red">RED 方法：看服务</h3>
+<p>面向请求的服务（HTTP 接口、RPC 服务），每个服务都看这三个指标：</p>
+<table>
+<thead>
+<tr>
+<th>指标</th>
+<th>含义</th>
+<th>PromQL 示意</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>R</strong>ate</td>
+<td>每秒请求数</td>
+<td><code>sum(rate(http_requests_total[5m]))</code></td>
+</tr>
+<tr>
+<td><strong>E</strong>rrors</td>
+<td>失败请求的比例</td>
+<td>5xx 请求速率 ÷ 总请求速率</td>
+</tr>
+<tr>
+<td><strong>D</strong>uration</td>
+<td>耗时<strong>分布</strong>（P50、P95、P99）</td>
+<td><code>histogram_quantile(0.99, …)</code></td>
+</tr>
+</tbody>
+</table>
+<h3 id="use">USE 方法：看资源</h3>
+<p>面向资源（CPU、内存、磁盘、网卡、连接池、线程池），每种资源看：</p>
+<table>
+<thead>
+<tr>
+<th>指标</th>
+<th>含义</th>
+<th>例子</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>U</strong>tilization 使用率</td>
+<td>资源有多忙</td>
+<td>CPU 使用率 70%</td>
+</tr>
+<tr>
+<td><strong>S</strong>aturation 饱和度</td>
+<td>有多少工作在<strong>排队</strong></td>
+<td>CPU 运行队列长度、连接池等待线程数、磁盘 IO 队列</td>
+</tr>
+<tr>
+<td><strong>E</strong>rrors 错误</td>
+<td>资源相关的错误</td>
+<td>网卡丢包、磁盘错误、获取连接超时</td>
+</tr>
+</tbody>
+</table>
+<p>饱和度经常被忽略，却往往是最早的预警信号：连接池使用率 100% 本身未必是问题，<strong>有线程在排队等连接</strong>才是。本文开头的故障就是这样：支付服务的数据库连接池 20/20 用满，后来的请求都在排队。</p>
+<p>Google SRE 书里的「四个黄金信号」（延迟、流量、错误、饱和度）可以看作这两种方法的合体。</p>
+<h3 id="p99">为什么看 P99，而不是平均值</h3>
+<p><strong>分位数</strong>的意思是：把所有请求按耗时从小到大排好，P99 就是排在 99% 位置的那个值，即「99% 的请求都不超过这个耗时」。P50 就是中位数。</p>
+<p>平均值的问题是：它把少数极慢的请求「摊平」了。下面「动手」一节的代码模拟了 1000 个请求，其中 3% 撞上了慢查询：</p>
+<table>
+<thead>
+<tr>
+<th>统计量</th>
+<th>值</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>平均值</td>
+<td>148.7 ms</td>
+</tr>
+<tr>
+<td>P50（中位数）</td>
+<td>79.8 ms</td>
+</tr>
+<tr>
+<td>P95</td>
+<td>148.2 ms</td>
+</tr>
+<tr>
+<td>P99</td>
+<td>2452.8 ms</td>
+</tr>
+</tbody>
+</table>
+<p>平均值 149ms 看起来很健康，但它既不能代表大多数请求（中位数只有 80ms），也完全看不出有 30 个用户等了 1.5 秒以上。更极端的对比：</p>
+<ul>
+<li>服务 A：每个请求都是 100ms，平均 100ms，P99 100ms；</li>
+<li>服务 B：98% 的请求 52ms，2% 要 2.5 秒，平均 101ms，P99 2500ms。</li>
+</ul>
+<p>两个服务平均值几乎一样，用户体验天差地别。</p>
+<p>为什么 1% 的慢请求值得这么在意？</p>
+<ol>
+<li><strong>一个页面会调用很多接口</strong>：打开一个页面要调 30 个接口时，至少碰上一次「1% 慢请求」的概率是 1 − 0.99³⁰ ≈ 26%；</li>
+<li><strong>慢请求常常来自最重要的用户</strong>：数据最多、订单最多的用户，查询往往最慢；</li>
+<li><strong>长尾是故障的前兆</strong>：连接池、锁、GC 等资源争抢，最先体现在尾部延迟上，平均值要等到问题很严重时才会动。</li>
+</ol>
+<p>所以耗时类指标，<strong>看 P99（甚至 P99.9），而不是平均值</strong>；同时看 P50，知道「大多数人」的体验。另外要注意：不同实例的 P99 <strong>不能简单求平均</strong>，要用 Histogram 的桶数据先合并再计算分位数。</p>
+<h2 id="_12">链路追踪：一个请求到底慢在哪一跳</h2>
+<figure><img src="img/f-66.jpg" alt="traceparent 请求头与追踪瀑布图" loading="lazy"><figcaption>traceparent 请求头与追踪瀑布图</figcaption></figure>
+<h3 id="trace-span">trace 与 span</h3>
+<p>一个用户请求进入系统后，会经过多个服务、多次数据库和缓存访问。链路追踪把这次请求的完整路径记录下来：</p>
+<ul>
+<li><strong>Span</strong>：一段操作，比如「order-service 处理 POST /orders」或者「执行一条 SQL」。它记录名字、开始时间、耗时、所属服务、状态，以及若干属性（如 HTTP 状态码、SQL 语句模板）；</li>
+<li><strong>Trace</strong>：同一个请求产生的所有 span，通过 <strong>traceId</strong> 归到一起，通过「父 span」关系连成一棵树；</li>
+<li><strong>瀑布图</strong>：按时间把 span 画成横条，嵌套关系一目了然，<strong>哪一段最长、哪些调用是串行的</strong>，一眼就能看出来。</li>
+</ul>
+<p>这个思路最早由 Google 2010 年的 Dapper 论文系统地提出，之后出现了 Zipkin、Jaeger、SkyWalking 等开源实现。</p>
+<h3 id="traceid">traceId 怎么跨服务传递</h3>
+<p>关键在于<strong>上下文传播</strong>（Context Propagation）：服务 A 调用服务 B 时，把「当前的 traceId 和自己的 spanId」放进请求头；服务 B 收到后，用这个 traceId 继续记录，并把 A 的 spanId 作为自己的父 span。</p>
+<p>W3C 的 <strong>Trace Context</strong> 规范统一了这个请求头的格式：</p>
+<pre><code class="language-text">traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+             │  │                                │                └ flags：01 表示被采样
+             │  │                                └ parent-id：调用方 span 的 ID（16 位十六进制）
+             │  └ trace-id：整条链路共用（32 位十六进制）
+             └ version
+</code></pre>
+<p>规范还定义了一个 <code>tracestate</code> 头，用来携带各厂商自己的扩展信息。有了统一格式，不同语言、不同框架、不同厂商的组件就能接力传递同一个 traceId。</p>
+<p>服务内部的传递也同样重要：一个请求在服务里可能跨越多个函数、多个线程、多个协程。Java 一般用 ThreadLocal 保存当前上下文，Python 用 <code>contextvars</code>，Go 用显式传递的 <code>context.Context</code>。<strong>线程池、异步回调、消息队列</strong>是最容易断链的地方：</p>
+<ul>
+<li>提交到线程池的任务，默认拿不到提交者线程的上下文，需要包装（OpenTelemetry 的 Java Agent 对常见线程池做了自动处理）；</li>
+<li>消息队列（见本系列《消息队列》）要把 traceparent 放进<strong>消息头</strong>，消费者处理时再恢复。</li>
+</ul>
+<h3 id="_13">采样</h3>
+<p>每个请求都完整记录 trace，存储成本很高。常用两种采样策略：</p>
+<table>
+<thead>
+<tr>
+<th>策略</th>
+<th>做法</th>
+<th>优缺点</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>头部采样</strong></td>
+<td>请求入口就决定这条 trace 要不要记录（比如 10%），通过 flags 告诉下游</td>
+<td>简单、开销小；但慢请求和错误请求也可能被丢掉</td>
+</tr>
+<tr>
+<td><strong>尾部采样</strong></td>
+<td>先把所有 span 收集到 Collector，整条 trace 结束后再决定留不留</td>
+<td>可以「错误全留、慢请求全留、正常请求留 10%」；需要缓存数据，Collector 成本更高</td>
+</tr>
+</tbody>
+</table>
+<h3 id="opentelemetry">OpenTelemetry：统一标准</h3>
+<p>过去每家追踪系统都有自己的 SDK 和数据格式，换一个后端就要改一遍埋点代码。<strong>OpenTelemetry</strong>（简称 OTel）由 OpenTracing 和 OpenCensus 两个项目在 2019 年合并而来，是 CNCF 的项目，目标是成为可观测性数据的统一标准：</p>
+<table>
+<thead>
+<tr>
+<th>组成部分</th>
+<th>作用</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>API / SDK</strong></td>
+<td>各语言统一的埋点接口，覆盖 traces、metrics、logs</td>
+</tr>
+<tr>
+<td><strong>自动埋点</strong></td>
+<td>如 Java Agent：不改代码，自动为常见框架（HTTP、gRPC、JDBC、Redis 客户端、消息队列）生成 span 并传播上下文</td>
+</tr>
+<tr>
+<td><strong>OTLP 协议</strong></td>
+<td>统一的数据传输协议（gRPC 默认端口 4317，HTTP 默认 4318）</td>
+</tr>
+<tr>
+<td><strong>Collector</strong></td>
+<td>独立部署的「数据中转站」：接收、处理（批量、过滤、采样、脱敏）、再导出到任意后端</td>
+</tr>
+</tbody>
+</table>
+<p>OTel <strong>只负责采集和传输，不负责存储和展示</strong>。后端可以是 Jaeger、Zipkin、SkyWalking、Prometheus、Loki、Elasticsearch，或者各种商业平台。好处是：<strong>一次埋点，后端随便换</strong>；而且三种数据共享同一套资源属性（服务名、版本、实例）和同一个 trace 上下文，天然可以关联。</p>
+<h2 id="python">动手：用 Python 标准库串起三根支柱</h2>
+<p>下面的代码只用 Python 标准库，所有输出都是真实运行的结果。</p>
+<h3 id="traceid-span">实验一：traceId 传播、span 树与结构化日志</h3>
+<p>模拟一次下单请求：<code>gateway → order-service → (user-service, inventory-service, payment-service → 数据库)</code>。几个关键点：</p>
+<ul>
+<li><code>contextvars</code> 保存「当前 span」，同一服务内的子 span 自动找到父 span；</li>
+<li>服务之间的「HTTP 调用」只传一个 <code>headers</code> 字典，traceId 通过 W3C <code>traceparent</code> 请求头传过去；</li>
+<li>日志的 Formatter 从 contextvars 里取出当前的 traceId 和 spanId，<strong>业务代码打日志时完全不用操心</strong>；</li>
+<li>支付服务里故意让「等待数据库连接」花掉 350ms。</li>
+</ul>
+<pre><code class="language-python">&quot;&quot;&quot;用标准库模拟分布式追踪：traceId 在服务间通过 traceparent 请求头传播，
+contextvars 保存「当前 span」，日志自动带上 traceId / spanId。&quot;&quot;&quot;
+import contextvars, json, logging, os, sys, time
+from contextlib import contextmanager
+
+current_span = contextvars.ContextVar(&quot;current_span&quot;, default=None)
+finished = []                                  # 相当于发给 Jaeger / Zipkin 的 span 数据
+
+class Span:
+    def __init__(self, name, trace_id, parent_id):
+        self.name, self.trace_id, self.parent_id = name, trace_id, parent_id
+        self.span_id = os.urandom(8).hex()     # 16 个十六进制字符
+        self.start = time.perf_counter()
+        self.end = None
+
+@contextmanager
+def span(name, parent_header=None):
+    &quot;&quot;&quot;开始一个 span。parent_header 是从上游请求头里取出的 traceparent。&quot;&quot;&quot;
+    parent = current_span.get()
+    if parent_header:                          # 跨服务：从请求头恢复上下文
+        _, trace_id, parent_id, _ = parent_header.split(&quot;-&quot;)
+    elif parent:                               # 同一服务内：继承当前 span
+        trace_id, parent_id = parent.trace_id, parent.span_id
+    else:                                      # 入口：生成新的 traceId
+        trace_id, parent_id = os.urandom(16).hex(), None
+    s = Span(name, trace_id, parent_id)
+    token = current_span.set(s)
+    try:
+        yield s
+    finally:
+        s.end = time.perf_counter()
+        current_span.reset(token)
+        finished.append(s)
+
+def inject_headers():
+    &quot;&quot;&quot;发起下游调用前，把当前上下文写进 W3C traceparent 请求头&quot;&quot;&quot;
+    s = current_span.get()
+    return {&quot;traceparent&quot;: f&quot;00-{s.trace_id}-{s.span_id}-01&quot;}
+
+# ---------- 结构化 JSON 日志：自动带上 traceId ----------
+class JsonFormatter(logging.Formatter):
+    def format(self, record):
+        s = current_span.get()
+        return json.dumps({
+            &quot;level&quot;: record.levelname, &quot;service&quot;: record.name, &quot;msg&quot;: record.getMessage(),
+            &quot;traceId&quot;: s.trace_id if s else None, &quot;spanId&quot;: s.span_id if s else None,
+            **getattr(record, &quot;fields&quot;, {}),
+        }, ensure_ascii=False)
+
+handler = logging.StreamHandler(sys.stdout); handler.setFormatter(JsonFormatter())
+def logger(name):
+    lg = logging.getLogger(name); lg.addHandler(handler); lg.setLevel(logging.INFO); return lg
+
+# ---------- 三级服务调用：gateway → order → (user, inventory, payment → db) ----------
+def call(service_fn, **kw):                    # 模拟一次 HTTP 调用：只传请求头
+    return service_fn(inject_headers(), **kw)
+
+def user_service(headers, uid):
+    with span(&quot;user-service GET /users/{id}&quot;, headers[&quot;traceparent&quot;]):
+        time.sleep(0.02)
+        return {&quot;uid&quot;: uid, &quot;level&quot;: &quot;gold&quot;}
+
+def inventory_service(headers, sku):
+    with span(&quot;inventory-service POST /reserve&quot;, headers[&quot;traceparent&quot;]):
+        time.sleep(0.03)
+        return True
+
+def payment_service(headers, amount):
+    log = logger(&quot;payment-service&quot;)
+    with span(&quot;payment-service POST /pay&quot;, headers[&quot;traceparent&quot;]):
+        with span(&quot;db: wait connection&quot;):      # 连接池满了，排队等连接
+            time.sleep(0.35)
+        log.warning(&quot;数据库连接池耗尽，等待连接&quot;, extra={&quot;fields&quot;: {&quot;poolActive&quot;: 20, &quot;poolMax&quot;: 20, &quot;waitMs&quot;: 350}})
+        with span(&quot;db: INSERT payment&quot;):
+            time.sleep(0.01)
+        return &quot;PAID&quot;
+
+def order_service(headers, uid, sku):
+    log = logger(&quot;order-service&quot;)
+    with span(&quot;order-service POST /orders&quot;, headers[&quot;traceparent&quot;]):
+        log.info(&quot;创建订单&quot;, extra={&quot;fields&quot;: {&quot;uid&quot;: uid, &quot;sku&quot;: sku}})
+        call(user_service, uid=uid)
+        call(inventory_service, sku=sku)
+        status = call(payment_service, amount=99)
+        log.info(&quot;订单完成&quot;, extra={&quot;fields&quot;: {&quot;status&quot;: status}})
+
+def gateway(uid, sku):
+    with span(&quot;gateway POST /api/checkout&quot;) as root:
+        call(order_service, uid=uid, sku=sku)
+        return root.trace_id
+
+trace_id = gateway(uid=42, sku=&quot;A-1001&quot;)
+
+# ---------- 打印 span 树（瀑布图）----------
+spans = {s.span_id: s for s in finished}
+root = next(s for s in finished if s.parent_id is None)
+total = root.end - root.start
+def show(s, depth=0):
+    off, dur = (s.start - root.start) * 1000, (s.end - s.start) * 1000
+    bar = &quot; &quot; * round(off / total / 1000 * 40) + &quot;█&quot; * max(1, round(dur / total / 1000 * 40))
+    print(f&quot;{'  ' * depth + s.name:&lt;36} {off:6.0f}ms +{dur:5.0f}ms |{bar:&lt;40}|&quot;)
+    for c in sorted((c for c in finished if c.parent_id == s.span_id), key=lambda c: c.start):
+        show(c, depth + 1)
+print(f&quot;\ntraceId = {trace_id}，共 {len(finished)} 个 span，全部共享这一个 traceId：{len({s.trace_id for s in finished}) == 1}&quot;)
+show(root)
+leaf = max((s for s in finished if not any(c.parent_id == s.span_id for c in finished)), key=lambda s: s.end - s.start)
+print(f&quot;最慢的叶子 span：{leaf.name}，{(leaf.end - leaf.start)*1000:.0f}ms，占整个请求的 {(leaf.end - leaf.start)/total:.0%}&quot;)
+</code></pre>
+<p>运行结果（traceId 和 spanId 是随机生成的，耗时每次会有毫秒级的差异）：</p>
+<pre><code class="language-text">{&quot;level&quot;: &quot;INFO&quot;, &quot;service&quot;: &quot;order-service&quot;, &quot;msg&quot;: &quot;创建订单&quot;, &quot;traceId&quot;: &quot;c89580b537436b836445f7bee518cf80&quot;, &quot;spanId&quot;: &quot;d4feba643f106eed&quot;, &quot;uid&quot;: 42, &quot;sku&quot;: &quot;A-1001&quot;}
+{&quot;level&quot;: &quot;WARNING&quot;, &quot;service&quot;: &quot;payment-service&quot;, &quot;msg&quot;: &quot;数据库连接池耗尽，等待连接&quot;, &quot;traceId&quot;: &quot;c89580b537436b836445f7bee518cf80&quot;, &quot;spanId&quot;: &quot;7ce5d4723d20291b&quot;, &quot;poolActive&quot;: 20, &quot;poolMax&quot;: 20, &quot;waitMs&quot;: 350}
+{&quot;level&quot;: &quot;INFO&quot;, &quot;service&quot;: &quot;order-service&quot;, &quot;msg&quot;: &quot;订单完成&quot;, &quot;traceId&quot;: &quot;c89580b537436b836445f7bee518cf80&quot;, &quot;spanId&quot;: &quot;d4feba643f106eed&quot;, &quot;status&quot;: &quot;PAID&quot;}
+
+traceId = c89580b537436b836445f7bee518cf80，共 7 个 span，全部共享这一个 traceId：True
+gateway POST /api/checkout                0ms +  411ms |████████████████████████████████████████|
+  order-service POST /orders              0ms +  411ms |████████████████████████████████████████|
+    user-service GET /users/{id}          0ms +   20ms |██                                      |
+    inventory-service POST /reserve      20ms +   30ms |  ███                                   |
+    payment-service POST /pay            51ms +  361ms |     ███████████████████████████████████|
+      db: wait connection                51ms +  350ms |     ██████████████████████████████████ |
+      db: INSERT payment                401ms +   10ms |                                       █|
+最慢的叶子 span：db: wait connection，350ms，占整个请求的 85%
+</code></pre>
+<p>可以看到：</p>
+<ul>
+<li>3 条日志来自两个不同的服务，但 <strong>traceId 完全相同</strong>。在日志系统里搜这个 traceId，就能拿到这次请求在所有服务里的全部日志；</li>
+<li>警告（WARNING）日志的 spanId 是 payment-service 那个 span 的 ID，它告诉你这条日志具体发生在调用链的哪个位置；</li>
+<li>span 树一眼看出：整个请求约 410ms，user-service 和 inventory-service 都很快，<strong>85% 的时间花在支付服务等待数据库连接上</strong>。如果只看订单服务的耗时指标，你只知道「订单服务慢」，不会知道原因在两跳之外。</li>
+</ul>
+<h3 id="metrics">实验二：三种指标和 /metrics 的样子</h3>
+<pre><code class="language-python">&quot;&quot;&quot;三种指标类型 + Prometheus 文本格式（/metrics 接口返回的内容），只用标准库。&quot;&quot;&quot;
+import random
+from collections import defaultdict
+
+random.seed(3)
+
+class Counter:                       # 只增不减：请求总数、错误总数
+    def __init__(self, name): self.name, self.v = name, defaultdict(float)
+    def inc(self, **labels): self.v[tuple(sorted(labels.items()))] += 1
+
+class Gauge:                         # 可增可减：当前值，如在途请求数、队列长度
+    def __init__(self, name): self.name, self.value = name, 0
+    def set(self, x): self.value = x
+
+class Histogram:                     # 分桶计数：耗时分布，用来估算分位数
+    def __init__(self, name, buckets):
+        self.name, self.buckets = name, buckets
+        self.counts, self.sum, self.count = [0] * len(buckets), 0.0, 0
+    def observe(self, x):
+        self.sum += x; self.count += 1
+        for i, le in enumerate(self.buckets):
+            if x &lt;= le: self.counts[i] += 1       # 累积桶：le=0.25 也包含 ≤0.1 的样本
+
+def lbl(t): return &quot;{&quot; + &quot;,&quot;.join(f'{k}=&quot;{v}&quot;' for k, v in t) + &quot;}&quot;
+
+requests = Counter(&quot;http_requests_total&quot;)
+inflight = Gauge(&quot;http_requests_in_flight&quot;)
+latency = Histogram(&quot;http_request_duration_seconds&quot;, [0.05, 0.1, 0.25, 0.5, 1, 2.5])
+
+for _ in range(1000):                # 模拟 1000 个请求
+    slow = random.random() &lt; 0.03
+    sec = random.uniform(1.5, 3) if slow else random.uniform(0.03, 0.12)
+    status = &quot;500&quot; if random.random() &lt; 0.01 else &quot;200&quot;
+    requests.inc(method=&quot;GET&quot;, status=status)
+    latency.observe(sec)
+inflight.set(7)
+
+# Prometheus 每隔 15 秒左右来「拉」一次的就是下面这段文本
+print(f&quot;# TYPE {requests.name} counter&quot;)
+for k, v in sorted(requests.v.items()): print(f&quot;{requests.name}{lbl(k)} {v:g}&quot;)
+print(f&quot;# TYPE {inflight.name} gauge\n{inflight.name} {inflight.value}&quot;)
+print(f&quot;# TYPE {latency.name} histogram&quot;)
+for le, c in zip(latency.buckets, latency.counts): print(f'{latency.name}_bucket{{le=&quot;{le}&quot;}} {c}')
+print(f'{latency.name}_bucket{{le=&quot;+Inf&quot;}} {latency.count}')
+print(f&quot;{latency.name}_sum {latency.sum:.3f}\n{latency.name}_count {latency.count}&quot;)
+</code></pre>
+<p>输出（这就是 Prometheus 每次抓取时拿到的文本格式）：</p>
+<pre><code class="language-text"># TYPE http_requests_total counter
+http_requests_total{method=&quot;GET&quot;,status=&quot;200&quot;} 987
+http_requests_total{method=&quot;GET&quot;,status=&quot;500&quot;} 13
+# TYPE http_requests_in_flight gauge
+http_requests_in_flight 7
+# TYPE http_request_duration_seconds histogram
+http_request_duration_seconds_bucket{le=&quot;0.05&quot;} 207
+http_request_duration_seconds_bucket{le=&quot;0.1&quot;} 770
+http_request_duration_seconds_bucket{le=&quot;0.25&quot;} 973
+http_request_duration_seconds_bucket{le=&quot;0.5&quot;} 973
+http_request_duration_seconds_bucket{le=&quot;1&quot;} 973
+http_request_duration_seconds_bucket{le=&quot;2.5&quot;} 994
+http_request_duration_seconds_bucket{le=&quot;+Inf&quot;} 1000
+http_request_duration_seconds_sum 129.933
+http_request_duration_seconds_count 1000
+</code></pre>
+<p>注意 Histogram 的桶是<strong>累积</strong>的：<code>le="0.25"</code> 的 973 包含了 <code>le="0.1"</code> 的 770。Prometheus 不存每个请求的耗时，只存这几个桶的计数，所以无论请求量多大，一个接口的耗时分布只占固定的几条时间序列。</p>
+<h3 id="_14">实验三：平均值、分位数与直方图估算</h3>
+<pre><code class="language-python">import random, math
+
+random.seed(7)
+# 模拟 1000 个请求的耗时（毫秒）：大多数很快，但有 3% 撞上了慢查询 / 锁等待
+fast = [random.lognormvariate(math.log(80), 0.3) for _ in range(970)]
+slow = [random.uniform(1500, 3000) for _ in range(30)]
+lat = sorted(fast + slow)
+
+def pct(data, p):
+    &quot;&quot;&quot;最近秩法：至少 p% 的请求不超过这个值&quot;&quot;&quot;
+    k = max(1, math.ceil(p / 100 * len(data)))
+    return data[k - 1]
+
+mean = sum(lat) / len(lat)
+print(f&quot;请求数 {len(lat)}&quot;)
+print(f&quot;平均值 {mean:7.1f} ms&quot;)
+for p in (50, 90, 95, 99, 99.9):
+    print(f&quot;P{p:&lt;4} {pct(lat, p):7.1f} ms&quot;)
+print(f&quot;最大值 {lat[-1]:7.1f} ms&quot;)
+print(f&quot;超过 1 秒的请求：{sum(x &gt; 1000 for x in lat)} 个（{sum(x &gt; 1000 for x in lat) / len(lat):.1%}）&quot;)
+
+# 两个服务：平均值几乎一样，体验天差地别
+a = [100.0] * 1000                         # 服务 A：每个请求都是 100ms
+b = [52.0] * 980 + [2500.0] * 20           # 服务 B：98% 很快，2% 要 2.5 秒
+for name, d in ((&quot;服务 A&quot;, a), (&quot;服务 B&quot;, b)):
+    d = sorted(d)
+    print(f&quot;{name}: 平均 {sum(d)/len(d):6.1f} ms   P50 {pct(d,50):6.1f}   P99 {pct(d,99):7.1f} ms&quot;)
+
+# Prometheus 直方图：只存「每个桶里有多少个」，分位数靠桶内线性插值估算
+buckets = [50, 100, 250, 500, 1000, 2500, 5000, float(&quot;inf&quot;)]
+cum = [sum(x &lt;= le for x in lat) for le in buckets]       # 累积计数，对应 le=&quot;...&quot; 标签
+print(&quot;直方图累积计数:&quot;, {(&quot;+Inf&quot; if le == float(&quot;inf&quot;) else le): c for le, c in zip(buckets, cum)})
+
+def histogram_quantile(q, buckets, cum):
+    rank = q * cum[-1]
+    for i, c in enumerate(cum):
+        if c &gt;= rank:
+            lo = buckets[i - 1] if i else 0
+            prev = cum[i - 1] if i else 0
+            return lo + (buckets[i] - lo) * (rank - prev) / (c - prev)
+
+for q in (0.5, 0.95, 0.99):
+    print(f&quot;histogram_quantile({q}) ≈ {histogram_quantile(q, buckets, cum):7.1f} ms   （精确值 {pct(lat, q*100):7.1f} ms）&quot;)
+</code></pre>
+<p>输出：</p>
+<pre><code class="language-text">请求数 1000
+平均值   148.7 ms
+P50      79.8 ms
+P90     124.7 ms
+P95     148.2 ms
+P99    2452.8 ms
+P99.9  2982.6 ms
+最大值  2982.6 ms
+超过 1 秒的请求：30 个（3.0%）
+服务 A: 平均  100.0 ms   P50  100.0   P99   100.0 ms
+服务 B: 平均  101.0 ms   P50   52.0   P99  2500.0 ms
+直方图累积计数: {50: 51, 100: 768, 250: 970, 500: 970, 1000: 970, 2500: 990, 5000: 1000, '+Inf': 1000}
+histogram_quantile(0.5) ≈    81.3 ms   （精确值    79.8 ms）
+histogram_quantile(0.95) ≈   235.1 ms   （精确值   148.2 ms）
+histogram_quantile(0.99) ≈  2500.0 ms   （精确值  2452.8 ms）
+</code></pre>
+<p>三个结论：</p>
+<ol>
+<li><strong>平均值（148.7ms）被 3% 的慢请求拉高了近一倍</strong>，却仍然远远低于这些慢请求本身的耗时，P99 才暴露出 2.4 秒的长尾；</li>
+<li><strong>服务 A 和服务 B 平均值几乎相同，P99 差了 25 倍</strong>；</li>
+<li><strong>直方图估算的分位数精度取决于桶的划分</strong>：P95 的真实值是 148ms，但它落在 100～250ms 这个宽桶里，线性插值估出了 235ms。所以桶的边界要围绕你关心的阈值来设计（比如 SLO 是 300ms，就要有一个 0.3 秒的桶）。Prometheus 较新的版本提供了原生直方图（native histograms），可以自动使用更细的指数分桶。</li>
+</ol>
+<h3 id="slo">实验四：SLO 与错误预算</h3>
+<pre><code class="language-python"># SLO 与错误预算：允许多少「坏」、按什么速度烧完
+WINDOW_DAYS = 30
+minutes = WINDOW_DAYS * 24 * 60
+for slo in (0.99, 0.999, 0.9999):
+    budget = 1 - slo
+    print(f&quot;SLO {slo:.2%}：错误预算 {budget:.2%}，30 天内全站故障最多 {minutes * budget:7.1f} 分钟&quot;)
+
+print()
+slo = 0.999
+for burn in (1, 2, 6, 14.4):
+    hours_to_empty = WINDOW_DAYS * 24 / burn
+    print(f&quot;燃烧率 {burn:&gt;4}（错误率 {burn * (1 - slo):.2%}）：{hours_to_empty:6.1f} 小时烧完预算；&quot;
+          f&quot;1 小时消耗预算的 {1 / (WINDOW_DAYS * 24) * burn:.1%}&quot;)
+</code></pre>
+<p>输出：</p>
+<pre><code class="language-text">SLO 99.00%：错误预算 1.00%，30 天内全站故障最多   432.0 分钟
+SLO 99.90%：错误预算 0.10%，30 天内全站故障最多    43.2 分钟
+SLO 99.99%：错误预算 0.01%，30 天内全站故障最多     4.3 分钟
+
+燃烧率    1（错误率 0.10%）： 720.0 小时烧完预算；1 小时消耗预算的 0.1%
+燃烧率    2（错误率 0.20%）： 360.0 小时烧完预算；1 小时消耗预算的 0.3%
+燃烧率    6（错误率 0.60%）： 120.0 小时烧完预算；1 小时消耗预算的 0.8%
+燃烧率 14.4（错误率 1.44%）：  50.0 小时烧完预算；1 小时消耗预算的 2.0%
+</code></pre>
+<h2 id="_15">告警与联动排查</h2>
+<figure><img src="img/f-77.jpg" alt="告警、指标、追踪、日志四步定位故障，以及 SLO 与告警原则" loading="lazy"><figcaption>告警、指标、追踪、日志四步定位故障，以及 SLO 与告警原则</figcaption></figure>
+<h3 id="slo_1">基于 SLO 的告警</h3>
+<p>几个概念：</p>
+<ul>
+<li><strong>SLI</strong>（服务水平指标）：衡量服务质量的指标，比如「耗时小于 300ms 且成功的请求所占比例」；</li>
+<li><strong>SLO</strong>（服务水平目标）：给 SLI 定的目标，比如「30 天内 99.9% 的请求满足要求」；</li>
+<li><strong>错误预算</strong>：1 − SLO。99.9% 的 SLO 意味着有 0.1% 的「额度」可以失败，换算成全站完全不可用的时间，30 天大约 <strong>43 分钟</strong>（实验四的输出）；</li>
+<li><strong>燃烧率</strong>（burn rate）：错误预算被消耗的速度。燃烧率为 1，表示刚好在 30 天末用完；燃烧率为 14.4，表示 1 小时就会烧掉 2% 的预算，约 50 小时就会全部烧光。</li>
+</ul>
+<p>传统的告警是「CPU &gt; 80% 就报警」「错误率 &gt; 1% 就报警」。问题是：CPU 高未必影响用户，错误率在流量低谷时偶尔一跳也会触发，于是告警越来越多，大家开始习惯性忽略，这就是<strong>告警疲劳</strong>。真正的故障反而被淹没在噪音里。</p>
+<p>基于 SLO 的告警换了一个角度：<strong>只在错误预算被快速消耗时告警</strong>。常见做法是多窗口、多燃烧率：</p>
+<table>
+<thead>
+<tr>
+<th>燃烧率</th>
+<th>长窗口 / 短窗口</th>
+<th>消耗预算</th>
+<th>处理方式</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>14.4</td>
+<td>1 小时 / 5 分钟</td>
+<td>2%</td>
+<td>立刻叫醒值班的人</td>
+</tr>
+<tr>
+<td>6</td>
+<td>6 小时 / 30 分钟</td>
+<td>5%</td>
+<td>立刻叫醒值班的人</td>
+</tr>
+<tr>
+<td>1</td>
+<td>3 天 / 6 小时</td>
+<td>10%</td>
+<td>提工单，工作时间处理</td>
+</tr>
+</tbody>
+</table>
+<p>长窗口保证不会因为一次小抖动就报警，短窗口保证问题恢复后告警能尽快消失。</p>
+<p>几条告警原则：</p>
+<ul>
+<li><strong>对症状告警，而不是对原因告警</strong>：用户感知到的是「慢」「失败」，而不是「CPU 高」。CPU、连接池、GC 这些原因类指标放进大盘，用于排查，不用来半夜叫人；</li>
+<li><strong>每条告警都要可行动</strong>：收到告警的人应该知道要做什么，最好附上排查手册（runbook）链接；</li>
+<li><strong>定期清理</strong>：一条告警如果经常触发、却从来不需要处理，就该删掉或者调整阈值。</li>
+</ul>
+<p>错误预算还有一个管理上的用途：预算充足时可以放心地快速发布；预算快用完时，就该放慢发布节奏，优先投入稳定性。</p>
+<h3 id="_16">三者联动：排查一次线上故障</h3>
+<p>回到文章开头的场景，完整的排查过程是这样的：</p>
+<table>
+<thead>
+<tr>
+<th>步骤</th>
+<th>用什么</th>
+<th>看到了什么</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>① 发现</td>
+<td><strong>告警</strong>（SLO 燃烧率）</td>
+<td>下单接口的耗时 SLO 预算消耗过快，通知值班工程师</td>
+</tr>
+<tr>
+<td>② 定位服务</td>
+<td><strong>指标</strong>（各服务的 RED 面板）</td>
+<td>网关和订单服务的 P99 都涨了，但订单服务调用的下游里，只有 payment 的 P99 从 120ms 涨到了 2.4s；错误率基本没变</td>
+</tr>
+<tr>
+<td>③ 定位哪一跳</td>
+<td><strong>追踪</strong>（筛选慢 trace）</td>
+<td>在追踪系统里筛出 payment 耗时超过 1 秒的 trace，瀑布图显示时间都花在 <code>db: wait connection</code> 这个 span 上</td>
+</tr>
+<tr>
+<td>④ 找到原因</td>
+<td><strong>日志</strong>（按 traceId 检索）</td>
+<td>用这条 trace 的 traceId 搜日志，看到 WARN「数据库连接池耗尽，active 20/20」；再看连接池的饱和度指标，发现一个新上线的对账任务占住了大量连接</td>
+</tr>
+</tbody>
+</table>
+<p>把三者串起来的关键是<strong>关联</strong>：</p>
+<ul>
+<li>日志里带 traceId，追踪的 span 可以一键跳转到对应日志；</li>
+<li>指标图上可以附带 <strong>exemplar</strong>（样例）：在某个时间点的耗时数据旁边，附上一个当时真实请求的 traceId，从「P99 突然升高」的图上直接点进一条慢 trace；</li>
+<li>所有数据使用相同的服务名、实例、版本等资源属性，可以在不同视图之间切换而不丢失上下文。</li>
+</ul>
+<p><strong>指标告诉你「有问题」，追踪告诉你「在哪」，日志告诉你「为什么」。</strong></p>
+<h2 id="promql-opentelemetry">参考写法：PromQL、告警规则与 OpenTelemetry</h2>
+<p>下面的配置需要真实的 Prometheus、OpenTelemetry Collector 等组件才能运行，属于<strong>参考写法</strong>，本机没有部署；其中的 YAML 已经用 PyYAML 检查过语法，Collector 配置还用脚本检查了 pipelines 里引用的组件都已定义。</p>
+<h3 id="promql">常用 PromQL</h3>
+<pre><code class="language-text"># 每个服务的每秒请求数（R）
+sum by (service) (rate(http_requests_total[5m]))
+
+# 错误率（E）：5xx 占比
+sum by (service) (rate(http_requests_total{status=~&quot;5..&quot;}[5m]))
+  / sum by (service) (rate(http_requests_total[5m]))
+
+# P99 耗时（D）：先按桶把所有实例合并，再算分位数
+histogram_quantile(0.99, sum by (service, le) (rate(http_request_duration_seconds_bucket[5m])))
+
+# 哪些实例抓取失败了
+up == 0
+</code></pre>
+<p><code>rate()</code> 会自动处理 Counter 因进程重启而归零的情况，所以对 Counter 永远用 <code>rate()</code> 或 <code>increase()</code>，不要直接对原始值做减法。</p>
+<h3 id="prometheus_1">基于燃烧率的告警规则（Prometheus）</h3>
+<pre><code class="language-yaml">groups:
+  - name: checkout-slo
+    rules:
+      # 快速燃烧：1 小时和 5 分钟窗口的错误率都超过预算的 14.4 倍 → 立刻叫人
+      - alert: CheckoutErrorBudgetFastBurn
+        expr: |
+          (
+            sum(rate(http_requests_total{service=&quot;checkout&quot;,status=~&quot;5..&quot;}[1h]))
+              / sum(rate(http_requests_total{service=&quot;checkout&quot;}[1h])) &gt; (14.4 * 0.001)
+          )
+          and
+          (
+            sum(rate(http_requests_total{service=&quot;checkout&quot;,status=~&quot;5..&quot;}[5m]))
+              / sum(rate(http_requests_total{service=&quot;checkout&quot;}[5m])) &gt; (14.4 * 0.001)
+          )
+        labels:
+          severity: page
+        annotations:
+          summary: &quot;下单接口错误预算正在快速消耗&quot;
+          runbook: &quot;https://wiki.example.com/runbooks/checkout-errors&quot;
+      # 慢速燃烧：3 天和 6 小时窗口都超过预算的 1 倍 → 提工单，工作时间处理
+      - alert: CheckoutErrorBudgetSlowBurn
+        expr: |
+          (
+            sum(rate(http_requests_total{service=&quot;checkout&quot;,status=~&quot;5..&quot;}[3d]))
+              / sum(rate(http_requests_total{service=&quot;checkout&quot;}[3d])) &gt; (1 * 0.001)
+          )
+          and
+          (
+            sum(rate(http_requests_total{service=&quot;checkout&quot;,status=~&quot;5..&quot;}[6h]))
+              / sum(rate(http_requests_total{service=&quot;checkout&quot;}[6h])) &gt; (1 * 0.001)
+          )
+        labels:
+          severity: ticket
+</code></pre>
+<h3 id="opentelemetry-collector">OpenTelemetry Collector 配置</h3>
+<pre><code class="language-yaml">receivers:
+  otlp:                              # 接收应用用 OTLP 协议发来的数据
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  memory_limiter:                    # 防止 Collector 自己被打爆
+    check_interval: 1s
+    limit_percentage: 80
+    spike_limit_percentage: 20
+  batch: {}                          # 攒一批再发，减少网络开销
+  tail_sampling:                     # 尾部采样：整条 trace 结束后再决定留不留
+    decision_wait: 10s
+    policies:
+      - name: keep-errors
+        type: status_code
+        status_code: {status_codes: [ERROR]}
+      - name: keep-slow
+        type: latency
+        latency: {threshold_ms: 1000}
+      - name: sample-10-percent
+        type: probabilistic
+        probabilistic: {sampling_percentage: 10}
+
+exporters:
+  otlp/jaeger:                       # 追踪 → Jaeger（原生支持 OTLP）
+    endpoint: jaeger-collector:4317
+    tls:
+      insecure: true
+  prometheus:                        # 指标 → 暴露给 Prometheus 来拉
+    endpoint: 0.0.0.0:8889
+  otlphttp/loki:                     # 日志 → Loki 的 OTLP 接口
+    endpoint: http://loki:3100/otlp
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, tail_sampling, batch]
+      exporters: [otlp/jaeger]
+    metrics:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [prometheus]
+    logs:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [otlphttp/loki]
+</code></pre>
+<p>应用侧接入（以 Java 为例，参考写法）：不用改代码，启动时挂上 OpenTelemetry Java Agent，通过环境变量配置服务名和 Collector 地址即可：</p>
+<pre><code class="language-bash">export OTEL_SERVICE_NAME=payment-service
+export OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4318
+export OTEL_RESOURCE_ATTRIBUTES=deployment.environment=prod,service.version=1.4.2
+java -javaagent:opentelemetry-javaagent.jar -jar payment-service.jar
+</code></pre>
+<p>Agent 会自动为 Spring MVC、JDBC、HTTP 客户端、常见消息队列客户端等生成 span、传播 traceparent，并把 traceId 注入日志框架的 MDC。需要在业务代码里加自定义 span 或属性时，再使用 OTel 的 API。</p>
+<h2 id="_17">工程实践与常见坑</h2>
+<ul>
+<li><strong>先统一，再丰富</strong>：服务名、环境、版本这些资源属性在三类数据里保持一致；日志格式全公司统一；traceId 字段名统一。没有统一的命名，关联就无从谈起；</li>
+<li><strong>网关和入口一定要接入追踪</strong>：链路从第一跳就断了，后面全白费。同样要关注线程池、异步任务、消息队列这些容易断链的地方；</li>
+<li><strong>控制指标的标签基数</strong>：不要把 userId、订单号、带参数的 URL 放进标签。接口路径要用路由模板（<code>/orders/{id}</code>），而不是真实路径；</li>
+<li><strong>日志不是越多越好</strong>：循环里打日志、每个请求打十几条 INFO，会把存储和网络打爆，也会拖慢应用。高频路径考虑采样或降级为 DEBUG；</li>
+<li><strong>敏感信息脱敏</strong>：日志、span 属性、SQL 参数都可能带出用户隐私。可以在 Collector 里统一做过滤和脱敏；</li>
+<li><strong>注意时钟</strong>：瀑布图依赖各机器的时间戳，时钟偏差会让子 span 看起来比父 span 先开始。服务器要开启时间同步；</li>
+<li><strong>可观测性系统本身也要被监控</strong>：Collector 积压、Prometheus 抓取失败、日志采集延迟，都会让你在故障时「失明」。最怕的就是出事时才发现监控系统先挂了；</li>
+<li><strong>大盘要有层次</strong>：先是业务总览（下单量、支付成功率），再是各服务的 RED，最后才是资源的 USE。值班的人应该能在一分钟内回答「用户受影响了吗」。</li>
+</ul>
+<h2 id="_18">高频面试题速答</h2>
+<p><strong>Q：监控和可观测性有什么区别？</strong>
+监控是预先定义指标和阈值，回答「坏了没有」，擅长已知问题；可观测性是通过系统输出的数据推断内部状态，回答「为什么坏、坏在哪」，能排查事先没想到的问题。</p>
+<p><strong>Q：可观测性的三大支柱是什么？各自适合做什么？</strong>
+日志记录离散事件的细节，用于找原因；指标是聚合的时间序列，便宜，用于看趋势和告警；链路追踪记录请求在服务间的完整路径和每段耗时，用于定位慢在哪一跳。三者通过 traceId 关联。</p>
+<p><strong>Q：Counter、Gauge、Histogram 有什么区别？</strong>
+Counter 只增不减，用 rate 算速率；Gauge 表示可增可减的当前值；Histogram 按区间分桶计数，用于估算分位数，并且可以跨实例聚合。</p>
+<p><strong>Q：Prometheus 为什么用拉模型？</strong>
+服务只需暴露 /metrics，不需要知道监控系统在哪；Prometheus 掌控抓取节奏；抓不到（up == 0）本身就能发现实例故障。短任务可以通过 Pushgateway 推送。</p>
+<p><strong>Q：为什么要看 P99 而不是平均值？</strong>
+平均值会被大量快请求「摊平」，掩盖长尾；一个页面调用很多接口时，用户很容易碰上尾部的慢请求；长尾往往是资源争抢的早期信号。</p>
+<p><strong>Q：traceId 是怎么在服务间传递的？</strong>
+调用下游时把 traceId 和当前 spanId 写进请求头（W3C 标准是 traceparent），下游取出后继续使用同一个 traceId，并把上游 spanId 作为父 span。进程内用 ThreadLocal、contextvars 或 context.Context 传递，线程池和消息队列需要特别处理。</p>
+<p><strong>Q：OpenTelemetry 是什么？</strong>
+CNCF 的可观测性标准，提供统一的 API/SDK、自动埋点、OTLP 协议和 Collector，覆盖 traces、metrics、logs；只负责采集和传输，后端可以自由选择。</p>
+<p><strong>Q：头部采样和尾部采样有什么区别？</strong>
+头部采样在请求入口就决定是否记录，简单但可能丢掉错误和慢请求；尾部采样在整条 trace 结束后再按规则决定，能保留所有错误和慢请求，但需要在 Collector 中缓存数据。</p>
+<p><strong>Q：如何避免告警疲劳？</strong>
+基于 SLO 和错误预算的燃烧率告警；对用户可感知的症状告警，而不是对原因告警；每条告警都要可行动、有 runbook；定期清理没有价值的告警。</p>
+<h2 id="_19">总结</h2>
+<figure><img src="img/f-83.jpg" alt="四个关键点" loading="lazy"><figcaption>四个关键点</figcaption></figure>
+<ul>
+<li><strong>监控</strong>回答「坏了没有」，<strong>可观测性</strong>回答「为什么坏、坏在哪」，能排查事先没想到的问题；</li>
+<li><strong>日志</strong>记录发生了什么：用结构化 JSON、合理的级别，一定要带上 traceId；</li>
+<li><strong>指标</strong>回答有多少、有多快：Counter、Gauge、Histogram，Prometheus 定期拉取；服务看 <strong>RED</strong>，资源看 <strong>USE</strong>；耗时看 <strong>P99</strong>，不要被平均值骗了；</li>
+<li><strong>链路追踪</strong>回答慢在哪一跳：trace 是一棵 span 树，traceId 通过 <strong>traceparent</strong> 请求头在服务间传递；</li>
+<li><strong>OpenTelemetry</strong> 统一了埋点、协议和采集，一次埋点、后端随便换；</li>
+<li>告警基于 <strong>SLO 和错误预算</strong>，对症状告警，避免告警疲劳；</li>
+<li>排查故障：告警发现 → 指标定位服务 → 追踪定位哪一跳 → 日志找到原因。<strong>指标说「有问题」，追踪说「在哪」，日志说「为什么」。</strong></li>
+</ul>
+<div class="refs">
+<h3 id="_20">参考资料</h3>
+<ul>
+<li><em>Dapper, a Large-Scale Distributed Systems Tracing Infrastructure</em>. Google Technical Report, 2010.</li>
+<li>W3C Recommendation：Trace Context.</li>
+<li>OpenTelemetry 官方文档：Concepts（Traces、Metrics、Logs、Context Propagation、Sampling）；Collector 配置；Java Agent.</li>
+<li>OpenTelemetry Collector Contrib：Tail Sampling Processor 文档.</li>
+<li>Prometheus 官方文档：Data Model；Metric Types；Histograms and Summaries；Querying Basics；Alerting Rules.</li>
+<li><em>Site Reliability Engineering</em>（Google SRE 书），第 6 章 Monitoring Distributed Systems（四个黄金信号）.</li>
+<li><em>The Site Reliability Workbook</em>，Alerting on SLOs（多窗口、多燃烧率告警）.</li>
+<li>Grafana Loki 官方文档：Architecture / Labels.</li>
+<li>Elastic 官方文档：Elastic Stack 概述.</li>
+<li>Python 文档：contextvars — Context Variables；logging.</li>
+</ul>
+</div>
+  </article>
+  <div class="foot"><a href="../index.html">← 拾星首页</a><a href="landscape.html">▶ 看配套视频</a></div>
+</div>
+</body>
+</html>

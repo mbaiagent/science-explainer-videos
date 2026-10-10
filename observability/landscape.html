@@ -1,0 +1,361 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>可观测性：日志、指标与链路追踪 · 拾星</title>
+<style>
+  :root{--bg:#07080f;--fg:#f4ede4;--muted:#9a93a8;--acc:#e9d5ff}
+  html,body{margin:0;height:100%;background:var(--bg);color:var(--fg);
+    font-family:-apple-system,"PingFang SC","Noto Sans SC","Noto Sans CJK SC","Microsoft YaHei",sans-serif}
+  body{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;overflow:hidden}
+  #stage{display:block;background:#07080f;border-radius:12px;box-shadow:0 20px 60px rgba(0,0,0,.55);cursor:pointer}
+  #bar{display:flex;align-items:center;gap:12px;width:min(calc(100vw - 32px),640px)}
+  #btn{width:40px;height:40px;border-radius:50%;border:1px solid rgba(233,213,255,.5);background:transparent;
+    color:var(--acc);font-size:16px;cursor:pointer;flex:none}
+  #seek{flex:1;accent-color:var(--acc)}
+  #time{font-variant-numeric:tabular-nums;font-size:13px;color:var(--muted);min-width:84px;text-align:right}
+  body.render{display:block}
+  body.render #bar{display:none}
+  body.render #stage{border-radius:0;box-shadow:none}
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="bar">
+  <button id="btn" aria-label="播放/暂停">❚❚</button>
+  <input id="seek" type="range" min="0" max="84" step="0.01" value="0">
+  <span id="time">0:00 / 1:24</span>
+</div>
+<script>
+/* ============ 基础设置（横屏 1920×1080） ============ */
+const W = 1920, H = 1080, DUR = 84;
+const cv = document.getElementById('stage'), ctx = cv.getContext('2d');
+cv.width = W; cv.height = H;
+const FONT = '"PingFang SC","Noto Sans SC","Noto Sans CJK SC","Source Han Sans SC","Microsoft YaHei",sans-serif';
+const MONO = '"JetBrains Mono","SF Mono",Menlo,Consolas,"DejaVu Sans Mono","Noto Sans Mono CJK SC","PingFang SC","Microsoft YaHei",monospace';
+const C = {acc:'#e9d5ff', mint:'#6ee7c8', gold:'#ffd38a', coral:'#ff9e7a', rose:'#ff8a8a', blue:'#9cc3ff', text:'#f4ede4', muted:'#9a93a8', dim:'#4a4558', panel:'#0f0e1f'};
+
+const clamp = (x,a=0,b=1) => Math.max(a, Math.min(b, x));
+const lerp = (a,b,t) => a + (b-a)*t;
+const p = (t,a,b) => clamp((t-a)/(b-a));
+const eo = x => 1 - Math.pow(1-x, 3);
+const eio = x => x < .5 ? 4*x*x*x : 1 - Math.pow(-2*x+2, 3)/2;
+const eback = x => { const c1=1.70158, c3=c1+1; return 1 + c3*Math.pow(x-1,3) + c1*Math.pow(x-1,2); };
+function rnd(seed){ let s = seed>>>0; return () => { s = (s*1664525 + 1013904223)>>>0; return s/4294967296; }; }
+
+let SA = 1;
+const al = a => { ctx.globalAlpha = clamp(SA*a); };
+const sceneA = (t,a,b,f=.5) => Math.min(p(t,a,a+f), 1 - p(t,b-f,b));
+
+function txt(s, x, y, o = {}){
+  const {size=64, weight=700, color=C.text, alpha=1, align='center', glow=0, scale=1, font=FONT} = o;
+  if (alpha <= 0) return;
+  ctx.save(); al(alpha);
+  ctx.font = `${weight} ${size}px ${font}`;
+  ctx.textAlign = align; ctx.textBaseline = 'middle'; ctx.fillStyle = color;
+  if (glow){ ctx.shadowColor = color; ctx.shadowBlur = glow; }
+  if (scale !== 1){ ctx.translate(x, y); ctx.scale(scale, scale); ctx.fillText(s, 0, 0); }
+  else ctx.fillText(s, x, y);
+  ctx.restore();
+}
+function rise(s, x, y, t, t0, o = {}, d = .7){
+  const e = eo(p(t, t0, t0+d));
+  if (e <= 0) return;
+  txt(s, x, y + (1-e)*36, {...o, alpha:(o.alpha ?? 1)*e});
+}
+function rr(x,y,w,h,r){ ctx.beginPath(); ctx.roundRect(x,y,w,h,r); }
+function box(x, y, w, h, a, o = {}){
+  const {fill='rgba(255,255,255,.05)', stroke='rgba(233,213,255,.35)', lw=2, glow=0, r=18, dash=null} = o;
+  if (a <= 0) return;
+  ctx.save(); al(a); rr(x, y, w, h, r); ctx.fillStyle = fill; ctx.fill();
+  if (dash) ctx.setLineDash(dash);
+  ctx.strokeStyle = stroke; ctx.lineWidth = lw; if (glow){ ctx.shadowColor = stroke; ctx.shadowBlur = glow; } ctx.stroke(); ctx.restore();
+}
+function arrow(x1, y1, x2, y2, e, a, color = C.acc, lw = 3){
+  if (e <= 0 || a <= 0) return;
+  const x = lerp(x1, x2, e), y = lerp(y1, y2, e), ang = Math.atan2(y2 - y1, x2 - x1);
+  ctx.save(); al(a); ctx.strokeStyle = color; ctx.fillStyle = color; ctx.lineWidth = lw; ctx.lineCap = 'round';
+  ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x, y); ctx.stroke();
+  if (e > .85){ ctx.translate(x, y); ctx.rotate(ang); ctx.beginPath(); ctx.moveTo(4, 0); ctx.lineTo(-14, -9); ctx.lineTo(-14, 9); ctx.closePath(); ctx.fill(); }
+  ctx.restore();
+}
+function panel(x, y, w, h, title, a){
+  box(x, y, w, h, a, {fill:C.panel, stroke:'rgba(255,255,255,.1)', r:20});
+  if (a <= 0) return;
+  ctx.save(); al(a); ctx.strokeStyle = 'rgba(255,255,255,.07)'; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(x, y + 52); ctx.lineTo(x + w, y + 52); ctx.stroke();
+  ['#ff6b6b','#ffd166','#6ee7a0'].forEach((c, i) => { ctx.fillStyle = c; ctx.globalAlpha = clamp(SA*a*.8); ctx.beginPath(); ctx.arc(x + 30 + i*24, y + 26, 7, 0, 6.283); ctx.fill(); });
+  ctx.restore();
+  txt(title, x + w/2, y + 27, {size:22, weight:500, color:C.muted, font:MONO, alpha:a});
+}
+
+/* ============ 背景 ============ */
+const PARTS = (() => { const r = rnd(317); return Array.from({length:100}, () => ({
+  x:r()*W, y:r()*H, s:r()*2.2+.5, v:r()*12+4, ph:r()*6.283, c:r()<.25})); })();
+function background(t){
+  const g = ctx.createLinearGradient(0,0,W,H);
+  g.addColorStop(0,'#0a0916'); g.addColorStop(.55,'#110f24'); g.addColorStop(1,'#18122c');
+  ctx.globalAlpha = 1; ctx.fillStyle = g; ctx.fillRect(0,0,W,H);
+  const gx = W*.5 + Math.sin(t*.27)*140;
+  const rg = ctx.createRadialGradient(gx, H*.45, 0, gx, H*.45, 950);
+  rg.addColorStop(0,'rgba(233,213,255,0.09)'); rg.addColorStop(1,'rgba(233,213,255,0)');
+  ctx.fillStyle = rg; ctx.fillRect(0,0,W,H);
+  ctx.fillStyle = C.acc;
+  for (let x = 40; x < W; x += 80) for (let y = 40; y < H; y += 80){ ctx.globalAlpha = .06; ctx.fillRect(x, y, 2, 2); }
+  for (const q of PARTS){
+    const y = ((q.y - t*q.v) % H + H) % H, x = q.x + Math.sin(t*.35 + q.ph)*12;
+    ctx.globalAlpha = .2 + .3*(.5 + .5*Math.sin(t*1.2 + q.ph));
+    ctx.fillStyle = q.c ? C.acc : '#d8d0ff';
+    ctx.beginPath(); ctx.arc(x, y, q.s, 0, 6.283); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+}
+function vignette(){
+  const v = ctx.createRadialGradient(W/2, H/2, W*.28, W/2, H/2, W*.62);
+  v.addColorStop(0,'rgba(0,0,0,0)'); v.addColorStop(1,'rgba(0,0,0,.55)');
+  ctx.globalAlpha = 1; ctx.fillStyle = v; ctx.fillRect(0,0,W,H);
+}
+function codeLine(s, x, y, size, a, kw = /\b(public|class|static|void|new|return)\b/){
+  const parts = s.split(/("[^"]*"|\b(?:public|class|static|void|new|return|getstatic|ldc|invokevirtual)\b)/g);
+  ctx.save(); al(a); ctx.font = `500 ${size}px ${MONO}`; ctx.textBaseline = 'middle'; ctx.textAlign = 'left';
+  let xx = x;
+  for (const seg of parts){ if (!seg) continue;
+    ctx.fillStyle = seg.startsWith('"') ? C.mint : /^(public|class|static|void|new|return|getstatic|ldc|invokevirtual)$/.test(seg) ? C.acc : C.text;
+    ctx.fillText(seg, xx, y); xx += ctx.measureText(seg).width; }
+  ctx.restore();
+}
+
+function card(h, lines, x, y, w, hh, a, c = C.acc, o = {}){
+  const {hs=30, ls=22, lh=40, font=FONT} = o;
+  box(x, y, w, hh, a, {fill:'rgba(233,213,255,.05)', stroke:c === C.acc ? 'rgba(233,213,255,.5)' : c, r:20});
+  txt(h, x + 30, y + 44, {size:hs, weight:900, color:c, align:'left', alpha:a});
+  lines.forEach((s, i) => txt(s, x + 30, y + 96 + i*lh, {size:ls, weight:600, color:'#d9d2e4', align:'left', alpha:a, font}));
+}
+function tag(name, sub, x, y, w, h, a, c = C.acc){
+  box(x, y, w, h, a, {fill:'rgba(233,213,255,.07)', stroke:c, r:14});
+  txt(name, x + w/2, y + h/2 - (sub ? 14 : 0), {size:24, weight:800, color:c, alpha:a});
+  if (sub) txt(sub, x + w/2, y + h/2 + 20, {size:19, weight:600, color:C.muted, alpha:a});
+}
+function tile(label, val, x, y, a, ok = true){
+  box(x, y, 440, 200, a, {fill:'rgba(110,231,200,.06)', stroke:'rgba(110,231,200,.5)', r:18});
+  txt(label, x + 30, y + 46, {size:24, weight:700, color:C.muted, align:'left', alpha:a});
+  txt(val, x + 30, y + 122, {size:56, weight:900, color:C.mint, align:'left', alpha:a});
+  if (ok) txt('✓ 正常', x + 410, y + 46, {size:22, weight:800, color:C.mint, align:'right', alpha:a});
+}
+function spark(x, y, w, h, a, kind, c){
+  if (a <= 0) return;
+  ctx.save(); al(a); ctx.strokeStyle = c; ctx.fillStyle = c; ctx.lineWidth = 3;
+  if (kind === 'bars'){ [8, 30, 64, 40, 18, 9, 5].forEach((v, i) => { const bh = v/64*h; rr(x + i*(w/7) + 4, y + h - bh, w/7 - 8, bh, 4); ctx.fill(); }); }
+  else { ctx.beginPath();
+    for (let i = 0; i <= 40; i++){ const u = i/40, v = kind === 'up' ? Math.floor(u*8)/8*.9 + .05 : .5 + .3*Math.sin(u*9) + .12*Math.sin(u*23);
+      const px = x + u*w, py = y + h - v*h; i ? ctx.lineTo(px, py) : ctx.moveTo(px, py); }
+    ctx.stroke(); }
+  ctx.restore();
+}
+
+/* ============ 场景 1 · 钩子 (0–7s) ============ */
+function s1(t){
+  rise('监控大盘一片绿，用户却在骂「付款卡死了」', W/2, 96, t, .2, {size:50, weight:900});
+  const a = eo(p(t, .7, 1.2));
+  panel(120, 170, 1000, 560, '监控大盘 · 订单服务', a);
+  [['CPU', '38%'], ['内存', '52%'], ['错误率', '0.3%'], ['平均耗时', '149ms']].forEach(([l, v], i) =>
+    tile(l, v, 160 + (i % 2)*480, 250 + Math.floor(i/2)*230, eo(p(t, 1 + i*.2, 1.4 + i*.2))));
+  ['「付款一直在转圈」', '「点了三次才成功」', '「你们是不是挂了？」'].forEach((s, i) => { const e = eo(p(t, 2.2 + i*.45, 2.6 + i*.45)), y = 260 + i*150;
+    box(1200, y - 50, 600, 100, e, {fill:'rgba(255,138,138,.10)', stroke:C.rose, r:50});
+    txt(s, 1500, y, {size:32, weight:800, color:C.rose, alpha:e}); });
+  const k = eo(p(t, 4.2, 4.7));
+  box(260, 790, 1400, 190, k, {fill:'rgba(233,213,255,.10)', stroke:C.acc, r:24, glow:20});
+  txt('平均耗时很正常，但有 3% 的请求要等 1.5～3 秒', W/2, 850, {size:36, weight:900, color:C.gold, alpha:k});
+  txt('慢在哪一跳？为什么慢？可观测性就是用来回答这些问题的', W/2, 920, {size:28, weight:700, alpha:eo(p(t, 5, 5.4))});
+}
+
+/* ============ 场景 2 · 监控 vs 可观测性 (7–19s) ============ */
+function s2(t){
+  rise('监控 vs 可观测性', W/2, 90, t, 7.2, {size:56, weight:900});
+  card('监控（Monitoring）', ['预先定义要看的指标和阈值', '回答：系统坏了没有？', '擅长发现「已知的问题」'], 120, 170, 800, 280, eo(p(t, 7.7, 8.2)), C.gold, {ls:26, lh:46});
+  card('可观测性（Observability）', ['从系统输出的数据推断内部状态', '回答：为什么坏？坏在哪？', '能排查「事先没想到的问题」'], 1000, 170, 800, 280, eo(p(t, 9, 9.5)), C.acc, {ls:26, lh:46});
+  rise('三大支柱', W/2, 530, t, 11, {size:36, weight:900, color:C.acc});
+  [['日志 Logs', ['发生了什么：每个事件的细节', '最详细，量也最大'], C.mint], ['指标 Metrics', ['有多少、有多快：聚合后的数字', '便宜，适合看趋势和告警'], C.gold], ['链路追踪 Traces', ['一个请求经过了哪些服务', '每一跳各花了多久'], C.acc]].forEach(([h, ls, c], i) =>
+    card(h, ls, 120 + i*580, 590, 520, 230, eo(p(t, 11.6 + i*.6, 12.1 + i*.6)), c, {ls:24, lh:44}));
+  rise('三者用同一个 traceId 串起来，才能从「发现问题」一路走到「找到原因」', W/2, 900, t, 14.4, {size:28, weight:800, color:C.text});
+}
+
+/* ============ 场景 3 · 日志 (19–31s) ============ */
+function s3(t){
+  rise('日志：发生了什么', W/2, 90, t, 19.2, {size:56, weight:900});
+  const a = eo(p(t, 19.6, 20.1));
+  panel(120, 170, 860, 170, '纯文本日志', a);
+  txt('14:03:22 WARN 支付超时 用户42 耗时2300ms', 150, 262, {size:22, weight:600, font:MONO, alpha:a, align:'left'});
+  txt('人能看懂，机器难解析：没法按字段过滤、统计', 150, 306, {size:20, weight:700, color:C.rose, alpha:eo(p(t, 20.4, 20.8)), align:'left'});
+  const b = eo(p(t, 21, 21.5));
+  panel(120, 370, 860, 350, '结构化日志（JSON）', b);
+  [['{"time": "2026-10-10T14:03:22Z",', C.text], [' "level": "WARN", "service": "payment",', C.text], [' "msg": "支付超时", "uid": 42,', C.text], [' "durationMs": 2300,', C.text], [' "traceId": "4bf92f3577b34da6…"}', C.acc]].forEach(([s, c], i) =>
+    txt(s, 150, 460 + i*46, {size:22, weight:600, font:MONO, color:c, align:'left', alpha:eo(p(t, 21.3 + i*.2, 21.7 + i*.2))}));
+  const g = eo(p(t, 22.6, 23));
+  box(140, 626, 600, 44, g, {fill:'rgba(233,213,255,.08)', stroke:C.acc, r:10, glow:12});
+  txt('每个字段可检索；带上 traceId 就能和链路追踪对上号', 550, 696, {size:20, weight:700, color:C.gold, alpha:eo(p(t, 23, 23.4))});
+  txt('日志级别', 1390, 200, {size:30, weight:900, color:C.acc, alpha:eo(p(t, 23.6, 24))});
+  [['DEBUG', '开发调试细节，生产一般关闭', C.muted], ['INFO', '关键业务事件：下单、支付成功', C.text], ['WARN', '不正常但还能自己恢复', C.gold], ['ERROR', '失败了，需要人来处理', C.rose]].forEach(([l, d, c], i) => { const e = eo(p(t, 24 + i*.3, 24.4 + i*.3)), y = 280 + i*100;
+    box(1040, y - 38, 760, 76, e, {fill:'rgba(255,255,255,.04)', stroke:'rgba(255,255,255,.2)', r:14});
+    txt(l, 1070, y, {size:26, weight:900, font:MONO, color:c, align:'left', alpha:e}); txt(d, 1210, y, {size:22, weight:600, align:'left', alpha:e}); });
+  const flow = [['应用', 'stdout / 日志文件'], ['采集 Agent', 'Filebeat · Fluent Bit'], ['存储与索引', 'Elasticsearch · Loki'], ['查询与看图', 'Kibana · Grafana']];
+  flow.forEach(([h, s], i) => { const e = eo(p(t, 25.6 + i*.4, 26 + i*.4)), x = 120 + i*430;
+    tag(h, s, x, 770, 360, 100, e, i === 2 ? C.gold : C.acc);
+    if (i) arrow(x - 66, 820, x - 6, 820, e, e, C.acc, 3); });
+  rise('ELK 对全文建索引，查得灵活但成本高；Loki 只索引标签，便宜，但要先按标签缩小范围', W/2, 950, t, 27.6, {size:24, weight:700, color:C.muted});
+}
+
+/* ============ 场景 4 · 指标 (31–43s) ============ */
+function s4(t){
+  rise('指标：有多少、有多快', W/2, 90, t, 31.2, {size:56, weight:900});
+  [['Counter 计数器', ['只增不减（重启归零）', '请求数、错误数，用 rate 算每秒'], 'up', C.mint], ['Gauge 仪表盘', ['可增可减的「当前值」', '内存、连接数、队列长度'], 'wave', C.gold], ['Histogram 直方图', ['按耗时区间分桶计数', '用来估算 P95、P99'], 'bars', C.acc]].forEach(([h, ls, k, c], i) => {
+    const e = eo(p(t, 31.7 + i*.6, 32.2 + i*.6)), x = 120 + i*580;
+    card(h, ls, x, 160, 520, 320, e, c, {ls:22, lh:40});
+    spark(x + 40, 350, 440, 100, eo(p(t, 32.1 + i*.6, 32.8 + i*.6)), k, c); });
+  const a = eo(p(t, 34, 34.5));
+  [['order-service', 540], ['payment-service', 640], ['node-exporter', 740]].forEach(([s, y], i) => { const e = eo(p(t, 34 + i*.2, 34.4 + i*.2));
+    box(120, y, 330, 76, e, {fill:'rgba(255,255,255,.05)', stroke:'rgba(255,255,255,.3)', r:12});
+    txt(s, 140, y + 26, {size:20, weight:800, font:MONO, align:'left', alpha:e}); txt('/metrics', 140, y + 54, {size:18, weight:600, font:MONO, color:C.muted, align:'left', alpha:e});
+    arrow(596, 660, 456, y + 38, eo(p(t, 35.2 + i*.15, 35.7 + i*.15)), e, C.acc, 3); });
+  box(600, 590, 340, 140, a, {fill:'rgba(233,213,255,.12)', stroke:C.acc, r:18, glow:14});
+  txt('Prometheus', 770, 636, {size:32, weight:900, color:C.acc, alpha:a}); txt('定期主动「拉」（pull）', 770, 690, {size:20, weight:700, color:C.muted, alpha:a});
+  txt('抓取间隔常配 15 秒', 770, 760, {size:20, weight:600, color:C.muted, alpha:eo(p(t, 35.8, 36.2))});
+  const b = eo(p(t, 36.4, 36.9));
+  panel(1000, 530, 800, 320, 'GET /metrics', b);
+  [['http_requests_total{status="200"} 987', C.text], ['http_requests_total{status="500"} 13', C.rose], ['http_request_duration_seconds_bucket{le="0.1"} 770', C.text], ['http_request_duration_seconds_bucket{le="+Inf"} 1000', C.text]].forEach(([s, c], i) =>
+    txt(s, 1030, 620 + i*44, {size:19, weight:600, font:MONO, color:c, align:'left', alpha:eo(p(t, 36.8 + i*.3, 37.2 + i*.3))}));
+  txt('PromQL：sum(rate(http_requests_total[5m]))', 1030, 806, {size:20, weight:800, font:MONO, color:C.acc, align:'left', alpha:eo(p(t, 38.4, 38.8))});
+  rise('拉模型：服务只要暴露一个 HTTP 接口；拉不到（up == 0）本身就说明出事了', W/2, 940, t, 39.4, {size:26, weight:800, color:C.gold});
+}
+
+/* ============ 场景 5 · RED/USE 与 P99 (43–55s) ============ */
+function s5(t){
+  rise('看哪些指标？为什么看 P99 而不是平均值', W/2, 90, t, 43.2, {size:50, weight:900});
+  card('RED：看服务（每个请求）', ['Rate：每秒请求数', 'Errors：失败请求的比例', 'Duration：耗时分布（P50 / P99）'], 120, 170, 800, 240, eo(p(t, 43.7, 44.2)), C.acc, {ls:22, lh:38});
+  card('USE：看资源（CPU、内存、连接池）', ['Utilization：使用率', 'Saturation：饱和度（排队了多少）', 'Errors：错误数'], 120, 440, 800, 240, eo(p(t, 44.6, 45.1)), C.gold, {ls:22, lh:38});
+  const a = eo(p(t, 45.6, 46.1));
+  panel(1000, 170, 800, 510, '1000 个请求的耗时分布', a);
+  const B = [['<50', 51], ['50–100', 717], ['100–250', 202], ['250–1000', 0], ['1–2.5s', 20], ['>2.5s', 10]];
+  B.forEach(([l, n], i) => { const e = eo(p(t, 46 + i*.15, 46.5 + i*.15)), x = 1050 + i*122, bh = n ? Math.max(8, n/717*240) : 0, slow = i >= 4;
+    if (bh && e > 0){ ctx.save(); al(a*e); ctx.fillStyle = slow ? C.rose : 'rgba(233,213,255,.7)'; rr(x, 500 - bh*e, 96, bh*e, 6); ctx.fill(); ctx.restore(); }
+    txt(String(n), x + 48, 500 - bh - 20, {size:20, weight:800, font:MONO, color:slow ? C.rose : C.text, alpha:a*e});
+    txt(l, x + 48, 530, {size:18, weight:700, color:C.muted, alpha:a}); });
+  [['平均', '149ms', C.gold, 47.6], ['P50', '80ms', C.text, 48], ['P99', '2453ms', C.rose, 48.4]].forEach(([k, v, c, ts], i) => { const e = eo(p(t, ts, ts + .4)), x = 1140 + i*260;
+    txt(k, x, 590, {size:22, weight:700, color:C.muted, alpha:e}); txt(v, x, 636, {size:32, weight:900, font:MONO, color:c, alpha:e}); });
+  const c = eo(p(t, 49.4, 49.9));
+  box(120, 720, 1680, 150, c, {fill:'rgba(255,255,255,.03)', stroke:'rgba(255,255,255,.18)', r:20});
+  txt('服务 A：每个请求都是 100ms', 160, 765, {size:26, weight:800, align:'left', alpha:c});
+  txt('平均 100ms   P99 100ms', 1760, 765, {size:26, weight:800, font:MONO, color:C.mint, align:'right', alpha:c});
+  const d = eo(p(t, 50.2, 50.7));
+  txt('服务 B：98% 是 52ms，2% 要 2.5 秒', 160, 825, {size:26, weight:800, align:'left', alpha:d});
+  txt('平均 101ms   P99 2500ms', 1760, 825, {size:26, weight:800, font:MONO, color:C.rose, align:'right', alpha:d});
+  rise('平均值几乎一样，体验天差地别：平均值把长尾「摊平」了', W/2, 930, t, 51.2, {size:30, weight:900, color:C.gold});
+  rise('一个页面调 30 个接口，至少碰上一次「1% 慢请求」的概率约 26%', W/2, 990, t, 52.2, {size:24, weight:700, color:C.muted});
+}
+
+/* ============ 场景 6 · 链路追踪 (55–67s) ============ */
+function s6(t){
+  rise('链路追踪：一个请求到底慢在哪一跳', W/2, 86, t, 55.2, {size:52, weight:900});
+  const a = eo(p(t, 55.6, 56.1));
+  const segs = [['00', C.muted, '版本'], ['4bf92f3577b34da6a3ce929d0e0e4736', C.acc, 'traceId：整条链路不变'], ['00f067aa0ba902b7', C.gold, '父 spanId：每一跳更新'], ['01', C.mint, '采样']];
+  ctx.save(); ctx.font = `600 24px ${MONO}`; const pre = 'traceparent: ', wPre = ctx.measureText(pre).width, ws = segs.map(s => ctx.measureText(s[0]).width), wd = ctx.measureText('-').width; ctx.restore();
+  const total = wPre + ws.reduce((x, y) => x + y, 0) + 3*wd; let x = W/2 - total/2;
+  txt(pre, x, 170, {size:24, weight:600, font:MONO, color:C.text, align:'left', alpha:a}); x += wPre;
+  segs.forEach(([s, c, d], i) => { txt(s, x, 170, {size:24, weight:600, font:MONO, color:c, align:'left', alpha:a});
+    if (i === 1 || i === 2) txt(d, x + ws[i]/2, 214, {size:20, weight:700, color:c, alpha:eo(p(t, 56.4 + i*.3, 56.8 + i*.3))});
+    x += ws[i]; if (i < 3){ txt('-', x, 170, {size:24, weight:600, font:MONO, color:C.muted, align:'left', alpha:a}); x += wd; } });
+  const S = [['gateway POST /checkout', 0, 0, 412], ['order-service POST /orders', 1, 1, 411], ['user-service GET /users', 2, 1, 21], ['inventory POST /reserve', 2, 21, 51], ['payment-service POST /pay', 2, 51, 411], ['db: wait connection', 3, 51, 401], ['db: INSERT payment', 3, 401, 411]];
+  const b = eo(p(t, 57.4, 57.9)), X0 = 760, X1 = 1740, sc = (X1 - X0)/420;
+  box(120, 260, 1680, 500, b, {fill:'rgba(255,255,255,.03)', stroke:'rgba(255,255,255,.15)', r:20});
+  [0, 100, 200, 300, 400].forEach(ms => { txt(ms + 'ms', X0 + ms*sc, 296, {size:18, weight:700, font:MONO, color:C.muted, alpha:b});
+    ctx.save(); al(b*.4); ctx.strokeStyle = 'rgba(255,255,255,.15)'; ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(X0 + ms*sc, 318); ctx.lineTo(X0 + ms*sc, 740); ctx.stroke(); ctx.restore(); });
+  S.forEach(([n, dep, s0, s1_], i) => { const st = 58 + i*.45, e = eo(p(t, st, st + .5)), y = 345 + i*58, hot = i === 5, c = hot ? C.rose : dep === 3 ? C.gold : C.acc;
+    txt(n, 150 + dep*28, y, {size:21, weight:700, font:MONO, color:hot ? C.rose : C.text, align:'left', alpha:e});
+    if (e > 0){ ctx.save(); al(e*b); ctx.fillStyle = hot ? 'rgba(255,138,138,.75)' : dep === 3 ? 'rgba(255,211,138,.6)' : 'rgba(233,213,255,' + (.75 - dep*.12) + ')';
+      if (hot){ ctx.shadowColor = C.rose; ctx.shadowBlur = 14; } rr(X0 + s0*sc, y - 17, Math.max(6, (s1_ - s0)*sc*e), 34, 6); ctx.fill(); ctx.restore(); }
+    const dur = s1_ - s0, lx = X0 + s1_*sc + 12, inside = lx > X1 - 70;
+    const narrow = inside && dur*sc < 90, la = eo(p(t, st + .4, st + .7));
+    if (narrow) txt(dur + 'ms', X0 + s0*sc - 12, y, {size:19, weight:800, font:MONO, color:c, align:'right', alpha:la});
+    else txt(dur + 'ms', inside ? X0 + s0*sc + 12 : lx, y, {size:19, weight:800, font:MONO, color:inside ? '#1a1530' : c, align:'left', alpha:la}); });
+  txt('← 85% 的时间在排队等数据库连接', 1250, 728, {size:22, weight:900, color:C.rose, alpha:eo(p(t, 61.6, 62))});
+  rise('Span：一段操作（名字、起止时间、父 span）　Trace：同一个 traceId 下所有 span 组成的树', W/2, 812, t, 62.4, {size:24, weight:700});
+  rise('Jaeger · Zipkin · SkyWalking：收集 span，画出这张瀑布图', W/2, 870, t, 63.2, {size:24, weight:700, color:C.muted});
+  rise('OpenTelemetry：统一的 API、SDK、Collector 和 OTLP 协议，一次埋点，后端随便换', W/2, 950, t, 64, {size:28, weight:900, color:C.acc});
+}
+
+/* ============ 场景 7 · 联动排查与告警 (67–78s) ============ */
+function s7(t){
+  rise('一次线上故障：三者怎么配合', W/2, 86, t, 67.2, {size:54, weight:900});
+  [['① 告警', ['SLO：99.9% 请求 < 300ms', '错误预算烧得太快', '→ 通知值班的人'], C.rose], ['② 看指标', ['各服务的 RED 面板', 'payment 的 P99', '从 120ms 涨到 2.4s'], C.gold],
+   ['③ 看追踪', ['筛出慢请求的 trace', '时间都花在', 'db: wait connection'], C.acc], ['④ 查日志', ['按 traceId 搜日志', 'WARN 连接池耗尽 20/20', '→ 找到根因'], C.mint]].forEach(([h, ls, c], i) => {
+    const e = eo(p(t, 67.7 + i*.8, 68.2 + i*.8)), x = 120 + i*430;
+    card(h, ls, x, 170, 390, 300, e, c, {ls:22, lh:44});
+    if (i) arrow(x - 36, 320, x - 4, 320, e, e, C.acc, 3); });
+  txt('发现', 315, 510, {size:22, weight:800, color:C.muted, alpha:eo(p(t, 70.8, 71.2))}); txt('定位服务', 745, 510, {size:22, weight:800, color:C.muted, alpha:eo(p(t, 70.8, 71.2))});
+  txt('定位哪一跳', 1175, 510, {size:22, weight:800, color:C.muted, alpha:eo(p(t, 70.8, 71.2))}); txt('找到原因', 1605, 510, {size:22, weight:800, color:C.muted, alpha:eo(p(t, 70.8, 71.2))});
+  card('SLO 与错误预算', ['SLO 99.9% → 允许 0.1% 的请求「不达标」', '按 30 天算，约 43 分钟的预算', '预算消耗过快（燃烧率高）才告警'], 120, 570, 800, 270, eo(p(t, 71.6, 72.1)), C.gold, {ls:24, lh:46});
+  card('避免告警疲劳', ['只对用户能感知的「症状」告警', '每条告警都要能行动、有预案', '原因类指标放进大盘，不半夜叫人'], 1000, 570, 800, 270, eo(p(t, 72.6, 73.1)), C.acc, {ls:24, lh:46});
+  rise('发现 → 定位 → 根因：一个 traceId 把三根支柱串成一条线', W/2, 930, t, 74, {size:32, weight:900, color:C.gold});
+}
+
+/* ============ 场景 8 · 收尾 (78–84s) ============ */
+function s8(t){
+  [['日志', '发生了什么'], ['指标', '有多少、有多快'], ['追踪', '慢在哪一跳'], ['OTel', '统一的采集标准']].forEach(([a, b], i) => {
+    const st = 78.2 + i*.25, e = eback(p(t, st, st + .5)); if (e <= 0) return;
+    const x = 330 + i*420, y = 330;
+    ctx.save(); ctx.translate(x, y); ctx.scale(e, e); ctx.translate(-x, -y);
+    box(x - 185, y - 90, 370, 180, clamp(e), {fill:'rgba(233,213,255,.08)', stroke:'rgba(233,213,255,.5)', r:26}); ctx.restore();
+    txt(a, x, y - 22, {size:40, weight:900, color:C.acc, alpha:clamp(e)}); txt(b, x, y + 40, {size:24, weight:600, color:C.muted, alpha:clamp(e)});
+  });
+  rise('指标说「有问题」，追踪说「在哪」，日志说「为什么」', W/2, 600, t, 79.2, {size:56, weight:900, glow:22});
+  rise('关注拾星，一起搞懂后端', W/2, 760, t, 80, {size:36, weight:500, color:C.muted});
+}
+/* ============ 总调度 ============ */
+const SCENES = [[s1,-1,7],[s2,7,19],[s3,19,31],[s4,31,43],[s5,43,55],[s6,55,67],[s7,67,78],[s8,78,84]];
+function draw(t){
+  t = clamp(t, 0, DUR);
+  ctx.save(); ctx.globalAlpha = 1; ctx.clearRect(0,0,W,H); background(t);
+  for (const [fn,a,b] of SCENES){
+    if (t < a || t > b) continue;
+    SA = sceneA(t, a, b, b === DUR ? .8 : .5);
+    if (SA > 0){ ctx.save(); fn(t); ctx.restore(); }
+  }
+  SA = 1; vignette();
+  const fo = p(t, DUR - .8, DUR);
+  if (fo > 0){ ctx.globalAlpha = fo; ctx.fillStyle = '#000'; ctx.fillRect(0,0,W,H); }
+  ctx.restore();
+}
+
+/* ============ 播放器 / 逐帧渲染接口 ============ */
+const isRender = new URLSearchParams(location.search).has('render');
+window.DURATION = DUR;
+window.renderFrame = t => draw(t);
+const btn = document.getElementById('btn'), seek = document.getElementById('seek'), timeEl = document.getElementById('time');
+const fmt = s => `${Math.floor(s/60)}:${String(Math.floor(s%60)).padStart(2,'0')}`;
+function fit(){
+  if (isRender){ cv.style.width = W+'px'; cv.style.height = H+'px'; return; }
+  const w = Math.min(innerWidth - 32, (innerHeight - 84)*16/9);
+  cv.style.width = w + 'px'; cv.style.height = w*9/16 + 'px';
+}
+addEventListener('resize', fit); fit();
+
+let cur = 0, playing = !isRender, last = null;
+function toggle(){ if (cur >= DUR) cur = 0; playing = !playing; }
+btn.onclick = toggle; cv.onclick = toggle;
+addEventListener('keydown', e => { if (e.code === 'Space'){ e.preventDefault(); toggle(); } });
+seek.oninput = () => { cur = +seek.value; draw(cur); };
+function loop(ts){
+  if (playing && last != null){ cur += (ts - last)/1000; if (cur >= DUR){ cur = DUR; playing = false; } }
+  last = ts; draw(cur);
+  seek.value = cur; timeEl.textContent = `${fmt(cur)} / ${fmt(DUR)}`;
+  btn.textContent = playing ? '❚❚' : (cur >= DUR ? '↺' : '▶');
+  requestAnimationFrame(loop);
+}
+document.fonts.ready.then(() => {
+  window.ready = true;
+  if (isRender) draw(0); else requestAnimationFrame(loop);
+});
+</script>
+</body>
+</html>
