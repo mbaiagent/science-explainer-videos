@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>AI 问答 · 拾星</title>
+<style>
+:root{--bg:#0b0f1a;--fg:#e8ecf4;--dim:#8b93a7;--acc:#6ee7c8;--card:#131a2b;--line:#223}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font-family:system-ui,-apple-system,"PingFang SC","Microsoft YaHei",sans-serif}
+.wrap{max-width:760px;margin:0 auto;padding:20px 16px;display:flex;flex-direction:column;min-height:100vh}
+nav.top{display:flex;gap:18px;padding:12px 0;border-bottom:1px solid var(--line);margin-bottom:16px}
+nav.top a{color:var(--dim);text-decoration:none;font-size:15px}
+nav.top a.cur{color:var(--acc);font-weight:700}
+h1{font-size:22px;margin:6px 0 4px}
+.sub{color:var(--dim);font-size:13.5px;margin:0 0 14px}
+#chat{flex:1;display:flex;flex-direction:column;gap:12px;padding:6px 0 16px}
+.msg{max-width:88%;padding:11px 14px;border-radius:14px;font-size:15px;line-height:1.75;white-space:pre-wrap}
+.msg.user{align-self:flex-end;background:#1d3a33;border:1px solid #2a5a4e}
+.msg.ai{align-self:flex-start;background:var(--card);border:1px solid var(--line)}
+.msg.ai .src{margin-top:8px;font-size:13px}
+.msg.ai .src a{color:var(--acc);text-decoration:none;margin-right:10px}
+.msg.thinking{align-self:flex-start;color:var(--dim);font-size:14px}
+.suggest{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:12px}
+.suggest button{background:var(--card);border:1px solid var(--line);color:var(--fg);border-radius:20px;
+  padding:7px 14px;font-size:13.5px;cursor:pointer}
+.suggest button:hover{border-color:var(--acc)}
+.box{display:flex;gap:8px;position:sticky;bottom:0;padding:12px 0;background:var(--bg)}
+input{flex:1;background:var(--card);border:1px solid var(--line);border-radius:10px;color:var(--fg);
+  font-size:16px;padding:12px 15px;outline:none}
+input:focus{border-color:var(--acc)}
+button.send{background:var(--acc);border:0;border-radius:10px;color:#06281f;font-weight:700;
+  font-size:16px;padding:0 24px;cursor:pointer}
+button.send:disabled{opacity:.5}
+footer{text-align:center;color:var(--dim);font-size:13px;padding:20px 0 8px}
+footer a{color:var(--acc);text-decoration:none}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <nav class="top"><a href="index.html">首页</a><a href="videos.html">视频</a><a href="ebook.html">电子书</a><a href="search.html">🔍 搜索</a><a href="ask.html" class="cur">💬 问答</a></nav>
+  <h1>💬 AI 问答</h1>
+  <p class="sub">基于站内 35 篇文章回答，答不上来的会直说。试试下面这些：</p>
+  <div class="suggest" id="suggest"></div>
+  <div id="chat"></div>
+  <div class="box">
+    <input id="q" type="text" placeholder="问个科普问题，比如：什么是雪花算法？" autocomplete="off" maxlength="200">
+    <button class="send" id="go">发送</button>
+  </div>
+  <footer>拾星 · 用代码，画出看得懂的原理<br>联系邮箱：<a href="mailto:contact@aipulse.lol">contact@aipulse.lol</a></footer>
+</div>
+<script>
+const chat = document.getElementById('chat');
+const q = document.getElementById('q');
+const go = document.getElementById('go');
+const esc = s => s.replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+
+const SUGGEST = ['什么是 MVCC？', '雪花算法怎么解决时钟回拨？', 'LoRA 为什么省参数？', 'CAP 定理到底在说什么？', '幸福的科学里，心流是什么？'];
+const sg = document.getElementById('suggest');
+SUGGEST.forEach(t => {
+  const b = document.createElement('button');
+  b.textContent = t;
+  b.onclick = () => { q.value = t; send(); };
+  sg.appendChild(b);
+});
+
+function addMsg(cls, html) {
+  const d = document.createElement('div');
+  d.className = 'msg ' + cls;
+  d.innerHTML = html;
+  chat.appendChild(d);
+  d.scrollIntoView({ behavior: 'smooth', block: 'end' });
+  return d;
+}
+
+async function send() {
+  const text = q.value.trim();
+  if (!text || go.disabled) return;
+  q.value = '';
+  addMsg('user', esc(text));
+  go.disabled = true;
+  const thinking = addMsg('thinking', '思考中…');
+  try {
+    const r = await fetch('/api/ask', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ question: text })
+    });
+    const d = await r.json();
+    thinking.remove();
+    let html = esc(d.answer || '出错了，稍后再试。');
+    if (d.sources && d.sources.length) {
+      html += '<div class="src">' + d.sources.map(s =>
+        '<a href="' + s.topic + '/article.html">📖 ' + esc(s.title) + '</a>').join('') + '</div>';
+    }
+    addMsg('ai', html);
+  } catch (e) {
+    thinking.remove();
+    addMsg('ai', '网络开小差了，稍后再试。');
+  }
+  go.disabled = false;
+  q.focus();
+}
+
+go.onclick = send;
+q.addEventListener('keydown', e => { if (e.key === 'Enter') send(); });
+q.focus();
+</script>
+</body>
+</html>
