@@ -6,7 +6,7 @@
 import re, json, glob, os
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
-DRAFTS = {'rpc', 'concurrent-hashmap', 'io-models', 'kubernetes', 'load-balancing'}
+DRAFTS = set()  # 2026-10-10: 全部已转正，无草稿
 
 def clean(html):
     html = re.sub(r'<script.*?</script>|<style.*?</style>', '', html, flags=re.S)

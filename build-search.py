@@ -14,7 +14,7 @@ def clean(html):
     return html.strip()
 
 docs = []
-DRAFTS = {'rpc', 'concurrent-hashmap', 'io-models', 'kubernetes', 'load-balancing'}
+DRAFTS = set()  # 2026-10-10: 全部已转正，无草稿
 for p in sorted(glob.glob(os.path.join(ROOT, '*/article.html'))):
     topic = os.path.basename(os.path.dirname(p))
     if topic in DRAFTS:
