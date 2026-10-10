@@ -36,6 +36,7 @@
   .cbody{padding:13px 15px 15px}
   .cbody b{display:block;font-size:16px;margin-bottom:6px}
   .cbody p{margin:0;color:var(--muted);font-size:13.5px;line-height:1.6}
+  .views{color:var(--muted);font-size:12.5px;margin-top:6px;display:block}
 
   .vdirectory{margin:6px 0 8px;background:var(--card);border:1px solid var(--line);border-radius:14px;padding:20px 24px}
   .vdirectory h2{font-size:18px;margin:0 0 6px}
@@ -176,7 +177,19 @@
   <div class="thumb"><img src="thumbs/positive-psychology.jpg" alt="积极心理学" loading="lazy"><span class="dur">1:12</span></div>
   <div class="cbody"><b>积极心理学</b><p>从修补问题到培养优势、PERMA、品格优势、3 个练习</p></div>
 </a></div></section>
-  <footer>拾星 · 用代码，画出看得懂的原理</footer>
+  <footer>拾星 · 用代码，画出看得懂的原理<br>联系邮箱：<a href="mailto:contact@aipulse.lol" style="color:#6ee7c8">contact@aipulse.lol</a></footer>
 </main>
+<script>
+fetch('/api/views').then(r=>r.json()).then(all=>{
+  document.querySelectorAll('a.card').forEach(a=>{
+    const m = a.getAttribute('href').match(/v=([a-z0-9-]+)/);
+    if(!m || !all[m[1]] || !all[m[1]].pv) return;
+    const s = document.createElement('span');
+    s.className = 'views';
+    s.textContent = '\u25b6 ' + all[m[1]].pv + ' \u6b21\u64ad\u653e';
+    a.querySelector('.cbody').appendChild(s);
+  });
+}).catch(()=>{});
+</script>
 </body>
 </html>

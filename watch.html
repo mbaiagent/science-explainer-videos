@@ -36,7 +36,8 @@
     border:1px solid rgba(255,255,255,.25);border-radius:8px;font-size:15px;padding:6px 11px;cursor:pointer}
   .fsbtn:hover{background:rgba(0,0,0,.85)}
   .vtitle{font-size:24px;margin:18px 0 6px}
-  .vmeta{color:var(--muted);font-size:14px;margin:0 0 8px}
+  .vmeta{color:var(--muted);font-size:14px;margin:0 0 4px}
+  .vstats{color:var(--muted);font-size:13px;margin:0 0 8px}
   .vnav{display:flex;justify-content:space-between;margin:18px 0 0;font-size:15px}
   .vnav a{color:var(--fg);text-decoration:none}
   .vnav .dim{color:var(--muted);opacity:.4}
@@ -57,6 +58,7 @@
   <div class="player"><iframe id="player" allowfullscreen title="视频"></iframe><button class="fsbtn" id="fsbtn" title="全屏播放">⛶ 全屏</button><div class="fs-hint">⟳ 横放手机观看</div></div>
   <h1 class="vtitle" id="vtitle">加载中…</h1>
   <p class="vmeta" id="vmeta"></p>
+  <p class="vstats" id="vstats"></p>
   <div class="vnav"><span id="prev"></span><span id="next"></span></div>
   <a class="arttoggle" id="artlink" href="#">📖 查看图文详解 →</a>
   <footer>拾星 · 用代码，画出看得懂的原理</footer>
@@ -74,6 +76,16 @@ const CHAPTERS = [{"topic":"llm","title":"什么是 LLM","desc":"猜下一个词
   document.getElementById('player').src = ch.topic + '/landscape.html';
   document.getElementById('vtitle').textContent = ch.title;
   document.getElementById('vmeta').textContent = ch.cat + ' · ' + ch.desc + (ch.dur ? ' · ' + Math.floor(ch.dur/60) + ':' + String(ch.dur%60).padStart(2,'0') : '');
+  // 播放统计：每会话每部只计一次
+  (function(){
+    const el = document.getElementById('vstats');
+    const key = 'viewed_' + ch.topic;
+    const record = !sessionStorage.getItem(key);
+    if (record) sessionStorage.setItem(key, '1');
+    const render = d => { if (d && d.pv) el.textContent = '▶ ' + d.pv + ' 次播放 · ' + d.uv + ' 人看过'; };
+    fetch('/api/views/' + ch.topic, {method: record ? 'POST' : 'GET'})
+      .then(r => r.json()).then(render).catch(()=>{});
+  })();
   const prev = document.getElementById('prev'), next = document.getElementById('next');
   prev.innerHTML = idx > 0 ? `<a href="watch.html?v=${CHAPTERS[idx-1].topic}">← ${CHAPTERS[idx-1].title}</a>` : '<span class="dim">← 上一部</span>';
   next.innerHTML = idx < CHAPTERS.length-1 ? `<a href="watch.html?v=${CHAPTERS[idx+1].topic}">${CHAPTERS[idx+1].title} →</a>` : '<span class="dim">下一部 →</span>';
@@ -110,5 +122,6 @@ const CHAPTERS = [{"topic":"llm","title":"什么是 LLM","desc":"猜下一个词
   document.addEventListener('fullscreenchange', syncFsBtn);
   document.addEventListener('webkitfullscreenchange', syncFsBtn);})();
 </script>
+<footer style="text-align:center;color:#8b93a7;font-size:13px;padding:28px 16px;border-top:1px solid #1c2438;margin-top:40px">拾星 · 用代码，画出看得懂的原理<br>联系邮箱：<a href="mailto:contact@aipulse.lol" style="color:#6ee7c8">contact@aipulse.lol</a></footer>
 </body>
 </html>
