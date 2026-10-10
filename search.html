@@ -1,0 +1,115 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>全文搜索 · 拾星</title>
+<style>
+:root{--bg:#0b0f1a;--fg:#e8ecf4;--dim:#8b93a7;--acc:#6ee7c8;--card:#131a2b;--line:#223}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font-family:system-ui,-apple-system,"PingFang SC","Microsoft YaHei",sans-serif}
+.wrap{max-width:760px;margin:0 auto;padding:20px 16px 60px}
+nav.top{display:flex;gap:18px;padding:12px 0;border-bottom:1px solid var(--line);margin-bottom:24px}
+nav.top a{color:var(--dim);text-decoration:none;font-size:15px}
+nav.top a.cur{color:var(--acc);font-weight:700}
+h1{font-size:24px;margin:8px 0 16px}
+.box{display:flex;gap:8px}
+input{flex:1;background:var(--card);border:1px solid var(--line);border-radius:10px;color:var(--fg);
+  font-size:17px;padding:13px 16px;outline:none}
+input:focus{border-color:var(--acc)}
+button{background:var(--acc);border:0;border-radius:10px;color:#06281f;font-weight:700;
+  font-size:16px;padding:0 22px;cursor:pointer}
+.hint{color:var(--dim);font-size:13px;margin:10px 2px}
+.count{color:var(--dim);font-size:14px;margin:18px 0 6px}
+.result{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:14px 16px;margin:10px 0}
+.result h3{margin:0 0 6px;font-size:17px}
+.result h3 a{color:var(--fg);text-decoration:none}
+.result h3 a:hover{color:var(--acc)}
+.result p{margin:6px 0;color:#c3cadb;font-size:14.5px;line-height:1.7}
+.result .links{margin-top:8px;font-size:13.5px}
+.result .links a{color:var(--acc);text-decoration:none;margin-right:14px}
+mark{background:#3d2f10;color:#ffd97a;border-radius:3px;padding:0 2px}
+.empty{color:var(--dim);text-align:center;margin-top:60px;line-height:2}
+.loading{color:var(--dim);margin-top:20px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <nav class="top"><a href="index.html">首页</a><a href="videos.html">视频</a><a href="ebook.html">电子书</a><a href="search.html" class="cur">🔍 搜索</a></nav>
+  <h1>🔍 全文搜索</h1>
+  <div class="box">
+    <input id="q" type="search" placeholder="搜 26 篇文章全文，比如：注意力机制、MVCC、分布式锁…" autocomplete="off">
+    <button id="go">搜索</button>
+  </div>
+  <div class="hint">支持中文分词外子串匹配，多个词用空格隔开（都要命中）。索引在你输入时才加载，不拖慢打开速度。</div>
+  <div id="out"></div>
+</div>
+<script>
+let DOCS = null, loading = null;
+const $ = id => document.getElementById(id);
+const esc = s => s.replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+
+async function ensureDocs() {
+  if (DOCS) return DOCS;
+  if (!loading) loading = fetch('search.json').then(r => r.json()).then(d => DOCS = d);
+  return loading;
+}
+
+function doSearch(q) {
+  const out = $('out');
+  q = q.trim().toLowerCase();
+  if (!q) { out.innerHTML = ''; return; }
+  out.innerHTML = '<div class="loading">搜索中…</div>';
+  ensureDocs().then(docs => {
+    const tokens = q.split(/\s+/).filter(Boolean);
+    const hits = [];
+    for (const d of docs) {
+      const T = d.title.toLowerCase(), D = d.desc.toLowerCase(), X = d.text.toLowerCase();
+      let s = 0, ok = true, pos = -1;
+      for (const t of tokens) {
+        let hit = false;
+        if (T.includes(t)) { s += 12; hit = true; }
+        if (D.includes(t)) { s += 6; hit = true; }
+        let c = 0, i = -1;
+        while ((i = X.indexOf(t, i + 1)) !== -1 && c < 8) { c++; if (pos < 0) pos = i; }
+        if (c) { s += c; hit = true; }
+        if (!hit) { ok = false; break; }
+      }
+      if (ok) hits.push({ d, s, pos });
+    }
+    hits.sort((a, b) => b.s - a.s);
+    if (!hits.length) {
+      out.innerHTML = '<div class="empty">没找到相关内容，换个词试试？<br>比如搜「锁」「注意力」「幸福」</div>';
+      return;
+    }
+    out.innerHTML = '<div class="count">找到 ' + hits.length + ' 篇</div>' + hits.slice(0, 50).map(({ d, pos }) => {
+      let snip;
+      if (pos >= 0) {
+        const a = Math.max(0, pos - 45), b = Math.min(d.text.length, pos + 90);
+        snip = (a > 0 ? '…' : '') + d.text.slice(a, b) + (b < d.text.length ? '…' : '');
+      } else snip = d.desc;
+      snip = esc(snip);
+      for (const t of tokens) {
+        const re = new RegExp(t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'gi');
+        snip = snip.replace(re, '<mark>$&</mark>');
+      }
+      return '<div class="result"><h3><a href="' + d.topic + '/article.html">' + esc(d.title) + '</a></h3>'
+        + '<p>' + snip + '</p>'
+        + '<div class="links"><a href="' + d.topic + '/article.html">📖 看图文</a>'
+        + '<a href="watch.html?v=' + d.topic + '">▶ 看视频</a></div></div>';
+    }).join('');
+  }).catch(() => { out.innerHTML = '<div class="empty">索引加载失败，请刷新重试</div>'; });
+}
+
+let timer;
+$('q').addEventListener('input', e => { clearTimeout(timer); timer = setTimeout(() => doSearch(e.target.value), 250); });
+$('go').addEventListener('click', () => doSearch($('q').value));
+$('q').addEventListener('keydown', e => { if (e.key === 'Enter') doSearch(e.target.value); });
+
+// 支持 ?q= 直达
+const init = new URLSearchParams(location.search).get('q');
+if (init) { $('q').value = init; doSearch(init); }
+else $('q').focus();
+</script>
+</body>
+</html>

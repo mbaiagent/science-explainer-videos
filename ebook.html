@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>拾星电子书 · 用代码画出看得懂的原理</title>
-<meta name="description" content="拾星电子书：24 章图文详解目录，每章独立成页，配配套视频。">
+<meta name="description" content="拾星电子书：26 章图文详解目录，每章独立成页，配配套视频。">
 <link rel="stylesheet" href="assets/article.css">
 <style>
   body{padding-top:0}
@@ -34,13 +34,13 @@
 <body>
 <header class="sitenav">
   <a class="brand" href="index.html">拾星<span>电子书</span></a>
-  <nav><a href="index.html">首页</a><a href="videos.html">视频</a><a href="ebook.html" class="cur">电子书</a></nav>
+  <nav><a href="index.html">首页</a><a href="videos.html">视频</a><a href="ebook.html" class="cur">电子书</a><a href="search.html">🔍 搜索</a></nav>
 </header>
 <main class="ebook">
   <div class="cover">
     <h1>拾星电子书</h1>
     <p class="slogan">用代码，画出看得懂的原理</p>
-    <p>24 章图文详解，每章独立成页，按顺序读完。每章配一段配套视频，文章页顶部可看。</p>
+    <p>26 章图文详解，每章独立成页，按顺序读完。每章配一段配套视频，文章页顶部可看。</p>
     <a class="back" href="videos.html">🎬 去视频站</a><a class="back" href="index.html">← 回到拾星首页</a>
   </div>
   <nav id="toc"><h2 class="toc-h">目录</h2>
@@ -54,31 +54,33 @@
 <a class="toc-item" href="function-calling-mcp/article.html"><span class="toc-no">05</span>Function Calling 与 MCP</a>
 <a class="toc-item" href="prompt-engineering/article.html"><span class="toc-no">06</span>Prompt 工程与结构化输出</a>
 <a class="toc-item" href="agent-patterns/article.html"><span class="toc-no">07</span>Agent 设计模式</a>
+<a class="toc-item" href="evals/article.html"><span class="toc-no">08</span>评估（Evals）</a>
 <div class="toc-sub">跨界趣味</div>
-<a class="toc-item" href="opus-video/article.html"><span class="toc-no">08</span>Opus 5.5 是怎么做视频的</a>
+<a class="toc-item" href="opus-video/article.html"><span class="toc-no">09</span>Opus 5.5 是怎么做视频的</a>
 <div class="toc-cat">计算机与后端</div>
 <div class="toc-sub">计算机基础</div>
-<a class="toc-item" href="jvm/article.html"><span class="toc-no">09</span>JVM 是什么</a>
-<a class="toc-item" href="process-thread-coroutine/article.html"><span class="toc-no">10</span>进程、线程与协程</a>
-<a class="toc-item" href="thread-pool/article.html"><span class="toc-no">11</span>线程池是什么</a>
-<a class="toc-item" href="tcp-handshake/article.html"><span class="toc-no">12</span>TCP 三次握手</a>
-<a class="toc-item" href="http-request/article.html"><span class="toc-no">13</span>按下回车后发生了什么</a>
+<a class="toc-item" href="jvm/article.html"><span class="toc-no">10</span>JVM 是什么</a>
+<a class="toc-item" href="process-thread-coroutine/article.html"><span class="toc-no">11</span>进程、线程与协程</a>
+<a class="toc-item" href="thread-pool/article.html"><span class="toc-no">12</span>线程池是什么</a>
+<a class="toc-item" href="tcp-handshake/article.html"><span class="toc-no">13</span>TCP 三次握手</a>
+<a class="toc-item" href="http-request/article.html"><span class="toc-no">14</span>按下回车后发生了什么</a>
 <div class="toc-sub">数据库</div>
-<a class="toc-item" href="mysql-mvcc/article.html"><span class="toc-no">14</span>MySQL 的 MVCC</a>
-<a class="toc-item" href="bplus-tree/article.html"><span class="toc-no">15</span>数据库索引：为什么是 B+ 树</a>
-<a class="toc-item" href="transaction-acid/article.html"><span class="toc-no">16</span>事务与 ACID</a>
-<a class="toc-item" href="redis-cache/article.html"><span class="toc-no">17</span>Redis 缓存</a>
-<a class="toc-item" href="mysql-lock/article.html"><span class="toc-no">18</span>MySQL 的锁</a>
+<a class="toc-item" href="mysql-mvcc/article.html"><span class="toc-no">15</span>MySQL 的 MVCC</a>
+<a class="toc-item" href="bplus-tree/article.html"><span class="toc-no">16</span>数据库索引：为什么是 B+ 树</a>
+<a class="toc-item" href="transaction-acid/article.html"><span class="toc-no">17</span>事务与 ACID</a>
+<a class="toc-item" href="redis-cache/article.html"><span class="toc-no">18</span>Redis 缓存</a>
+<a class="toc-item" href="mysql-lock/article.html"><span class="toc-no">19</span>MySQL 的锁</a>
 <div class="toc-sub">架构设计</div>
-<a class="toc-item" href="message-queue/article.html"><span class="toc-no">19</span>消息队列</a>
-<a class="toc-item" href="cap-theorem/article.html"><span class="toc-no">20</span>CAP 与 BASE</a>
-<a class="toc-item" href="rate-limiting/article.html"><span class="toc-no">21</span>限流算法</a>
+<a class="toc-item" href="message-queue/article.html"><span class="toc-no">20</span>消息队列</a>
+<a class="toc-item" href="cap-theorem/article.html"><span class="toc-no">21</span>CAP 与 BASE</a>
+<a class="toc-item" href="rate-limiting/article.html"><span class="toc-no">22</span>限流算法</a>
+<a class="toc-item" href="distributed-lock/article.html"><span class="toc-no">23</span>分布式锁</a>
 <div class="toc-cat">心理学 · 人生</div>
 <div class="toc-sub">幸福</div>
-<a class="toc-item" href="happiness/article.html"><span class="toc-no">22</span>幸福的科学</a>
-<a class="toc-item" href="positive-psychology/article.html"><span class="toc-no">23</span>积极心理学</a>
+<a class="toc-item" href="happiness/article.html"><span class="toc-no">24</span>幸福的科学</a>
+<a class="toc-item" href="positive-psychology/article.html"><span class="toc-no">25</span>积极心理学</a>
 <div class="toc-sub">意义</div>
-<a class="toc-item" href="meaning-of-life/article.html"><span class="toc-no">24</span>人生的意义</a>
+<a class="toc-item" href="meaning-of-life/article.html"><span class="toc-no">26</span>人生的意义</a>
   </nav>
   <footer>拾星 · 用代码，画出看得懂的原理<br><a href="videos.html">视频站</a> · <a href="index.html">回到首页</a></footer>
 </main>
