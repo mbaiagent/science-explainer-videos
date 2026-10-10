@@ -31,6 +31,7 @@
 | Prompt 工程与结构化输出 | `prompt-engineering/landscape.html` | 横屏 1920×1080 | 80s |
 | MySQL 的锁 | `mysql-lock/landscape.html` | 横屏 1920×1080 | 80s |
 | Agent 设计模式 | `agent-patterns/landscape.html` | 横屏 1920×1080 | 80s |
+| 进程、线程与协程 | `process-thread-coroutine/landscape.html` | 横屏 1920×1080 | 80s |
 
 ### 幸福的科学
 钩子 → 享乐适应（快乐曲线 + 跑步机）→ 哈佛成人发展研究（关系网络）→ 心流（挑战 × 技能坐标图）→ 今晚就能做的 3 件事 → 收尾
@@ -100,6 +101,9 @@
 
 ### Agent 设计模式
 自主程度光谱 → 工作流 vs 智能体 → 提示词链与路由 → 并行化与编排者-工作者 → 评估者-优化者 → 自主 Agent 循环 → 五条原则 → 收尾
+
+### 进程、线程与协程
+CPU 轮流切换 → 进程与隔离 → 线程与竞态条件 → 上下文切换的代价 → IO 等待与协程 M:N 调度 → 各语言的协程 → 对比表 → 收尾
 
 ## 预览
 

@@ -1,0 +1,325 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>进程、线程与协程 · 拾星</title>
+<style>
+  :root{--bg:#07080f;--fg:#f4ede4;--muted:#9a93a8;--acc:#60a5fa}
+  html,body{margin:0;height:100%;background:var(--bg);color:var(--fg);
+    font-family:-apple-system,"PingFang SC","Noto Sans SC","Noto Sans CJK SC","Microsoft YaHei",sans-serif}
+  body{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;overflow:hidden}
+  #stage{display:block;background:#07080f;border-radius:12px;box-shadow:0 20px 60px rgba(0,0,0,.55);cursor:pointer}
+  #bar{display:flex;align-items:center;gap:12px;width:min(calc(100vw - 32px),640px)}
+  #btn{width:40px;height:40px;border-radius:50%;border:1px solid rgba(96,165,250,.5);background:transparent;
+    color:var(--acc);font-size:16px;cursor:pointer;flex:none}
+  #seek{flex:1;accent-color:var(--acc)}
+  #time{font-variant-numeric:tabular-nums;font-size:13px;color:var(--muted);min-width:84px;text-align:right}
+  body.render{display:block}
+  body.render #bar{display:none}
+  body.render #stage{border-radius:0;box-shadow:none}
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="bar">
+  <button id="btn" aria-label="播放/暂停">❚❚</button>
+  <input id="seek" type="range" min="0" max="80" step="0.01" value="0">
+  <span id="time">0:00 / 1:20</span>
+</div>
+<script>
+/* ============ 基础设置（横屏 1920×1080） ============ */
+const W = 1920, H = 1080, DUR = 80;
+const cv = document.getElementById('stage'), ctx = cv.getContext('2d');
+cv.width = W; cv.height = H;
+const FONT = '"PingFang SC","Noto Sans SC","Noto Sans CJK SC","Source Han Sans SC","Microsoft YaHei",sans-serif';
+const MONO = '"JetBrains Mono","SF Mono",Menlo,Consolas,"DejaVu Sans Mono","Noto Sans Mono CJK SC","PingFang SC","Microsoft YaHei",monospace';
+const C = {acc:'#60a5fa', mint:'#6ee7c8', gold:'#ffd38a', coral:'#ff9e7a', rose:'#ff8a8a', blue:'#9cc3ff', text:'#f4ede4', muted:'#9a93a8', dim:'#4a4558', panel:'#0f0e1f'};
+
+const clamp = (x,a=0,b=1) => Math.max(a, Math.min(b, x));
+const lerp = (a,b,t) => a + (b-a)*t;
+const p = (t,a,b) => clamp((t-a)/(b-a));
+const eo = x => 1 - Math.pow(1-x, 3);
+const eio = x => x < .5 ? 4*x*x*x : 1 - Math.pow(-2*x+2, 3)/2;
+const eback = x => { const c1=1.70158, c3=c1+1; return 1 + c3*Math.pow(x-1,3) + c1*Math.pow(x-1,2); };
+function rnd(seed){ let s = seed>>>0; return () => { s = (s*1664525 + 1013904223)>>>0; return s/4294967296; }; }
+
+let SA = 1;
+const al = a => { ctx.globalAlpha = clamp(SA*a); };
+const sceneA = (t,a,b,f=.5) => Math.min(p(t,a,a+f), 1 - p(t,b-f,b));
+
+function txt(s, x, y, o = {}){
+  const {size=64, weight=700, color=C.text, alpha=1, align='center', glow=0, scale=1, font=FONT} = o;
+  if (alpha <= 0) return;
+  ctx.save(); al(alpha);
+  ctx.font = `${weight} ${size}px ${font}`;
+  ctx.textAlign = align; ctx.textBaseline = 'middle'; ctx.fillStyle = color;
+  if (glow){ ctx.shadowColor = color; ctx.shadowBlur = glow; }
+  if (scale !== 1){ ctx.translate(x, y); ctx.scale(scale, scale); ctx.fillText(s, 0, 0); }
+  else ctx.fillText(s, x, y);
+  ctx.restore();
+}
+function rise(s, x, y, t, t0, o = {}, d = .7){
+  const e = eo(p(t, t0, t0+d));
+  if (e <= 0) return;
+  txt(s, x, y + (1-e)*36, {...o, alpha:(o.alpha ?? 1)*e});
+}
+function rr(x,y,w,h,r){ ctx.beginPath(); ctx.roundRect(x,y,w,h,r); }
+function box(x, y, w, h, a, o = {}){
+  const {fill='rgba(255,255,255,.05)', stroke='rgba(96,165,250,.35)', lw=2, glow=0, r=18, dash=null} = o;
+  if (a <= 0) return;
+  ctx.save(); al(a); rr(x, y, w, h, r); ctx.fillStyle = fill; ctx.fill();
+  if (dash) ctx.setLineDash(dash);
+  ctx.strokeStyle = stroke; ctx.lineWidth = lw; if (glow){ ctx.shadowColor = stroke; ctx.shadowBlur = glow; } ctx.stroke(); ctx.restore();
+}
+function arrow(x1, y1, x2, y2, e, a, color = C.acc, lw = 3){
+  if (e <= 0 || a <= 0) return;
+  const x = lerp(x1, x2, e), y = lerp(y1, y2, e), ang = Math.atan2(y2 - y1, x2 - x1);
+  ctx.save(); al(a); ctx.strokeStyle = color; ctx.fillStyle = color; ctx.lineWidth = lw; ctx.lineCap = 'round';
+  ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x, y); ctx.stroke();
+  if (e > .85){ ctx.translate(x, y); ctx.rotate(ang); ctx.beginPath(); ctx.moveTo(4, 0); ctx.lineTo(-14, -9); ctx.lineTo(-14, 9); ctx.closePath(); ctx.fill(); }
+  ctx.restore();
+}
+function panel(x, y, w, h, title, a){
+  box(x, y, w, h, a, {fill:C.panel, stroke:'rgba(255,255,255,.1)', r:20});
+  if (a <= 0) return;
+  ctx.save(); al(a); ctx.strokeStyle = 'rgba(255,255,255,.07)'; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(x, y + 52); ctx.lineTo(x + w, y + 52); ctx.stroke();
+  ['#ff6b6b','#ffd166','#6ee7a0'].forEach((c, i) => { ctx.fillStyle = c; ctx.globalAlpha = clamp(SA*a*.8); ctx.beginPath(); ctx.arc(x + 30 + i*24, y + 26, 7, 0, 6.283); ctx.fill(); });
+  ctx.restore();
+  txt(title, x + w/2, y + 27, {size:22, weight:500, color:C.muted, font:MONO, alpha:a});
+}
+
+/* ============ 背景 ============ */
+const PARTS = (() => { const r = rnd(193); return Array.from({length:100}, () => ({
+  x:r()*W, y:r()*H, s:r()*2.2+.5, v:r()*12+4, ph:r()*6.283, c:r()<.25})); })();
+function background(t){
+  const g = ctx.createLinearGradient(0,0,W,H);
+  g.addColorStop(0,'#0a0916'); g.addColorStop(.55,'#110f24'); g.addColorStop(1,'#18122c');
+  ctx.globalAlpha = 1; ctx.fillStyle = g; ctx.fillRect(0,0,W,H);
+  const gx = W*.5 + Math.sin(t*.27)*140;
+  const rg = ctx.createRadialGradient(gx, H*.45, 0, gx, H*.45, 950);
+  rg.addColorStop(0,'rgba(96,165,250,0.09)'); rg.addColorStop(1,'rgba(96,165,250,0)');
+  ctx.fillStyle = rg; ctx.fillRect(0,0,W,H);
+  ctx.fillStyle = C.acc;
+  for (let x = 40; x < W; x += 80) for (let y = 40; y < H; y += 80){ ctx.globalAlpha = .06; ctx.fillRect(x, y, 2, 2); }
+  for (const q of PARTS){
+    const y = ((q.y - t*q.v) % H + H) % H, x = q.x + Math.sin(t*.35 + q.ph)*12;
+    ctx.globalAlpha = .2 + .3*(.5 + .5*Math.sin(t*1.2 + q.ph));
+    ctx.fillStyle = q.c ? C.acc : '#d8d0ff';
+    ctx.beginPath(); ctx.arc(x, y, q.s, 0, 6.283); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+}
+function vignette(){
+  const v = ctx.createRadialGradient(W/2, H/2, W*.28, W/2, H/2, W*.62);
+  v.addColorStop(0,'rgba(0,0,0,0)'); v.addColorStop(1,'rgba(0,0,0,.55)');
+  ctx.globalAlpha = 1; ctx.fillStyle = v; ctx.fillRect(0,0,W,H);
+}
+function codeLine(s, x, y, size, a, kw = /\b(public|class|static|void|new|return)\b/){
+  const parts = s.split(/("[^"]*"|\b(?:public|class|static|void|new|return|getstatic|ldc|invokevirtual)\b)/g);
+  ctx.save(); al(a); ctx.font = `500 ${size}px ${MONO}`; ctx.textBaseline = 'middle'; ctx.textAlign = 'left';
+  let xx = x;
+  for (const seg of parts){ if (!seg) continue;
+    ctx.fillStyle = seg.startsWith('"') ? C.mint : /^(public|class|static|void|new|return|getstatic|ldc|invokevirtual)$/.test(seg) ? C.acc : C.text;
+    ctx.fillText(seg, xx, y); xx += ctx.measureText(seg).width; }
+  ctx.restore();
+}
+
+function pill(s, x, y, a, o = {}){
+  const {size=30, color=C.text, stroke='rgba(255,255,255,.2)', fill='rgba(255,255,255,.05)', font=FONT, weight=700} = o;
+  if (a <= 0) return;
+  ctx.save(); ctx.font = `${weight} ${size}px ${font}`; const w = ctx.measureText(s).width + 52; ctx.restore();
+  box(x - w/2, y - size*.9, w, size*1.8, a, {fill, stroke, r:size*.9});
+  txt(s, x, y, {size, weight, color, font, alpha:a});
+}
+const TC = ['#60a5fa', '#f472b6', '#6ee7c8', '#ffd38a', '#c084fc'];
+function worker(x, y, a, c, t, busy = true){
+  if (a <= 0) return;
+  const b = busy ? Math.sin(t*8 + x)*4 : 0;
+  ctx.save(); al(a); ctx.fillStyle = c; ctx.shadowColor = c; ctx.shadowBlur = 12;
+  ctx.beginPath(); ctx.arc(x, y - 22 + b, 12, 0, 6.283); ctx.fill(); rr(x - 12, y - 8 + b, 24, 30, 8); ctx.fill(); ctx.restore();
+}
+
+/* ============ 场景 1 · 钩子 (0–7s) ============ */
+function s1(t){
+  rise('一边听歌、一边写代码、一边下载文件', W/2, 140, t, .2, {size:50, weight:900});
+  [['🎵 音乐', 420], ['⌨ 编辑器', 960], ['⬇ 下载', 1500]].forEach(([s, x], i) => { const e = eback(p(t, .6 + i*.3, 1.1 + i*.3));
+    box(x - 190, 230, 380, 140, clamp(e), {fill:'rgba(255,255,255,.04)', stroke:TC[i], r:20}); txt(s, x, 300, {size:36, weight:900, alpha:clamp(e)}); });
+  const a = eo(p(t, 1.8, 2.3));
+  box(760, 470, 400, 150, a, {fill:'rgba(96,165,250,.10)', stroke:C.acc, lw:3, r:20}); txt('CPU 核心', 960, 545, {size:36, weight:900, color:C.acc, alpha:a});
+  if (t > 2.3){ const k = Math.floor(t*6) % 3; arrow([420, 960, 1500][k], 375, 960, 465, 1, 1, TC[k], 4); txt('正在执行：' + ['音乐', '编辑器', '下载'][k], 960, 670, {size:28, weight:800, color:TC[k]}); }
+  rise('其实是在极快地轮流切换，看起来像「同时」', W/2, 760, t, 3.0, {size:40, weight:900});
+  const k = p(t, 4.4, 5);
+  if (k > 0) txt('进程 · 线程 · 协程', W/2, 900, {size:96, weight:900, color:C.acc, glow:36, alpha:clamp(k*2), scale:eback(k)});
+}
+
+/* ============ 场景 2 · 进程 (7–20s) ============ */
+function s2(t){
+  rise('进程：一个运行中的程序', W/2, 100, t, 7.2, {size:58, weight:900});
+  [['浏览器', 0], ['微信', 1], ['IDE', 2]].forEach(([s, i]) => { const x0 = 140 + i*560, e = eo(p(t, 7.8 + i*.5, 8.3 + i*.5));
+    box(x0, 190, 520, 470, e, {fill:'rgba(255,255,255,.03)', stroke:TC[i], lw:3, r:24});
+    txt('进程：' + s, x0 + 260, 235, {size:30, weight:900, color:TC[i], alpha:e});
+    [['代码', 290], ['数据 / 堆', 360], ['打开的文件、网络连接', 430]].forEach(([m, y], k) => box(x0 + 40, y - 26, 440, 52, e, {fill:'rgba(255,255,255,.05)', stroke:'rgba(255,255,255,.15)', r:10}));
+    [['代码', 290], ['数据 / 堆', 360], ['打开的文件、网络连接', 430]].forEach(([m, y]) => txt(m, x0 + 260, y, {size:22, weight:700, alpha:e}));
+    worker(x0 + 260, 560, e, TC[i], t);
+    if (i === 1 && t > 12.4){ const c = eo(p(t, 12.4, 12.8)); ctx.save(); al(c); ctx.fillStyle = 'rgba(255,138,138,.25)'; rr(x0, 190, 520, 470, 24); ctx.fill(); ctx.restore(); txt('💥 崩溃', x0 + 260, 620, {size:30, weight:900, color:C.rose, alpha:c}); }
+  });
+  txt('每个进程都有自己独立的内存空间', W/2, 720, {size:36, weight:900, alpha:eo(p(t, 10.2, 10.6))});
+  txt('一个进程崩溃，不影响其他进程：隔离、安全', W/2, 785, {size:30, weight:800, color:C.mint, alpha:eo(p(t, 12.8, 13.2))});
+  rise('代价：创建和切换都比较「重」；进程之间要交换数据，得靠管道、Socket、共享内存等方式（IPC）', W/2, 880, t, 14.6, {size:28, weight:700, color:C.muted});
+  rise('操作系统分配资源（内存、文件）的基本单位是进程', W/2, 950, t, 16.2, {size:30, weight:800, color:C.gold});
+}
+
+/* ============ 场景 3 · 线程 (20–34s) ============ */
+function s3(t){
+  rise('线程：进程里的「工人」', W/2, 100, t, 20.2, {size:58, weight:900});
+  const a = eo(p(t, 20.6, 21.1));
+  box(110, 180, 1000, 640, a, {fill:'rgba(96,165,250,.04)', stroke:C.acc, lw:3, r:26});
+  txt('一个进程（工厂）', 610, 225, {size:30, weight:900, color:C.acc, alpha:a});
+  box(170, 270, 880, 150, a, {fill:'rgba(255,211,138,.08)', stroke:'rgba(255,211,138,.5)', r:16});
+  txt('共享：代码、堆内存、全局变量、打开的文件', 610, 345, {size:26, weight:800, color:C.gold, alpha:a});
+  [0, 1, 2].forEach(i => { const x = 300 + i*310, e = eo(p(t, 21.4 + i*.4, 21.8 + i*.4));
+    worker(x, 520, e, TC[i], t);
+    box(x - 120, 580, 240, 180, e, {fill:'rgba(255,255,255,.04)', stroke:TC[i], r:14});
+    txt('线程 ' + (i + 1), x, 612, {size:24, weight:900, color:TC[i], alpha:e});
+    txt('自己的栈', x, 660, {size:20, weight:600, alpha:e}); txt('程序计数器', x, 695, {size:20, weight:600, alpha:e}); txt('寄存器', x, 730, {size:20, weight:600, alpha:e});
+    if (t > 22.6){ const u = ((t*.8 + i*.33) % 1); ctx.save(); al(.8); ctx.strokeStyle = TC[i]; ctx.setLineDash([6, 6]); ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(x, 490); ctx.lineTo(lerp(x, 610, u), lerp(490, 420, u)); ctx.stroke(); ctx.restore(); }
+  });
+  [['比进程轻', '共享内存，创建和切换开销更小'], ['通信方便', '直接读写同一块内存'], ['也更危险', '一个线程出错，可能拖垮整个进程']].forEach(([h, d], i) => { const e = eo(p(t, 23.6 + i*.6, 24 + i*.6)), y = 260 + i*150;
+    box(1160, y - 58, 650, 122, e, {fill:'rgba(96,165,250,.06)', stroke:i === 2 ? 'rgba(255,138,138,.5)' : 'rgba(96,165,250,.5)', r:18});
+    txt(h, 1190, y - 16, {size:32, weight:900, color:i === 2 ? C.rose : C.acc, align:'left', alpha:e}); txt(d, 1190, y + 30, {size:22, weight:600, color:'#d9d2e4', align:'left', alpha:e}); });
+  // 竞态演示
+  const r = eo(p(t, 27.6, 28.1));
+  box(1160, 700, 650, 220, r, {fill:'rgba(255,138,138,.05)', stroke:'rgba(255,138,138,.45)', r:18});
+  txt('共享的坑：竞态条件', 1190, 740, {size:28, weight:900, color:C.rose, align:'left', alpha:r});
+  txt('两个线程同时执行 count++（读 → 加 1 → 写）', 1190, 790, {size:20, weight:600, align:'left', alpha:r});
+  txt('都读到 5，都写回 6：加了两次，只多了 1', 1190, 830, {size:22, weight:800, color:C.gold, align:'left', alpha:eo(p(t, 29, 29.4))});
+  txt('→ 需要锁、原子操作来保护', 1190, 875, {size:22, weight:800, color:C.mint, align:'left', alpha:eo(p(t, 30, 30.4))});
+  rise('操作系统调度 CPU 的基本单位是线程', 610, 900, t, 31.0, {size:30, weight:800, color:C.gold});
+}
+
+/* ============ 场景 4 · 上下文切换 (34–46s) ============ */
+function s4(t){
+  rise('切换是有代价的：上下文切换', W/2, 100, t, 34.2, {size:58, weight:900});
+  const a = eo(p(t, 34.6, 35.1)), x0 = 160, x1 = 1760, y = 320, prog = clamp((t - 35.2)/5);
+  txt('单个 CPU 核心的时间线', x0, 220, {size:24, weight:700, color:C.muted, align:'left', alpha:a});
+  const segs = []; let x = x0, k = 0; while (x < x1){ const w = 170; segs.push([x, Math.min(w, x1 - x), k % 3]); x += w; if (x < x1){ segs.push([x, 34, -1]); x += 34; } k++; }
+  segs.forEach(([sx, w, c]) => { if (sx > x0 + (x1 - x0)*prog) return; const ww = Math.min(w, x0 + (x1 - x0)*prog - sx);
+    ctx.save(); al(1); ctx.fillStyle = c < 0 ? 'rgba(255,138,138,.6)' : TC[c]; ctx.globalAlpha = SA*(c < 0 ? .9 : .55); rr(sx, y - 40, ww, 80, 6); ctx.fill(); ctx.restore();
+    if (c >= 0 && ww > 120) txt('线程 ' + (c + 1), sx + ww/2, y, {size:22, weight:800}); });
+  txt('红色：切换的开销', x0, 410, {size:24, weight:800, color:C.rose, align:'left', alpha:eo(p(t, 36, 36.4))});
+  [['保存现场', '把当前线程的寄存器、程序计数器存起来'], ['恢复现场', '载入下一个线程的状态'], ['缓存变冷', '换了线程，CPU 缓存里的数据多半用不上'], ['进程切换更重', '还要切换内存地址空间（页表），TLB 失效']].forEach(([h, d], i) => {
+    const e = eo(p(t, 37.4 + i*.6, 37.8 + i*.6)), xx = 140 + (i % 2)*840, yy = 540 + Math.floor(i/2)*150;
+    box(xx, yy - 58, 800, 120, e, {fill:'rgba(255,255,255,.04)', stroke:'rgba(96,165,250,.4)', r:18});
+    txt(h, xx + 30, yy - 16, {size:30, weight:900, color:C.acc, align:'left', alpha:e}); txt(d, xx + 30, yy + 28, {size:22, weight:600, color:'#d9d2e4', align:'left', alpha:e}); });
+  rise('线程开得太多，CPU 的时间就浪费在来回切换上', W/2, 900, t, 41.8, {size:38, weight:900, color:C.gold});
+}
+
+/* ============ 场景 5 · IO 等待与协程 (46–59s) ============ */
+function s5(t){
+  rise('线程的尴尬：大部分时间在「等」', W/2, 100, t, 46.2, {size:56, weight:900});
+  const a = eo(p(t, 46.6, 47.1));
+  txt('一个处理网络请求的线程', 160, 200, {size:26, weight:800, color:C.muted, align:'left', alpha:a});
+  [['计算', 120, 0], ['等数据库返回……', 520, 1], ['计算', 100, 0], ['等下游接口……', 440, 1], ['计算', 80, 0]].reduce((x, [s, w, wait]) => {
+    box(x, 230, w - 6, 70, a, {fill:wait ? 'rgba(255,255,255,.04)' : 'rgba(96,165,250,.35)', stroke:wait ? 'rgba(255,255,255,.25)' : C.acc, dash:wait ? [8, 6] : null, r:8});
+    txt(s, x + w/2, 266, {size:22, weight:800, color:wait ? C.muted : C.text, alpha:a}); return x + w; }, 160);
+  txt('一万个连接 = 一万个线程？每个线程的栈常常就要上 MB，内存和切换都吃不消', W/2, 360, {size:28, weight:800, color:C.rose, alpha:eo(p(t, 48, 48.4))});
+  const b = eo(p(t, 49.4, 49.9));
+  txt('协程：用户态的「轻量线程」', W/2, 450, {size:44, weight:900, color:C.acc, glow:16, alpha:b});
+  txt('遇到 IO 就主动让出，由程序自己的运行时调度，不用操作系统插手', W/2, 510, {size:26, weight:700, alpha:b});
+  // M:N
+  [0, 1, 2, 3].forEach(i => { const x = 360 + i*400; box(x - 140, 780, 280, 90, b, {fill:'rgba(96,165,250,.10)', stroke:C.acc, r:16}); txt('线程 ' + (i + 1), x, 825, {size:26, weight:900, color:C.acc, alpha:b}); });
+  txt('少量线程（通常 ≈ CPU 核数）', W/2, 920, {size:24, weight:700, color:C.muted, alpha:b});
+  const m = eo(p(t, 50.6, 51.2));
+  for (let i = 0; i < 48; i++){ const col = i % 16, row = Math.floor(i/16), x = 260 + col*94, y = 590 + row*52, run = (Math.floor(t*2.2) + i) % 12 === 0;
+    ctx.save(); al(m); ctx.fillStyle = run ? C.gold : 'rgba(255,255,255,.25)'; ctx.shadowColor = C.gold; ctx.shadowBlur = run ? 14 : 0; ctx.beginPath(); ctx.arc(x, y, run ? 13 : 10, 0, 6.283); ctx.fill(); ctx.restore();
+    if (run && t > 51.4){ const tx = 360 + (Math.floor(i/12) % 4)*400; ctx.save(); al(.5*m); ctx.strokeStyle = C.gold; ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(x, y + 14); ctx.lineTo(tx, 735); ctx.stroke(); ctx.restore(); } }
+  txt('成千上万个协程（金色：正在运行，灰色：在等 IO）', W/2, 555, {size:22, weight:700, color:C.gold, alpha:m});
+}
+
+/* ============ 场景 6 · 协程实例 (59–70s) ============ */
+function s6(t){
+  rise('常见的协程实现', W/2, 100, t, 59.2, {size:58, weight:900});
+  [['Go', 'goroutine', ['go handle(conn)   // 开一个 goroutine', '// 初始栈只有几 KB，可以开几十万个']], ['Python', 'asyncio', ['async def fetch(url):', '    data = await client.get(url)']], ['Java 21', '虚拟线程', ['Thread.startVirtualThread(() -> handle(req));', '// 写法像普通线程，阻塞时自动让出']], ['Kotlin / JS', 'suspend / async', ['suspend fun load() = api.get()', 'const data = await fetch(url)']]].forEach(([h, sub, code], i) => {
+    const e = eo(p(t, 59.8 + i*.6, 60.2 + i*.6)), x = 120 + (i % 2)*850, y = 200 + Math.floor(i/2)*270;
+    box(x, y, 820, 240, e, {fill:'rgba(255,255,255,.03)', stroke:'rgba(96,165,250,.45)', r:20});
+    txt(h, x + 30, y + 45, {size:34, weight:900, color:C.acc, align:'left', alpha:e}); txt(sub, x + 790, y + 45, {size:24, weight:700, color:C.gold, align:'right', alpha:e});
+    code.forEach((c, k) => txt(c, x + 30, y + 120 + k*50, {size:22, weight:600, font:MONO, color:c.trim().startsWith('//') ? C.muted : C.text, align:'left', alpha:e}));
+  });
+  rise('注意：协程擅长「大量等待 IO」；CPU 密集的计算，它帮不上忙', W/2, 800, t, 63.6, {size:34, weight:900, color:C.gold});
+  rise('在协程里调用会阻塞线程的老式 API，会把同一线程上的其他协程一起卡住', W/2, 870, t, 65.0, {size:28, weight:700, color:C.muted});
+}
+
+/* ============ 场景 7 · 对比 (70–76s) ============ */
+const CMPR = [['谁来调度', '操作系统', '操作系统', '语言运行时 / 程序'], ['内存', '各自独立', '共享所在进程的', '共享所在线程的'], ['创建开销', '大', '中', '极小'], ['切换', '内核态，最重', '内核态', '用户态，很轻'], ['常见数量', '几十 ~ 几百', '几百 ~ 几千', '几万 ~ 百万'], ['适合', '需要隔离', '利用多核做计算', '海量 IO 并发']];
+function s7(t){
+  rise('一张表看懂', W/2, 100, t, 70.2, {size:56, weight:900});
+  const a = eo(p(t, 70.4, 70.8)), cx = [380, 800, 1180, 1580];
+  ['', '进程', '线程', '协程'].forEach((h, i) => txt(h, cx[i], 190, {size:34, weight:900, color:[C.text, TC[0], TC[1], TC[2]][i], alpha:a}));
+  CMPR.forEach((row, r) => { const e = eo(p(t, 70.8 + r*.35, 71.2 + r*.35)), y = 270 + r*100;
+    box(200, y - 40, 1560, 80, e, {fill:'rgba(255,255,255,.03)', stroke:'rgba(96,165,250,.25)', r:12});
+    row.forEach((c, k) => txt(c, cx[k], y, {size:k ? 26 : 28, weight:k ? 700 : 900, color:k ? '#e6e1f0' : C.acc, alpha:e})); });
+}
+
+/* ============ 场景 8 · 收尾 (76–80s) ============ */
+function s8(t){
+  [['进程', '资源分配的单位'], ['线程', 'CPU 调度的单位'], ['协程', '用户态的轻量任务']].forEach(([a, b], i) => {
+    const st = 76.2 + i*.35, e = eback(p(t, st, st + .5)); if (e <= 0) return;
+    const x = 400 + i*560, y = 330;
+    ctx.save(); ctx.translate(x, y); ctx.scale(e, e); ctx.translate(-x, -y);
+    box(x - 230, y - 95, 460, 190, clamp(e), {fill:'rgba(96,165,250,.08)', stroke:TC[i], r:26}); ctx.restore();
+    txt(a, x, y - 24, {size:56, weight:900, color:TC[i], alpha:clamp(e)}); txt(b, x, y + 44, {size:28, weight:600, color:C.muted, alpha:clamp(e)});
+  });
+  rise('工厂、工人，和会见缝插针的工人', W/2, 600, t, 77.0, {size:56, weight:900, glow:20});
+  rise('关注拾星，一起搞懂计算机', W/2, 760, t, 77.6, {size:36, weight:500, color:C.muted});
+}
+
+/* ============ 总调度 ============ */
+const SCENES = [[s1,-1,7],[s2,7,20],[s3,20,34],[s4,34,46],[s5,46,59],[s6,59,70],[s7,70,76],[s8,76,80]];
+function draw(t){
+  t = clamp(t, 0, DUR);
+  ctx.save(); ctx.globalAlpha = 1; ctx.clearRect(0,0,W,H); background(t);
+  for (const [fn,a,b] of SCENES){
+    if (t < a || t > b) continue;
+    SA = sceneA(t, a, b, b === DUR ? .8 : .5);
+    if (SA > 0){ ctx.save(); fn(t); ctx.restore(); }
+  }
+  SA = 1; vignette();
+  const fo = p(t, DUR - .8, DUR);
+  if (fo > 0){ ctx.globalAlpha = fo; ctx.fillStyle = '#000'; ctx.fillRect(0,0,W,H); }
+  ctx.restore();
+}
+
+/* ============ 播放器 / 逐帧渲染接口 ============ */
+const isRender = new URLSearchParams(location.search).has('render');
+window.DURATION = DUR;
+window.renderFrame = t => draw(t);
+const btn = document.getElementById('btn'), seek = document.getElementById('seek'), timeEl = document.getElementById('time');
+const fmt = s => `${Math.floor(s/60)}:${String(Math.floor(s%60)).padStart(2,'0')}`;
+function fit(){
+  if (isRender){ cv.style.width = W+'px'; cv.style.height = H+'px'; return; }
+  const w = Math.min(innerWidth - 32, (innerHeight - 84)*16/9);
+  cv.style.width = w + 'px'; cv.style.height = w*9/16 + 'px';
+}
+addEventListener('resize', fit); fit();
+
+let cur = 0, playing = !isRender, last = null;
+function toggle(){ if (cur >= DUR) cur = 0; playing = !playing; }
+btn.onclick = toggle; cv.onclick = toggle;
+addEventListener('keydown', e => { if (e.code === 'Space'){ e.preventDefault(); toggle(); } });
+seek.oninput = () => { cur = +seek.value; draw(cur); };
+function loop(ts){
+  if (playing && last != null){ cur += (ts - last)/1000; if (cur >= DUR){ cur = DUR; playing = false; } }
+  last = ts; draw(cur);
+  seek.value = cur; timeEl.textContent = `${fmt(cur)} / ${fmt(DUR)}`;
+  btn.textContent = playing ? '❚❚' : (cur >= DUR ? '↺' : '▶');
+  requestAnimationFrame(loop);
+}
+document.fonts.ready.then(() => {
+  window.ready = true;
+  if (isRender) draw(0); else requestAnimationFrame(loop);
+});
+</script>
+</body>
+</html>
