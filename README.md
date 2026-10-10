@@ -42,6 +42,7 @@
 | 微服务：拆开之后的那些组件 | `microservices/landscape.html` | 横屏 1920×1080 | 84s |
 | 分布式 ID：雪花算法 | `snowflake-id/landscape.html` | 横屏 1920×1080 | 84s |
 | Java 的锁：synchronized、CAS 与 AQS | `java-lock/landscape.html` | 横屏 1920×1080 | 84s |
+| 幂等性设计：重复请求不出错 | `idempotency/landscape.html` | 横屏 1920×1080 | 82s |
 
 ### 幸福的科学
 钩子 → 享乐适应（快乐曲线 + 跑步机）→ 哈佛成人发展研究（关系网络）→ 心流（挑战 × 技能坐标图）→ 今晚就能做的 3 件事 → 收尾
@@ -144,6 +145,9 @@ CPU 轮流切换 → 进程与隔离 → 线程与竞态条件 → 上下文切�
 
 ### Java 的锁：synchronized、CAS 与 AQS
 钩子（4 个线程加不到 400 万）→ 读改写竞态 → synchronized 与锁升级 → CAS、ABA 与 LongAdder → AQS → 基于 AQS 的同步工具 → 选型、死锁与虚拟线程 → 收尾
+
+### 幂等性设计：重复请求不出错
+钩子（连点三次支付扣了三次钱）→ 重复请求的四个来源 → 幂等定义与 HTTP 方法 → 唯一约束与防重 Token → 乐观锁与状态机 → 幂等键 Idempotency-Key → MQ 消费幂等与三个坑 → 收尾
 
 ## 预览
 

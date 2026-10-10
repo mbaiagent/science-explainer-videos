@@ -1,0 +1,381 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>RPC 原理：像调本地方法一样调远程服务 · 拾星</title>
+<style>
+  :root{--bg:#07080f;--fg:#f4ede4;--muted:#9a93a8;--acc:#c4b5fd}
+  html,body{margin:0;height:100%;background:var(--bg);color:var(--fg);
+    font-family:-apple-system,"PingFang SC","Noto Sans SC","Noto Sans CJK SC","Microsoft YaHei",sans-serif}
+  body{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;overflow:hidden}
+  #stage{display:block;background:#07080f;border-radius:12px;box-shadow:0 20px 60px rgba(0,0,0,.55);cursor:pointer}
+  #bar{display:flex;align-items:center;gap:12px;width:min(calc(100vw - 32px),640px)}
+  #btn{width:40px;height:40px;border-radius:50%;border:1px solid rgba(196,181,253,.5);background:transparent;
+    color:var(--acc);font-size:16px;cursor:pointer;flex:none}
+  #seek{flex:1;accent-color:var(--acc)}
+  #time{font-variant-numeric:tabular-nums;font-size:13px;color:var(--muted);min-width:84px;text-align:right}
+  body.render{display:block}
+  body.render #bar{display:none}
+  body.render #stage{border-radius:0;box-shadow:none}
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="bar">
+  <button id="btn" aria-label="播放/暂停">❚❚</button>
+  <input id="seek" type="range" min="0" max="84" step="0.01" value="0">
+  <span id="time">0:00 / 1:24</span>
+</div>
+<script>
+/* ============ 基础设置（横屏 1920×1080） ============ */
+const W = 1920, H = 1080, DUR = 84;
+const cv = document.getElementById('stage'), ctx = cv.getContext('2d');
+cv.width = W; cv.height = H;
+const FONT = '"PingFang SC","Noto Sans SC","Noto Sans CJK SC","Source Han Sans SC","Microsoft YaHei",sans-serif';
+const MONO = '"JetBrains Mono","SF Mono",Menlo,Consolas,"DejaVu Sans Mono","Noto Sans Mono CJK SC","PingFang SC","Microsoft YaHei",monospace';
+const C = {acc:'#c4b5fd', mint:'#6ee7c8', gold:'#ffd38a', coral:'#ff9e7a', rose:'#ff8a8a', blue:'#9cc3ff', text:'#f4ede4', muted:'#9a93a8', dim:'#4a4558', panel:'#0f0e1f'};
+
+const clamp = (x,a=0,b=1) => Math.max(a, Math.min(b, x));
+const lerp = (a,b,t) => a + (b-a)*t;
+const p = (t,a,b) => clamp((t-a)/(b-a));
+const eo = x => 1 - Math.pow(1-x, 3);
+const eio = x => x < .5 ? 4*x*x*x : 1 - Math.pow(-2*x+2, 3)/2;
+const eback = x => { const c1=1.70158, c3=c1+1; return 1 + c3*Math.pow(x-1,3) + c1*Math.pow(x-1,2); };
+function rnd(seed){ let s = seed>>>0; return () => { s = (s*1664525 + 1013904223)>>>0; return s/4294967296; }; }
+
+let SA = 1;
+const al = a => { ctx.globalAlpha = clamp(SA*a); };
+const sceneA = (t,a,b,f=.5) => Math.min(p(t,a,a+f), 1 - p(t,b-f,b));
+
+function txt(s, x, y, o = {}){
+  const {size=64, weight=700, color=C.text, alpha=1, align='center', glow=0, scale=1, font=FONT} = o;
+  if (alpha <= 0) return;
+  ctx.save(); al(alpha);
+  ctx.font = `${weight} ${size}px ${font}`;
+  ctx.textAlign = align; ctx.textBaseline = 'middle'; ctx.fillStyle = color;
+  if (glow){ ctx.shadowColor = color; ctx.shadowBlur = glow; }
+  if (scale !== 1){ ctx.translate(x, y); ctx.scale(scale, scale); ctx.fillText(s, 0, 0); }
+  else ctx.fillText(s, x, y);
+  ctx.restore();
+}
+function rise(s, x, y, t, t0, o = {}, d = .7){
+  const e = eo(p(t, t0, t0+d));
+  if (e <= 0) return;
+  txt(s, x, y + (1-e)*36, {...o, alpha:(o.alpha ?? 1)*e});
+}
+function rr(x,y,w,h,r){ ctx.beginPath(); ctx.roundRect(x,y,w,h,r); }
+function box(x, y, w, h, a, o = {}){
+  const {fill='rgba(255,255,255,.05)', stroke='rgba(196,181,253,.35)', lw=2, glow=0, r=18, dash=null} = o;
+  if (a <= 0) return;
+  ctx.save(); al(a); rr(x, y, w, h, r); ctx.fillStyle = fill; ctx.fill();
+  if (dash) ctx.setLineDash(dash);
+  ctx.strokeStyle = stroke; ctx.lineWidth = lw; if (glow){ ctx.shadowColor = stroke; ctx.shadowBlur = glow; } ctx.stroke(); ctx.restore();
+}
+function arrow(x1, y1, x2, y2, e, a, color = C.acc, lw = 3){
+  if (e <= 0 || a <= 0) return;
+  const x = lerp(x1, x2, e), y = lerp(y1, y2, e), ang = Math.atan2(y2 - y1, x2 - x1);
+  ctx.save(); al(a); ctx.strokeStyle = color; ctx.fillStyle = color; ctx.lineWidth = lw; ctx.lineCap = 'round';
+  ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x, y); ctx.stroke();
+  if (e > .85){ ctx.translate(x, y); ctx.rotate(ang); ctx.beginPath(); ctx.moveTo(4, 0); ctx.lineTo(-14, -9); ctx.lineTo(-14, 9); ctx.closePath(); ctx.fill(); }
+  ctx.restore();
+}
+function panel(x, y, w, h, title, a){
+  box(x, y, w, h, a, {fill:C.panel, stroke:'rgba(255,255,255,.1)', r:20});
+  if (a <= 0) return;
+  ctx.save(); al(a); ctx.strokeStyle = 'rgba(255,255,255,.07)'; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(x, y + 52); ctx.lineTo(x + w, y + 52); ctx.stroke();
+  ['#ff6b6b','#ffd166','#6ee7a0'].forEach((c, i) => { ctx.fillStyle = c; ctx.globalAlpha = clamp(SA*a*.8); ctx.beginPath(); ctx.arc(x + 30 + i*24, y + 26, 7, 0, 6.283); ctx.fill(); });
+  ctx.restore();
+  txt(title, x + w/2, y + 27, {size:22, weight:500, color:C.muted, font:MONO, alpha:a});
+}
+
+/* ============ 背景 ============ */
+const PARTS = (() => { const r = rnd(263); return Array.from({length:100}, () => ({
+  x:r()*W, y:r()*H, s:r()*2.2+.5, v:r()*12+4, ph:r()*6.283, c:r()<.25})); })();
+function background(t){
+  const g = ctx.createLinearGradient(0,0,W,H);
+  g.addColorStop(0,'#0a0916'); g.addColorStop(.55,'#110f24'); g.addColorStop(1,'#18122c');
+  ctx.globalAlpha = 1; ctx.fillStyle = g; ctx.fillRect(0,0,W,H);
+  const gx = W*.5 + Math.sin(t*.27)*140;
+  const rg = ctx.createRadialGradient(gx, H*.45, 0, gx, H*.45, 950);
+  rg.addColorStop(0,'rgba(196,181,253,0.09)'); rg.addColorStop(1,'rgba(196,181,253,0)');
+  ctx.fillStyle = rg; ctx.fillRect(0,0,W,H);
+  ctx.fillStyle = C.acc;
+  for (let x = 40; x < W; x += 80) for (let y = 40; y < H; y += 80){ ctx.globalAlpha = .06; ctx.fillRect(x, y, 2, 2); }
+  for (const q of PARTS){
+    const y = ((q.y - t*q.v) % H + H) % H, x = q.x + Math.sin(t*.35 + q.ph)*12;
+    ctx.globalAlpha = .2 + .3*(.5 + .5*Math.sin(t*1.2 + q.ph));
+    ctx.fillStyle = q.c ? C.acc : '#d8d0ff';
+    ctx.beginPath(); ctx.arc(x, y, q.s, 0, 6.283); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+}
+function vignette(){
+  const v = ctx.createRadialGradient(W/2, H/2, W*.28, W/2, H/2, W*.62);
+  v.addColorStop(0,'rgba(0,0,0,0)'); v.addColorStop(1,'rgba(0,0,0,.55)');
+  ctx.globalAlpha = 1; ctx.fillStyle = v; ctx.fillRect(0,0,W,H);
+}
+function codeLine(s, x, y, size, a, kw = /\b(public|class|static|void|new|return)\b/){
+  const parts = s.split(/("[^"]*"|\b(?:public|class|static|void|new|return|getstatic|ldc|invokevirtual)\b)/g);
+  ctx.save(); al(a); ctx.font = `500 ${size}px ${MONO}`; ctx.textBaseline = 'middle'; ctx.textAlign = 'left';
+  let xx = x;
+  for (const seg of parts){ if (!seg) continue;
+    ctx.fillStyle = seg.startsWith('"') ? C.mint : /^(public|class|static|void|new|return|getstatic|ldc|invokevirtual)$/.test(seg) ? C.acc : C.text;
+    ctx.fillText(seg, xx, y); xx += ctx.measureText(seg).width; }
+  ctx.restore();
+}
+
+function card(h, lines, x, y, w, hh, a, c = C.acc, o = {}){
+  const {hs=30, ls=22, lh=40} = o;
+  box(x, y, w, hh, a, {fill:'rgba(196,181,253,.05)', stroke:c === C.acc ? 'rgba(196,181,253,.5)' : c, r:20});
+  txt(h, x + 30, y + 44, {size:hs, weight:900, color:c, align:'left', alpha:a});
+  lines.forEach((s, i) => txt(s, x + 30, y + 96 + i*lh, {size:ls, weight:600, color:'#d9d2e4', align:'left', alpha:a}));
+}
+function stage(label, sub, cx, cy, w, h, a, on = 0){
+  box(cx - w/2, cy - h/2, w, h, a, {fill:on ? 'rgba(196,181,253,.20)' : 'rgba(196,181,253,.07)', stroke:on ? C.acc : 'rgba(196,181,253,.45)', r:18, glow:on ? 22 : 0});
+  txt(label, cx, cy - (sub ? 16 : 0), {size:30, weight:900, color:on ? C.acc : C.text, alpha:a});
+  if (sub) txt(sub, cx, cy + 26, {size:20, weight:600, color:C.muted, alpha:a});
+}
+function codeCmt(code, cmt, x, cx, y, size, a){
+  codeLine(code, x, y, size, a);
+  if (cmt) txt(cmt, cx, y, {size, weight:500, font:MONO, color:C.muted, align:'left', alpha:a});
+}
+function seg(x, y, w, h, a, fill, stroke, label, lc = C.text){
+  box(x, y, w, h, a, {fill, stroke, r:8});
+  if (label) txt(label, x + w/2, y + h/2, {size:22, weight:800, font:MONO, color:lc, alpha:a});
+}
+
+/* ============ 场景 1 · 钩子 (0–7s) ============ */
+function s1(t){
+  rise('这行代码，其实在另一台机器上执行', W/2, 110, t, .2, {size:54, weight:900});
+  const a = eo(p(t, .8, 1.3));
+  panel(120, 210, 800, 300, 'OrderController.java', a);
+  txt('// 看起来就是一次普通的方法调用', 160, 300, {size:24, weight:500, font:MONO, color:C.muted, align:'left', alpha:eo(p(t, 1.1, 1.5))});
+  codeLine('String r = helloService.hello("拾星");', 160, 370, 28, eo(p(t, 1.4, 1.8)));
+  txt('// r = "Hello, 拾星"', 160, 440, {size:24, weight:500, font:MONO, color:C.mint, align:'left', alpha:eo(p(t, 3.4, 3.8))});
+  const b = eo(p(t, 1.8, 2.3));
+  box(1240, 230, 560, 260, b, {fill:'rgba(196,181,253,.08)', stroke:C.acc, r:22});
+  txt('另一台机器', 1520, 290, {size:24, weight:700, color:C.muted, alpha:b});
+  txt('HelloServiceImpl', 1520, 360, {size:34, weight:900, font:MONO, color:C.acc, alpha:b});
+  txt('hello() 在这里真正执行', 1520, 425, {size:24, weight:700, alpha:b});
+  arrow(935, 360, 1225, 360, eo(p(t, 2.2, 2.8)), b, C.acc, 3);
+  txt('网络', 1080, 320, {size:24, weight:800, color:C.acc, alpha:eo(p(t, 2.4, 2.8))});
+  const k = p(t, 2.6, 3.4);
+  if (k > 0 && k < 1){ ctx.save(); al(1); ctx.fillStyle = C.gold; ctx.shadowColor = C.gold; ctx.shadowBlur = 18; ctx.beginPath(); ctx.arc(lerp(950, 1210, eio(k)), 360, 10, 0, 6.283); ctx.fill(); ctx.restore(); }
+  rise('背后藏着这些步骤：', W/2, 580, t, 3.6, {size:26, weight:700, color:C.muted});
+  ['动态代理', '序列化', '协议编码', '网络传输', '反射调用'].forEach((s, i) => { const e = eo(p(t, 3.9 + i*.3, 4.3 + i*.3)), x = W/2 + (i - 2)*320;
+    box(x - 135, 625, 270, 90, e, {fill:'rgba(196,181,253,.10)', stroke:'rgba(196,181,253,.55)', r:16});
+    txt(s, x, 670, {size:30, weight:900, alpha:e});
+    if (i) arrow(x - 178, 670, x - 142, 670, e, e, C.acc, 3); });
+  rise('RPC：Remote Procedure Call，远程过程调用', W/2, 820, t, 5.3, {size:40, weight:900, color:C.acc});
+  rise('目标：调用远程服务，像调用本地方法一样简单', W/2, 905, t, 5.8, {size:30, weight:800, color:C.gold});
+}
+
+/* ============ 场景 2 · 完整链路 (7–17s) ============ */
+function s2(t){
+  rise('一次 RPC 调用的完整旅程', W/2, 90, t, 7.2, {size:54, weight:900});
+  const k = p(t, 10.8, 13.6), step = k > 0 && k < 1 ? Math.floor(k*9) : -1;
+  txt('客户端', 120, 190, {size:28, weight:900, color:C.gold, align:'left', alpha:eo(p(t, 7.5, 7.9))});
+  const top = [['业务代码', 'hello("拾星")'], ['代理 Stub', '拦截方法调用'], ['序列化', '对象 → 字节'], ['协议编码', '加上帧头']];
+  top.forEach(([h, d], i) => { const e = eo(p(t, 7.6 + i*.35, 8 + i*.35)), x = 250 + i*360;
+    stage(h, d, x, 300, 300, 120, e, step === i);
+    if (i) arrow(x - 205, 300, x - 155, 300, e, e, C.acc, 3); });
+  const n = eo(p(t, 9, 9.4));
+  box(1560, 240, 260, 460, n, {fill:step === 4 ? 'rgba(255,211,138,.16)' : 'rgba(255,211,138,.07)', stroke:C.gold, r:20, glow:step === 4 ? 22 : 0});
+  txt('网络', 1690, 440, {size:36, weight:900, color:C.gold, alpha:n}); txt('TCP 连接', 1690, 495, {size:22, weight:700, color:C.muted, alpha:n});
+  arrow(1485, 300, 1555, 300, n, n, C.acc, 3);
+  arrow(1555, 640, 1485, 640, eo(p(t, 9.35, 9.7)), eo(p(t, 9.35, 9.7)), C.acc, 3);
+  const bot = [['协议解码', '按长度切出一帧'], ['反序列化', '字节 → 对象'], ['反射调用', '找到方法并 invoke'], ['实现类', 'HelloServiceImpl']];
+  bot.forEach(([h, d], i) => { const e = eo(p(t, 9.35 + i*.35, 9.75 + i*.35)), x = 1330 - i*360;
+    stage(h, d, x, 640, 300, 120, e, step === 5 + i);
+    if (i) arrow(x + 205, 640, x + 155, 640, e, e, C.acc, 3); });
+  rise('调用信息一路被「翻译」：方法调用 → 对象 → 字节 → 网络 → 字节 → 对象 → 方法调用', W/2, 470, t, 10.8, {size:24, weight:700, color:C.muted});
+  txt('服务端', 120, 750, {size:28, weight:900, color:C.gold, align:'left', alpha:eo(p(t, 9.6, 10))});
+  rise('返回值原路返回：结果序列化 → 编码 → 网络 → 客户端解码 → 反序列化 → 调用方拿到 String', W/2, 840, t, 13.6, {size:26, weight:700, color:C.text});
+  rise('框架把这一切藏在接口后面：你只管写接口和实现类', W/2, 920, t, 14.5, {size:32, weight:900, color:C.gold});
+}
+
+/* ============ 场景 3 · 动态代理 + 反射 (17–28s) ============ */
+function s3(t){
+  rise('两端的关键：动态代理 + 反射', W/2, 90, t, 17.2, {size:54, weight:900});
+  const a = eo(p(t, 17.6, 18.1));
+  panel(100, 170, 860, 640, '客户端：动态代理生成 Stub', a);
+  const L = [['hs = Proxy.newProxyInstance(loader,', ''], ['    new Class[]{HelloService.class},', ''], ['    (proxy, method, args) -> {', ''], ['      var req = new RpcRequest(', ''],
+             ['          nextId(),', '// 请求 ID'], ['          "HelloService",', '// 接口名'], ['          method.getName(),', '// 方法名'], ['          method.getParameterTypes(),', ''],
+             ['          args);', '// 参数'], ['      return client.send(req)', '// 发出去'], ['                   .get(3, SECONDS);', '// 等结果'], ['    });', '']];
+  L.forEach(([c, m], i) => codeCmt(c, m, 130, 650, 262 + i*42, 22, eo(p(t, 17.9 + i*.15, 18.3 + i*.15))));
+  const b = eo(p(t, 20.8, 21.3));
+  panel(1000, 170, 820, 640, '服务端：反射调用实现类', b);
+  const R = [['// 启动时：注册实现类', C.muted], ['services.put("HelloService",', 0], ['             new HelloServiceImpl());', 0], ['', 0],
+             ['// 收到请求：按名字找实现，反射调用', C.muted], ['Object impl = services.get(req.iface());', 0], ['Method m = impl.getClass().getMethod(', 0],
+             ['    req.method(), req.paramTypes());', 0], ['Object result = m.invoke(impl, req.args());', 0], ['', 0], ['send(new RpcResponse(req.id(), result));', 0]];
+  R.forEach(([c, col], i) => { const e = eo(p(t, 21.1 + i*.18, 21.5 + i*.18)); if (!c) return;
+    if (col) txt(c, 1030, 262 + i*46, {size:22, weight:500, font:MONO, color:col, align:'left', alpha:e}); else codeLine(c, 1030, 262 + i*46, 22, e); });
+  rise('调用方以为在调本地方法，其实只是把「调谁、传什么」打包成对象发了出去', W/2, 880, t, 24, {size:28, weight:800, color:C.gold});
+  rise('服务端按「接口名 + 方法名 + 参数类型」找到实现并调用，再把结果连同请求 ID 一起送回', W/2, 950, t, 25, {size:24, weight:700, color:C.muted});
+}
+
+/* ============ 场景 4 · 序列化 (28–40s) ============ */
+function s4(t){
+  rise('序列化：对象 ⇄ 字节', W/2, 90, t, 28.2, {size:54, weight:900});
+  rise('同一个对象 User{id=150, name="拾星"}，两种编码', W/2, 160, t, 28.6, {size:28, weight:700, color:C.muted});
+  const a = eo(p(t, 29.2, 29.7));
+  box(120, 220, 800, 210, a, {fill:'rgba(255,255,255,.04)', stroke:'rgba(255,255,255,.25)', r:20});
+  txt('JSON（文本）', 160, 262, {size:28, weight:900, color:C.gold, align:'left', alpha:a});
+  txt('{"id":150,"name":"拾星"}', 520, 330, {size:30, weight:700, font:MONO, alpha:a});
+  txt('带字段名，人能直接看懂 · 共 26 字节', 520, 392, {size:22, weight:700, color:C.muted, alpha:a});
+  const b = eo(p(t, 30.2, 30.7));
+  box(1000, 220, 800, 210, b, {fill:'rgba(196,181,253,.08)', stroke:C.acc, r:20});
+  txt('Protobuf（二进制）', 1040, 262, {size:28, weight:900, color:C.acc, align:'left', alpha:b});
+  txt('08 96 01 12 06 e6 8b be e6 98 9f', 1400, 330, {size:30, weight:700, font:MONO, alpha:b});
+  txt('只有字段编号 + 值 · 共 11 字节', 1400, 392, {size:22, weight:700, color:C.muted, alpha:b});
+  const S = [['JSON', ['文本，可读性最好', '天然跨语言', '体积大、解析较慢', 'HTTP REST 的主流'], C.gold],
+             ['Protobuf', ['二进制 + .proto 定义', '跨语言，兼容性好', '体积小、速度快', 'gRPC 默认'], C.acc],
+             ['Hessian', ['二进制，自描述', '无需 IDL', '跨语言，Java 生态常用', 'Dubbo 2.x 默认'], C.blue],
+             ['Kryo', ['二进制，Java 专用', '速度快、体积小', '最好提前注册类', '不适合跨语言'], C.mint]];
+  S.forEach(([h, ls, c], i) => card(h, ls, 120 + i*427, 480, 400, 310, eo(p(t, 31.6 + i*.6, 32.1 + i*.6)), c, {hs:32, lh:46}));
+  rise('选型看三点：要不要跨语言、要不要人能读、对性能有多敏感', W/2, 870, t, 35, {size:30, weight:900, color:C.gold});
+  rise('JDK 自带的序列化体积大、速度慢，还有反序列化安全风险，不适合跨服务通信', W/2, 945, t, 36.2, {size:24, weight:700, color:C.muted});
+}
+
+/* ============ 场景 5 · 协议帧与粘包拆包 (40–53s) ============ */
+function s5(t){
+  rise('协议：给字节流划出边界', W/2, 90, t, 40.2, {size:54, weight:900});
+  rise('TCP 只保证字节按顺序到达，不知道一条消息从哪开始、到哪结束', W/2, 160, t, 40.6, {size:28, weight:700, color:C.muted});
+  const cols = [['rgba(196,181,253,.25)', C.acc], ['rgba(255,211,138,.22)', C.gold], ['rgba(110,231,200,.22)', C.mint]];
+  txt('发送端写了 3 条消息', 120, 230, {size:24, weight:800, align:'left', alpha:eo(p(t, 41, 41.4))});
+  const M = [300, 220, 260]; let x = 120;
+  M.forEach((w, i) => { seg(x, 260, w, 60, eo(p(t, 41.2 + i*.3, 41.6 + i*.3)), cols[i][0], cols[i][1], '消息 ' + (i + 1)); x += w + 30; });
+  const r = eo(p(t, 42.2, 42.7));
+  txt('接收端可能这样读到', 120, 380, {size:24, weight:800, align:'left', alpha:r});
+  seg(120, 410, 300, 60, r, cols[0][0], cols[0][1], '消息 1'); seg(420, 410, 120, 60, r, cols[1][0], cols[1][1], '2 前半');
+  seg(560, 410, 100, 60, r, cols[1][0], cols[1][1], '后半'); seg(660, 410, 260, 60, r, cols[2][0], cols[2][1], '消息 3');
+  const r1 = eo(p(t, 42.8, 43.2)), r2 = eo(p(t, 43.2, 43.6));
+  box(112, 402, 436, 76, r1, {fill:'rgba(0,0,0,0)', stroke:C.rose, r:10, dash:[8, 6], lw:3});
+  box(552, 402, 376, 76, r2, {fill:'rgba(0,0,0,0)', stroke:C.blue, r:10, dash:[8, 6], lw:3});
+  txt('第 1 次 read', 330, 505, {size:20, weight:700, color:C.rose, alpha:r1}); txt('第 2 次 read', 740, 505, {size:20, weight:700, color:C.blue, alpha:r2});
+  txt('粘包：两条消息粘在一次读里', 1000, 300, {size:28, weight:800, color:C.rose, align:'left', alpha:eo(p(t, 43.6, 44))});
+  txt('拆包：一条消息被拆到两次读里', 1000, 380, {size:28, weight:800, color:C.blue, align:'left', alpha:eo(p(t, 44.1, 44.5))});
+  txt('→ 协议必须自己标出每条消息的边界', 1000, 460, {size:26, weight:800, color:C.gold, align:'left', alpha:eo(p(t, 44.6, 45))});
+  txt('自定义协议帧（帧头固定 17 字节）', 120, 590, {size:28, weight:900, color:C.acc, align:'left', alpha:eo(p(t, 45.2, 45.6))});
+  const F = [['魔数', '2 字节', 200], ['版本', '1', 150], ['序列化方式', '1', 210], ['消息类型', '1', 200], ['请求 ID', '8 字节', 300], ['长度 N', '4 字节', 200], ['消息体', 'N 字节', 420]];
+  x = 120;
+  F.forEach(([h, d, w], i) => { const e = eo(p(t, 45.5 + i*.25, 45.9 + i*.25)), hi = i === 4 || i === 5;
+    box(x, 630, w, 100, e, {fill:i === 6 ? 'rgba(255,255,255,.05)' : hi ? 'rgba(196,181,253,.20)' : 'rgba(196,181,253,.09)', stroke:hi ? C.acc : 'rgba(196,181,253,.5)', r:6});
+    txt(h, x + w/2, 662, {size:24, weight:900, color:hi ? C.acc : C.text, alpha:e}); txt(d, x + w/2, 702, {size:20, weight:600, color:C.muted, alpha:e}); x += w; });
+  [['认不出就拒绝', 220, 47.6], ['对上请求和响应', 1030, 48], ['据此切出一帧', 1280, 48.4], ['序列化后的对象', 1590, 48.8]].forEach(([s, cx, ts]) =>
+    txt(s, cx, 765, {size:22, weight:700, color:C.gold, alpha:eo(p(t, ts, ts + .4))}));
+  rise('解码：先读满 17 字节帧头 → 校验魔数 → 读出长度 N → 再读满 N 字节，正好一条消息', W/2, 860, t, 49.4, {size:26, weight:800});
+  rise('常见做法：定长、分隔符、长度字段（最常用，Netty 有现成的 LengthFieldBasedFrameDecoder）', W/2, 935, t, 50.4, {size:22, weight:700, color:C.muted});
+}
+
+/* ============ 场景 6 · 多路复用 + 服务治理 (53–65s) ============ */
+function s6(t){
+  rise('请求 ID 与服务治理', W/2, 90, t, 53.2, {size:54, weight:900});
+  txt('一条连接，多个请求同时在飞', 520, 180, {size:30, weight:900, color:C.acc, alpha:eo(p(t, 53.5, 53.9))});
+  const a = eo(p(t, 53.8, 54.3));
+  box(120, 230, 270, 430, a, {fill:'rgba(196,181,253,.07)', stroke:'rgba(196,181,253,.5)', r:18});
+  txt('客户端', 255, 270, {size:28, weight:900, alpha:a}); txt('等待表', 255, 315, {size:20, weight:700, color:C.muted, alpha:a});
+  box(680, 230, 240, 430, a, {fill:'rgba(255,255,255,.05)', stroke:'rgba(255,255,255,.3)', r:18});
+  txt('服务端', 800, 270, {size:28, weight:900, alpha:a}); txt('并发处理', 800, 315, {size:20, weight:700, color:C.muted, alpha:a});
+  const done = [56.8, 55.8, 56.3];
+  [1, 2, 3].forEach((id, i) => { const y = 390 + i*70, ok = t > done[i] + .5;
+    txt('#' + id + ' → Future', 150, y, {size:22, weight:700, font:MONO, color:ok ? C.mint : C.text, align:'left', alpha:eo(p(t, 54.2 + i*.4, 54.6 + i*.4))});
+    if (ok) txt('✓', 360, y, {size:26, weight:900, color:C.mint, alpha:eo(p(t, done[i] + .5, done[i] + .8))}); });
+  [1, 2, 3].forEach((id, i) => { const ts = 54.2 + i*.4, y = 380 + i*40;
+    arrow(395, y, 675, y, eo(p(t, ts, ts + .5)), clamp(p(t, ts, ts + .2)), C.acc, 3); });
+  txt('请求 #1 #2 #3', 535, 345, {size:20, weight:800, color:C.acc, alpha:eo(p(t, 54.6, 55))});
+  [[2, 55.8], [3, 56.3], [1, 56.8]].forEach(([id, ts], i) => { const y = 540 + i*40;
+    arrow(675, y, 395, y, eo(p(t, ts, ts + .5)), clamp(p(t, ts, ts + .2)), C.mint, 3); });
+  txt('响应 #2 #3 #1（乱序）', 535, 665, {size:20, weight:800, color:C.mint, alpha:eo(p(t, 56.2, 56.6))});
+  rise('按 ID 找到对应的 Future，唤醒等待的调用方', 520, 730, t, 57.3, {size:24, weight:800});
+  rise('不必一问一答地排队 → 连接复用、天然支持异步', 520, 780, t, 57.8, {size:24, weight:800, color:C.gold});
+  txt('远程调用要可靠，还需要', 1400, 180, {size:30, weight:900, color:C.acc, alpha:eo(p(t, 58.4, 58.8))});
+  [['服务发现', ['注册中心记录实例地址', '调用方订阅地址变化', '实例上下线自动感知']], ['负载均衡', ['在多个实例里挑一个', '轮询、随机、一致性哈希', '故障实例自动摘除']],
+   ['超时与重试', ['一定要设超时', '只对幂等接口重试', '重试次数要有上限']], ['连接池', ['复用长连接', '省掉反复握手的开销', '或单连接多路复用']]].forEach(([h, ls], i) =>
+    card(h, ls, 1000 + (i % 2)*410, 230 + Math.floor(i/2)*275, 390, 250, eo(p(t, 58.8 + i*.5, 59.3 + i*.5)), C.acc, {lh:44}));
+  rise('远程调用 ≠ 本地调用：网络会慢、会断、会超时，框架要替你兜底', W/2, 880, t, 61.5, {size:30, weight:900, color:C.gold});
+  rise('常见注册中心：ZooKeeper、Nacos、etcd、Consul', W/2, 950, t, 62.4, {size:24, weight:700, color:C.muted});
+}
+
+/* ============ 场景 7 · RPC vs REST + 框架 (65–78s) ============ */
+function s7(t){
+  rise('RPC 还是 HTTP REST？', W/2, 90, t, 65.2, {size:54, weight:900});
+  const R = [['', 'RPC（gRPC、Dubbo 等）', 'HTTP REST'],
+             ['调用方式', '像调本地方法，面向接口', '面向资源：URL + GET / POST…'],
+             ['协议与编码', '自定义 TCP 协议或 HTTP/2，多为二进制', 'HTTP + JSON 文本'],
+             ['性能', '体积小、长连接复用，开销低', '开销稍大，多数场景够用'],
+             ['接口契约', 'IDL / 接口定义，强类型，生成代码', 'OpenAPI 等文档约定，较松'],
+             ['更适合', '内部微服务之间的大量调用', '对外开放、浏览器、跨团队']];
+  R.forEach(([k, v1, v2], i) => { const e = eo(p(t, 65.6 + i*.5, 66 + i*.5)), y = 190 + i*66, hd = i === 0;
+    if (i % 2 === 1) box(120, y - 31, 1680, 62, e, {fill:'rgba(255,255,255,.035)', stroke:'rgba(255,255,255,0)', r:10});
+    txt(k, 150, y, {size:24, weight:900, color:C.muted, align:'left', alpha:e});
+    txt(v1, 420, y, {size:hd ? 28 : 24, weight:hd ? 900 : 700, color:hd ? C.acc : C.text, align:'left', alpha:e});
+    txt(v2, 1160, y, {size:hd ? 28 : 24, weight:hd ? 900 : 700, color:hd ? C.gold : C.text, align:'left', alpha:e}); });
+  [['gRPC', ['HTTP/2 + Protobuf', '跨语言，支持流式调用'], C.acc], ['Dubbo', ['Java 生态常用', '自带服务治理，3.x 有 Triple 协议'], C.blue], ['Thrift', ['自带 IDL 和代码生成', '多种传输层和编码可选'], C.mint]].forEach(([h, ls, c], i) =>
+    card(h, ls, 120 + i*570, 600, 540, 230, eo(p(t, 69.4 + i*.6, 69.9 + i*.6)), c, {hs:34, ls:24, lh:44}));
+  rise('RPC 不等于「不用 HTTP」：gRPC 本身就跑在 HTTP/2 上', W/2, 910, t, 72, {size:30, weight:900, color:C.gold});
+  rise('对内用 RPC 追求效率，对外用 REST 追求通用，是很常见的组合', W/2, 980, t, 73, {size:24, weight:700, color:C.muted});
+}
+
+/* ============ 场景 8 · 收尾 (78–84s) ============ */
+function s8(t){
+  [['动态代理', '方法调用 → 请求对象'], ['序列化', '对象 ⇄ 字节'], ['协议帧', '长度字段划边界'], ['请求 ID', '多路复用与异步']].forEach(([a, b], i) => {
+    const st = 78.2 + i*.25, e = eback(p(t, st, st + .5)); if (e <= 0) return;
+    const x = 330 + i*420, y = 330;
+    ctx.save(); ctx.translate(x, y); ctx.scale(e, e); ctx.translate(-x, -y);
+    box(x - 185, y - 90, 370, 180, clamp(e), {fill:'rgba(196,181,253,.08)', stroke:'rgba(196,181,253,.5)', r:26}); ctx.restore();
+    txt(a, x, y - 22, {size:40, weight:900, color:C.acc, alpha:clamp(e)}); txt(b, x, y + 40, {size:24, weight:600, color:C.muted, alpha:clamp(e)});
+  });
+  rise('把网络藏在接口后面，但别忘了它还在', W/2, 600, t, 79.2, {size:60, weight:900, glow:22});
+  rise('关注拾星，一起搞懂后端', W/2, 760, t, 80, {size:36, weight:500, color:C.muted});
+}
+/* ============ 总调度 ============ */
+const SCENES = [[s1,-1,7],[s2,7,17],[s3,17,28],[s4,28,40],[s5,40,53],[s6,53,65],[s7,65,78],[s8,78,84]];
+function draw(t){
+  t = clamp(t, 0, DUR);
+  ctx.save(); ctx.globalAlpha = 1; ctx.clearRect(0,0,W,H); background(t);
+  for (const [fn,a,b] of SCENES){
+    if (t < a || t > b) continue;
+    SA = sceneA(t, a, b, b === DUR ? .8 : .5);
+    if (SA > 0){ ctx.save(); fn(t); ctx.restore(); }
+  }
+  SA = 1; vignette();
+  const fo = p(t, DUR - .8, DUR);
+  if (fo > 0){ ctx.globalAlpha = fo; ctx.fillStyle = '#000'; ctx.fillRect(0,0,W,H); }
+  ctx.restore();
+}
+
+/* ============ 播放器 / 逐帧渲染接口 ============ */
+const isRender = new URLSearchParams(location.search).has('render');
+window.DURATION = DUR;
+window.renderFrame = t => draw(t);
+const btn = document.getElementById('btn'), seek = document.getElementById('seek'), timeEl = document.getElementById('time');
+const fmt = s => `${Math.floor(s/60)}:${String(Math.floor(s%60)).padStart(2,'0')}`;
+function fit(){
+  if (isRender){ cv.style.width = W+'px'; cv.style.height = H+'px'; return; }
+  const w = Math.min(innerWidth - 32, (innerHeight - 84)*16/9);
+  cv.style.width = w + 'px'; cv.style.height = w*9/16 + 'px';
+}
+addEventListener('resize', fit); fit();
+
+let cur = 0, playing = !isRender, last = null;
+function toggle(){ if (cur >= DUR) cur = 0; playing = !playing; }
+btn.onclick = toggle; cv.onclick = toggle;
+addEventListener('keydown', e => { if (e.code === 'Space'){ e.preventDefault(); toggle(); } });
+seek.oninput = () => { cur = +seek.value; draw(cur); };
+function loop(ts){
+  if (playing && last != null){ cur += (ts - last)/1000; if (cur >= DUR){ cur = DUR; playing = false; } }
+  last = ts; draw(cur);
+  seek.value = cur; timeEl.textContent = `${fmt(cur)} / ${fmt(DUR)}`;
+  btn.textContent = playing ? '❚❚' : (cur >= DUR ? '↺' : '▶');
+  requestAnimationFrame(loop);
+}
+document.fonts.ready.then(() => {
+  window.ready = true;
+  if (isRender) draw(0); else requestAnimationFrame(loop);
+});
+</script>
+</body>
+</html>

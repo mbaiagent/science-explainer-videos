@@ -1,0 +1,449 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>HashMap 与 ConcurrentHashMap · 拾星</title>
+<style>
+  :root{--bg:#07080f;--fg:#f4ede4;--muted:#9a93a8;--acc:#99f6e4}
+  html,body{margin:0;height:100%;background:var(--bg);color:var(--fg);
+    font-family:-apple-system,"PingFang SC","Noto Sans SC","Noto Sans CJK SC","Microsoft YaHei",sans-serif}
+  body{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;overflow:hidden}
+  #stage{display:block;background:#07080f;border-radius:12px;box-shadow:0 20px 60px rgba(0,0,0,.55);cursor:pointer}
+  #bar{display:flex;align-items:center;gap:12px;width:min(calc(100vw - 32px),640px)}
+  #btn{width:40px;height:40px;border-radius:50%;border:1px solid rgba(153,246,228,.5);background:transparent;
+    color:var(--acc);font-size:16px;cursor:pointer;flex:none}
+  #seek{flex:1;accent-color:var(--acc)}
+  #time{font-variant-numeric:tabular-nums;font-size:13px;color:var(--muted);min-width:84px;text-align:right}
+  body.render{display:block}
+  body.render #bar{display:none}
+  body.render #stage{border-radius:0;box-shadow:none}
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="bar">
+  <button id="btn" aria-label="播放/暂停">❚❚</button>
+  <input id="seek" type="range" min="0" max="84" step="0.01" value="0">
+  <span id="time">0:00 / 1:24</span>
+</div>
+<script>
+/* ============ 基础设置（横屏 1920×1080） ============ */
+const W = 1920, H = 1080, DUR = 84;
+const cv = document.getElementById('stage'), ctx = cv.getContext('2d');
+cv.width = W; cv.height = H;
+const FONT = '"PingFang SC","Noto Sans SC","Noto Sans CJK SC","Source Han Sans SC","Microsoft YaHei",sans-serif';
+const MONO = '"JetBrains Mono","SF Mono",Menlo,Consolas,"DejaVu Sans Mono","Noto Sans Mono CJK SC","PingFang SC","Microsoft YaHei",monospace';
+const C = {acc:'#99f6e4', mint:'#6ee7c8', gold:'#ffd38a', coral:'#ff9e7a', rose:'#ff8a8a', blue:'#9cc3ff', text:'#f4ede4', muted:'#9a93a8', dim:'#4a4558', panel:'#0f0e1f'};
+
+const clamp = (x,a=0,b=1) => Math.max(a, Math.min(b, x));
+const lerp = (a,b,t) => a + (b-a)*t;
+const p = (t,a,b) => clamp((t-a)/(b-a));
+const eo = x => 1 - Math.pow(1-x, 3);
+const eio = x => x < .5 ? 4*x*x*x : 1 - Math.pow(-2*x+2, 3)/2;
+const eback = x => { const c1=1.70158, c3=c1+1; return 1 + c3*Math.pow(x-1,3) + c1*Math.pow(x-1,2); };
+function rnd(seed){ let s = seed>>>0; return () => { s = (s*1664525 + 1013904223)>>>0; return s/4294967296; }; }
+
+let SA = 1;
+const al = a => { ctx.globalAlpha = clamp(SA*a); };
+const sceneA = (t,a,b,f=.5) => Math.min(p(t,a,a+f), 1 - p(t,b-f,b));
+
+function txt(s, x, y, o = {}){
+  const {size=64, weight=700, color=C.text, alpha=1, align='center', glow=0, scale=1, font=FONT} = o;
+  if (alpha <= 0) return;
+  ctx.save(); al(alpha);
+  ctx.font = `${weight} ${size}px ${font}`;
+  ctx.textAlign = align; ctx.textBaseline = 'middle'; ctx.fillStyle = color;
+  if (glow){ ctx.shadowColor = color; ctx.shadowBlur = glow; }
+  if (scale !== 1){ ctx.translate(x, y); ctx.scale(scale, scale); ctx.fillText(s, 0, 0); }
+  else ctx.fillText(s, x, y);
+  ctx.restore();
+}
+function rise(s, x, y, t, t0, o = {}, d = .7){
+  const e = eo(p(t, t0, t0+d));
+  if (e <= 0) return;
+  txt(s, x, y + (1-e)*36, {...o, alpha:(o.alpha ?? 1)*e});
+}
+function rr(x,y,w,h,r){ ctx.beginPath(); ctx.roundRect(x,y,w,h,r); }
+function box(x, y, w, h, a, o = {}){
+  const {fill='rgba(255,255,255,.05)', stroke='rgba(153,246,228,.35)', lw=2, glow=0, r=18, dash=null} = o;
+  if (a <= 0) return;
+  ctx.save(); al(a); rr(x, y, w, h, r); ctx.fillStyle = fill; ctx.fill();
+  if (dash) ctx.setLineDash(dash);
+  ctx.strokeStyle = stroke; ctx.lineWidth = lw; if (glow){ ctx.shadowColor = stroke; ctx.shadowBlur = glow; } ctx.stroke(); ctx.restore();
+}
+function arrow(x1, y1, x2, y2, e, a, color = C.acc, lw = 3){
+  if (e <= 0 || a <= 0) return;
+  const x = lerp(x1, x2, e), y = lerp(y1, y2, e), ang = Math.atan2(y2 - y1, x2 - x1);
+  ctx.save(); al(a); ctx.strokeStyle = color; ctx.fillStyle = color; ctx.lineWidth = lw; ctx.lineCap = 'round';
+  ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x, y); ctx.stroke();
+  if (e > .85){ ctx.translate(x, y); ctx.rotate(ang); ctx.beginPath(); ctx.moveTo(4, 0); ctx.lineTo(-14, -9); ctx.lineTo(-14, 9); ctx.closePath(); ctx.fill(); }
+  ctx.restore();
+}
+function panel(x, y, w, h, title, a){
+  box(x, y, w, h, a, {fill:C.panel, stroke:'rgba(255,255,255,.1)', r:20});
+  if (a <= 0) return;
+  ctx.save(); al(a); ctx.strokeStyle = 'rgba(255,255,255,.07)'; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(x, y + 52); ctx.lineTo(x + w, y + 52); ctx.stroke();
+  ['#ff6b6b','#ffd166','#6ee7a0'].forEach((c, i) => { ctx.fillStyle = c; ctx.globalAlpha = clamp(SA*a*.8); ctx.beginPath(); ctx.arc(x + 30 + i*24, y + 26, 7, 0, 6.283); ctx.fill(); });
+  ctx.restore();
+  txt(title, x + w/2, y + 27, {size:22, weight:500, color:C.muted, font:MONO, alpha:a});
+}
+
+/* ============ 背景 ============ */
+const PARTS = (() => { const r = rnd(307); return Array.from({length:100}, () => ({
+  x:r()*W, y:r()*H, s:r()*2.2+.5, v:r()*12+4, ph:r()*6.283, c:r()<.25})); })();
+function background(t){
+  const g = ctx.createLinearGradient(0,0,W,H);
+  g.addColorStop(0,'#0a0916'); g.addColorStop(.55,'#110f24'); g.addColorStop(1,'#18122c');
+  ctx.globalAlpha = 1; ctx.fillStyle = g; ctx.fillRect(0,0,W,H);
+  const gx = W*.5 + Math.sin(t*.27)*140;
+  const rg = ctx.createRadialGradient(gx, H*.45, 0, gx, H*.45, 950);
+  rg.addColorStop(0,'rgba(153,246,228,0.09)'); rg.addColorStop(1,'rgba(153,246,228,0)');
+  ctx.fillStyle = rg; ctx.fillRect(0,0,W,H);
+  ctx.fillStyle = C.acc;
+  for (let x = 40; x < W; x += 80) for (let y = 40; y < H; y += 80){ ctx.globalAlpha = .06; ctx.fillRect(x, y, 2, 2); }
+  for (const q of PARTS){
+    const y = ((q.y - t*q.v) % H + H) % H, x = q.x + Math.sin(t*.35 + q.ph)*12;
+    ctx.globalAlpha = .2 + .3*(.5 + .5*Math.sin(t*1.2 + q.ph));
+    ctx.fillStyle = q.c ? C.acc : '#d8d0ff';
+    ctx.beginPath(); ctx.arc(x, y, q.s, 0, 6.283); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+}
+function vignette(){
+  const v = ctx.createRadialGradient(W/2, H/2, W*.28, W/2, H/2, W*.62);
+  v.addColorStop(0,'rgba(0,0,0,0)'); v.addColorStop(1,'rgba(0,0,0,.55)');
+  ctx.globalAlpha = 1; ctx.fillStyle = v; ctx.fillRect(0,0,W,H);
+}
+function codeLine(s, x, y, size, a, kw = /\b(public|class|static|void|new|return)\b/){
+  const parts = s.split(/("[^"]*"|\b(?:public|class|static|void|new|return|getstatic|ldc|invokevirtual)\b)/g);
+  ctx.save(); al(a); ctx.font = `500 ${size}px ${MONO}`; ctx.textBaseline = 'middle'; ctx.textAlign = 'left';
+  let xx = x;
+  for (const seg of parts){ if (!seg) continue;
+    ctx.fillStyle = seg.startsWith('"') ? C.mint : /^(public|class|static|void|new|return|getstatic|ldc|invokevirtual)$/.test(seg) ? C.acc : C.text;
+    ctx.fillText(seg, xx, y); xx += ctx.measureText(seg).width; }
+  ctx.restore();
+}
+
+function card(h, lines, x, y, w, hh, a, c = C.acc, o = {}){
+  const {hs=30, ls=22, lh=40} = o;
+  box(x, y, w, hh, a, {fill:'rgba(153,246,228,.05)', stroke:c === C.acc ? 'rgba(153,246,228,.5)' : c, r:20});
+  txt(h, x + 30, y + 44, {size:hs, weight:900, color:c, align:'left', alpha:a});
+  lines.forEach((s, i) => txt(s, x + 30, y + 96 + i*lh, {size:ls, weight:600, color:'#d9d2e4', align:'left', alpha:a}));
+}
+function chip(s, x, y, a, c = C.text, w = 90, h = 48){
+  box(x - w/2, y - h/2, w, h, a, {fill:'rgba(255,255,255,.07)', stroke:c, r:12});
+  txt(s, x, y, {size:22, weight:800, font:MONO, color:c, alpha:a});
+}
+function cell(x, y, w, h, a, o = {}){
+  const {fill='rgba(255,255,255,.05)', stroke='rgba(255,255,255,.3)', label, lc = C.muted, size = 20} = o;
+  box(x, y, w, h, a, {fill, stroke, r:8});
+  if (label !== undefined) txt(String(label), x + w/2, y + h/2, {size, weight:800, font:MONO, color:lc, alpha:a});
+}
+function lockIcon(x, y, s, a, color){
+  if (a <= 0) return;
+  ctx.save(); al(a); ctx.translate(x, y); ctx.scale(s, s); ctx.strokeStyle = color; ctx.fillStyle = color; ctx.lineWidth = 5;
+  ctx.beginPath(); ctx.arc(0, -12, 12, Math.PI, 0); ctx.lineTo(12, -4); ctx.moveTo(-12, -12); ctx.lineTo(-12, -4); ctx.stroke();
+  rr(-18, -6, 36, 28, 6); ctx.fill(); ctx.restore();
+}
+function dot(x, y, r, a, c){
+  if (a <= 0) return;
+  ctx.save(); al(a); ctx.fillStyle = c; ctx.beginPath(); ctx.arc(x, y, r, 0, 6.283); ctx.fill(); ctx.restore();
+}
+function bitsRow(label, hi, lo, y, a, hiC, loC){
+  txt(label, 150, y, {size:24, weight:700, font:MONO, color:C.muted, align:'left', alpha:a});
+  txt(hi, 560, y, {size:26, weight:700, font:MONO, color:hiC, align:'left', alpha:a});
+  txt(lo, 840, y, {size:26, weight:700, font:MONO, color:loC, align:'left', alpha:a});
+}
+
+/* ============ 场景 1 · 钩子 (0–7s) ============ */
+function s1(t){
+  rise('10 个线程，同时往 HashMap 里放 10000 个不同的 key', W/2, 110, t, .2, {size:50, weight:900});
+  const k = p(t, 1.4, 3.6), ek = eo(k);
+  [[540, 'HashMap', C.gold, 9358, .9], [1380, 'ConcurrentHashMap', C.acc, 10000, 1.2]].forEach(([cx, name, c, final, t0]) => {
+    const a = eo(p(t, t0, t0 + .5));
+    box(cx - 380, 210, 760, 380, a, {fill:'rgba(255,255,255,.04)', stroke:'rgba(255,255,255,.25)', r:24});
+    txt(name, cx, 270, {size:40, weight:900, font:MONO, color:c, alpha:a});
+    for (let i = 0; i < 10; i++){ const ph = (k*3 + i*.1) % 1; if (k > 0 && k < 1) dot(cx - 270 + i*60, lerp(310, 360, ph), 6, a*(1 - ph), c); }
+    const v = Math.round(final*ek), done = k >= 1, bad = final < 10000;
+    txt('size() = ' + v, cx, 420, {size:58, weight:900, font:MONO, color:done ? (bad ? C.rose : C.mint) : C.text, alpha:a});
+    if (done) txt(bad ? '✗ 少了 642 个（每次运行结果都不同）' : '✓ 一个不少', cx, 520, {size:26, weight:800, color:bad ? C.rose : C.mint, alpha:eo(p(t, 3.6, 4))});
+  });
+  const b = eo(p(t, 4.2, 4.7));
+  box(410, 650, 1100, 100, b, {fill:'rgba(255,138,138,.10)', stroke:C.rose, r:20, glow:14});
+  txt('没有异常，没有日志，数据就这样悄悄丢了', W/2, 700, {size:34, weight:900, color:C.rose, alpha:b});
+  rise('HashMap 为什么会丢？ConcurrentHashMap 又凭什么又安全又快？', W/2, 880, t, 5.2, {size:34, weight:800, color:C.gold});
+}
+
+/* ============ 场景 2 · hash 与下标 (7–18s) ============ */
+function s2(t){
+  rise('第一步：算出 key 该放进哪个桶', W/2, 90, t, 7.2, {size:54, weight:900});
+  const a = eo(p(t, 7.6, 8.1));
+  panel(100, 170, 1120, 580, 'key = "hello"，数组长度 n = 16', a);
+  const r1 = eo(p(t, 8.2, 8.6)), r2 = eo(p(t, 8.9, 9.3)), r3 = eo(p(t, 9.6, 10));
+  txt('高 16 位', 690, 255, {size:20, weight:700, color:C.muted, alpha:r1}); txt('低 16 位', 970, 255, {size:20, weight:700, color:C.muted, alpha:r1});
+  bitsRow('h = hashCode()', '0000010111101001', '0001100011010010', 310, r1, C.text, C.text);
+  bitsRow('h >>> 16', '0000000000000000', '0000010111101001', 380, r2, C.dim, C.gold);
+  bitsRow('h ^ (h >>> 16)', '0000010111101001', '0001110100111011', 450, r3, C.text, C.acc);
+  if (r3 > 0){ ctx.save(); al(r3*.5); ctx.strokeStyle = 'rgba(255,255,255,.3)'; ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(140, 500); ctx.lineTo(1180, 500); ctx.stroke(); ctx.restore(); }
+  const r4 = eo(p(t, 10.8, 11.2)), r5 = eo(p(t, 11.6, 12));
+  bitsRow('n - 1 = 15', '0000000000000000', '0000000000001111', 550, r4, C.dim, C.text);
+  bitsRow('(n-1) & hash', '0000000000000000', '000000000000', 620, r5, C.dim, C.dim);
+  txt('1011', 1028, 620, {size:26, weight:900, font:MONO, color:C.acc, align:'left', alpha:r5});
+  txt('= 11', 1110, 620, {size:26, weight:900, font:MONO, color:C.acc, align:'left', alpha:eo(p(t, 12.2, 12.6))});
+  txt('高 16 位也参与了运算，下标分布更均匀', 660, 700, {size:24, weight:800, color:C.gold, alpha:eo(p(t, 12.8, 13.2))});
+  card('为什么要「扰动」？', ['数组不大时，下标只用到 hash 的低几位', '把高 16 位异或进来，减少冲突'], 1270, 170, 560, 250, eo(p(t, 13.4, 13.9)), C.acc, {ls:21});
+  card('为什么容量是 2 的幂？', ['(n-1) & hash 等价于 hash % n，更快', '扩容时拆分规则也很简单', 'new HashMap(10) 实际容量是 16'], 1270, 450, 560, 300, eo(p(t, 14.4, 14.9)), C.acc, {ls:21});
+  rise('桶里找 key：先比 hash，再用 equals 确认是不是同一个', W/2, 850, t, 15.6, {size:30, weight:800});
+  rise('null 键的 hash 固定为 0，放在 0 号桶', W/2, 920, t, 16.2, {size:24, weight:700, color:C.muted});
+}
+
+/* ============ 场景 3 · 结构与扩容 (18–31s) ============ */
+function s3(t){
+  rise('结构：数组 + 链表 + 红黑树', W/2, 90, t, 18.2, {size:54, weight:900});
+  const X = i => 120 + i*74, a = eo(p(t, 18.6, 19.1));
+  for (let i = 0; i < 16; i++) cell(X(i), 170, 66, 56, eo(p(t, 18.6 + i*.04, 19 + i*.04)), {label:i, size:20});
+  const chains = [[1, 2, 19.6], [4, 3, 20], [7, 1, 20.4], [14, 2, 20.8]];
+  chains.forEach(([b, n, ts]) => { for (let j = 0; j < n; j++){ const e = eo(p(t, ts + j*.2, ts + .4 + j*.2)), cx = X(b) + 33, y = 270 + j*70;
+    arrow(cx, y - 42 + (j ? 18 : 0), cx, y - 22, e, e, 'rgba(255,255,255,.4)', 2);
+    box(cx - 29, y - 20, 58, 40, e, {fill:'rgba(153,246,228,.12)', stroke:C.acc, r:8}); } });
+  txt('链表', X(4) + 33, 475, {size:20, weight:700, color:C.muted, alpha:eo(p(t, 20.4, 20.8))});
+  const tr = eo(p(t, 23, 23.6)), cx = X(11) + 33;
+  if (tr > 0){
+    const N = [[cx, 280, 0], [cx - 46, 345, 1], [cx + 46, 345, 1], [cx - 70, 410, 0], [cx - 22, 410, 0], [cx + 22, 410, 0], [cx + 70, 410, 0]];
+    ctx.save(); al(tr); ctx.strokeStyle = 'rgba(255,255,255,.4)'; ctx.lineWidth = 2; ctx.beginPath();
+    [[0, 1], [0, 2], [1, 3], [1, 4], [2, 5], [2, 6]].forEach(([u, v]) => { ctx.moveTo(N[u][0], N[u][1]); ctx.lineTo(N[v][0], N[v][1]); });
+    ctx.moveTo(cx, 228); ctx.lineTo(cx, 266); ctx.stroke(); ctx.restore();
+    N.forEach(([x, y, red]) => { dot(x, y, 15, tr, red ? C.rose : '#2a2640'); ctx.save(); al(tr); ctx.strokeStyle = red ? C.rose : C.text; ctx.lineWidth = 2; ctx.beginPath(); ctx.arc(x, y, 15, 0, 6.283); ctx.stroke(); ctx.restore(); });
+    txt('红黑树', cx, 460, {size:20, weight:700, color:C.rose, alpha:tr});
+  }
+  const R = ['默认容量 16，负载因子 0.75', '元素数 > 容量 × 0.75 → 扩容 2 倍', '链表超过 8 个，且数组长度 ≥ 64', '　→ 链表转成红黑树', '数组 < 64 时：先扩容，不树化', '扩容拆分后 ≤ 6 个 → 退回链表'];
+  box(1370, 160, 450, 360, a, {fill:'rgba(153,246,228,.05)', stroke:'rgba(153,246,228,.5)', r:20});
+  txt('几个关键数字', 1400, 205, {size:28, weight:900, color:C.acc, align:'left', alpha:a});
+  R.forEach((s, i) => txt(s, 1400, 260 + i*44, {size:21, weight:600, color:i === 2 || i === 3 ? C.gold : '#d9d2e4', align:'left', alpha:eo(p(t, 21.2 + i*.5, 21.6 + i*.5))}));
+  const b = eo(p(t, 25, 25.5));
+  box(100, 560, 1720, 460, b, {fill:'rgba(255,255,255,.03)', stroke:'rgba(255,255,255,.18)', r:24});
+  txt('扩容 16 → 32：每个元素要么留在原位，要么移动 oldCap', W/2, 610, {size:30, weight:900, color:C.acc, alpha:b});
+  const sp = p(t, 27.4, 28);
+  txt('旧数组（16）', 180, 690, {size:22, weight:700, color:C.muted, align:'left', alpha:b});
+  cell(180, 740, 90, 56, b, {label:'[5]', lc:C.text});
+  [[5, 0], [21, 1], [37, 0], [53, 1]].forEach(([k, hi], j) => { const x = 300 + j*125, c = sp > 0 ? (hi ? C.gold : C.mint) : C.acc;
+    if (j) arrow(x - 22, 768, x - 4, 768, b, b, 'rgba(255,255,255,.4)', 2); else arrow(272, 768, 296, 768, b, b, 'rgba(255,255,255,.4)', 2);
+    box(x, 740, 100, 56, b, {fill:'rgba(153,246,228,.10)', stroke:c, r:10});
+    txt(String(k), x + 50, 768, {size:24, weight:800, font:MONO, color:c, alpha:b});
+    txt(hi ? '&16=16' : '&16=0', x + 50, 830, {size:18, weight:700, font:MONO, color:hi ? C.gold : C.mint, alpha:eo(p(t, 26.2 + j*.2, 26.6 + j*.2))}); });
+  arrow(820, 760, 1090, 720, eo(p(t, 27.6, 28.2)), b, C.mint, 3); arrow(820, 780, 1090, 850, eo(p(t, 27.8, 28.4)), b, C.gold, 3);
+  txt('新数组（32）', 1110, 650, {size:22, weight:700, color:C.muted, align:'left', alpha:eo(p(t, 28, 28.4))});
+  [[700, '[5]', [5, 37], C.mint], [830, '[21]', [21, 53], C.gold]].forEach(([y, lb, ks, c], r) => { const e = eo(p(t, 28.2 + r*.3, 28.6 + r*.3));
+    cell(1110, y - 28, 90, 56, e, {label:lb, lc:c});
+    ks.forEach((k, j) => { const x = 1230 + j*125; arrow(x - 26, y, x - 4, y, e, e, 'rgba(255,255,255,.4)', 2);
+      box(x, y - 28, 100, 56, e, {fill:'rgba(255,255,255,.05)', stroke:c, r:10}); txt(String(k), x + 50, y, {size:24, weight:800, font:MONO, color:c, alpha:e}); }); });
+  txt('hash & oldCap == 0 → 留在原下标 j', 560, 920, {size:26, weight:800, color:C.mint, alpha:eo(p(t, 29, 29.4))});
+  txt('hash & oldCap != 0 → 移到 j + oldCap', 1360, 920, {size:26, weight:800, color:C.gold, alpha:eo(p(t, 29.4, 29.8))});
+  txt('不用重新算 hash，只看多出来的那一位；JDK 8 拆分时还保持了原来的顺序', W/2, 975, {size:22, weight:700, color:C.muted, alpha:eo(p(t, 29.8, 30.2))});
+}
+
+/* ============ 场景 4 · 线程不安全 (31–42s) ============ */
+function s4(t){
+  rise('HashMap 为什么线程不安全？', W/2, 90, t, 31.2, {size:54, weight:900});
+  const a = eo(p(t, 31.6, 32.1));
+  box(100, 170, 840, 620, a, {fill:'rgba(255,255,255,.03)', stroke:'rgba(255,255,255,.18)', r:24});
+  txt('① 并发 put：数据被覆盖', 140, 225, {size:32, weight:900, color:C.rose, align:'left', alpha:a});
+  const st = [['线程 A：看到 tab[3] 为空', C.gold, 32.4], ['线程 B：也看到 tab[3] 为空', C.blue, 33.2], ['线程 A：tab[3] = 节点A', C.gold, 34], ['线程 B：tab[3] = 节点B', C.blue, 34.8]];
+  st.forEach(([s, c, ts], i) => txt(s, 140, 310 + i*66, {size:26, weight:700, font:i > 1 ? MONO : FONT, color:c, align:'left', alpha:eo(p(t, ts, ts + .4))}));
+  const v = t < 34 ? '' : t < 34.8 ? 'A' : 'B', vc = v === 'A' ? C.gold : C.blue;
+  txt('tab[3]', 800, 280, {size:22, weight:700, font:MONO, color:C.muted, alpha:a});
+  box(740, 310, 120, 80, a, {fill:'rgba(255,255,255,.05)', stroke:v ? vc : 'rgba(255,255,255,.3)', r:12});
+  if (v) txt(v, 800, 350, {size:40, weight:900, font:MONO, color:vc, alpha:a});
+  if (t > 35) txt('A 被覆盖', 800, 430, {size:24, weight:900, color:C.rose, alpha:eo(p(t, 35.2, 35.6))});
+  txt('size++ 也不是原子操作：两次自增，可能只加了 1', 140, 590, {size:24, weight:700, color:C.text, align:'left', alpha:eo(p(t, 35.8, 36.2))});
+  txt('没有任何报错，数据就这样没了', 140, 660, {size:28, weight:900, color:C.rose, align:'left', alpha:eo(p(t, 36.3, 36.7))});
+  const b = eo(p(t, 37, 37.5));
+  box(980, 170, 840, 620, b, {fill:'rgba(255,255,255,.03)', stroke:'rgba(255,255,255,.18)', r:24});
+  txt('② JDK 7：扩容时链表可能成环', 1020, 225, {size:32, weight:900, color:C.rose, align:'left', alpha:b});
+  txt('JDK 7 扩容用「头插法」，会把链表顺序倒过来', 1020, 300, {size:24, weight:700, align:'left', alpha:b});
+  txt('两个线程同时扩容，可能出现 A.next = B、B.next = A', 1020, 350, {size:24, weight:700, align:'left', alpha:eo(p(t, 37.6, 38))});
+  const c = eo(p(t, 38.2, 38.7)), ax = 1260, bx = 1580, cy = 470;
+  [[ax, 'A'], [bx, 'B']].forEach(([x, s]) => { dot(x, cy, 46, c, 'rgba(255,138,138,.15)'); ctx.save(); al(c); ctx.strokeStyle = C.rose; ctx.lineWidth = 3; ctx.beginPath(); ctx.arc(x, cy, 46, 0, 6.283); ctx.stroke(); ctx.restore(); txt(s, x, cy, {size:36, weight:900, font:MONO, color:C.rose, alpha:c}); });
+  arrow(ax + 50, cy - 20, bx - 50, cy - 20, c, c, C.rose, 3); arrow(bx - 50, cy + 20, ax + 50, cy + 20, c, c, C.rose, 3);
+  txt('next', 1420, cy - 50, {size:20, weight:700, font:MONO, color:C.muted, alpha:c}); txt('next', 1420, cy + 50, {size:20, weight:700, font:MONO, color:C.muted, alpha:c});
+  if (t > 38.7){ const ph = (t*1.2) % 1, x = ph < .5 ? lerp(ax + 50, bx - 50, ph*2) : lerp(bx - 50, ax + 50, (ph - .5)*2), y = ph < .5 ? cy - 20 : cy + 20; dot(x, y, 9, c, C.gold); }
+  txt('get() 在环里一直转 → CPU 100%', 1400, 590, {size:28, weight:900, color:C.rose, alpha:eo(p(t, 39, 39.4))});
+  txt('JDK 8 改成尾插法并保持顺序，不再成环', 1400, 660, {size:24, weight:700, color:C.mint, alpha:eo(p(t, 39.6, 40))});
+  txt('但 ① 的问题依然存在', 1400, 715, {size:24, weight:700, color:C.muted, alpha:eo(p(t, 40, 40.4))});
+  rise('结论：多个线程共享读写，就不要用 HashMap', W/2, 890, t, 40.6, {size:38, weight:900, color:C.gold});
+}
+
+/* ============ 场景 5 · 一把大锁 vs 分段锁 (42–53s) ============ */
+function s5(t){
+  rise('加锁的老办法', W/2, 90, t, 42.2, {size:56, weight:900});
+  const a = eo(p(t, 42.6, 43.1));
+  box(100, 170, 840, 680, a, {fill:'rgba(255,255,255,.03)', stroke:'rgba(255,255,255,.18)', r:24});
+  txt('Hashtable / synchronizedMap', 520, 225, {size:30, weight:900, font:MONO, color:C.gold, alpha:a});
+  box(370, 300, 520, 300, a, {fill:'rgba(255,211,138,.06)', stroke:C.gold, r:18, lw:3});
+  lockIcon(630, 300, 1.4, a, C.gold);
+  for (let i = 0; i < 8; i++) cell(410 + (i % 4)*118, 380 + Math.floor(i/4)*100, 94, 70, a, {stroke:'rgba(255,255,255,.2)'});
+  chip('T1', 630, 560, eo(p(t, 43.4, 43.8)), C.mint);
+  ['T2', 'T3', 'T4'].forEach((s, i) => { const e = eo(p(t, 43.8 + i*.3, 44.2 + i*.3)), y = 360 + i*90;
+    chip(s, 200, y, e, C.rose); arrow(250, y, 360, y, e, e*.6, C.rose, 2); });
+  txt('排队', 200, 640, {size:22, weight:800, color:C.rose, alpha:eo(p(t, 44.8, 45.2))});
+  txt('所有方法都用同一把锁，锁住整张表', 520, 700, {size:26, weight:800, alpha:eo(p(t, 45, 45.4))});
+  txt('读和读也要排队，线程越多越堵', 520, 760, {size:26, weight:800, color:C.rose, alpha:eo(p(t, 45.6, 46))});
+  const b = eo(p(t, 46.4, 46.9));
+  box(980, 170, 840, 680, b, {fill:'rgba(255,255,255,.03)', stroke:'rgba(255,255,255,.18)', r:24});
+  txt('JDK 7 ConcurrentHashMap：分段锁', 1400, 225, {size:30, weight:900, color:C.acc, alpha:b});
+  for (let i = 0; i < 8; i++){ const e = eo(p(t, 46.8 + i*.08, 47.2 + i*.08)), x = 1020 + i*96;
+    lockIcon(x + 40, 330, .8, e, C.acc);
+    cell(x, 360, 80, 70, e, {label:i < 7 ? 'S' + i : '…', lc:C.acc, stroke:'rgba(153,246,228,.5)', fill:'rgba(153,246,228,.08)'});
+    for (let j = 0; j < 3; j++) box(x + 18, 445 + j*28, 44, 20, e*.8, {fill:'rgba(255,255,255,.06)', stroke:'rgba(255,255,255,.2)', r:4}); }
+  [['T1', 0, C.mint, 48], ['T2', 3, C.mint, 48.3], ['T3', 6, C.mint, 48.6]].forEach(([s, seg, c, ts]) => { const e = eo(p(t, ts, ts + .4)), x = 1060 + seg*96;
+    chip(s, x, 600, e, c, 80); arrow(x, 574, x, 540, e, e, c, 3); });
+  chip('T4', 1492, 600, eo(p(t, 49, 49.4)), C.rose, 80); arrow(1452, 584, 1392, 546, eo(p(t, 49.2, 49.6)), eo(p(t, 49, 49.4)), C.rose, 2);
+  txt('等 S3 的锁', 1492, 660, {size:22, weight:800, color:C.rose, alpha:eo(p(t, 49.4, 49.8))});
+  txt('每个 Segment = 一把 ReentrantLock + 一张小哈希表', 1400, 750, {size:23, weight:800, alpha:eo(p(t, 49.8, 50.2))});
+  txt('默认 16 段，不同段可以并行写；段数创建后就固定了', 1400, 800, {size:22, weight:700, color:C.muted, alpha:eo(p(t, 50.3, 50.7))});
+  rise('能不能把锁拆得更细？JDK 8：每个桶一把锁', W/2, 950, t, 51, {size:36, weight:900, color:C.gold});
+}
+
+/* ============ 场景 6 · JDK 8 CAS + synchronized (53–65s) ============ */
+function s6(t){
+  rise('JDK 8 ConcurrentHashMap：只锁一个桶', W/2, 90, t, 53.2, {size:54, weight:900});
+  const X = i => 140 + i*92, a = eo(p(t, 53.6, 54.1)), BY = 330;
+  const has = i => i === 6 || i === 9 || i === 4 || (i === 2 && t > 55.4);
+  for (let i = 0; i < 12; i++) cell(X(i), BY, 80, 64, a, {label:i, size:20, stroke:has(i) ? C.acc : 'rgba(255,255,255,.3)', lc:has(i) ? C.acc : C.muted});
+  [[4, 1], [6, 2], [9, 2]].forEach(([b, n]) => { for (let j = 0; j < n; j++){ const cx = X(b) + 40, y = 450 + j*70;
+    arrow(cx, y - 52 + (j ? 18 : 0), cx, y - 24, a, a, 'rgba(255,255,255,.4)', 2); box(cx - 32, y - 22, 64, 44, a, {fill:'rgba(153,246,228,.12)', stroke:C.acc, r:8}); } });
+  // T1：空桶 CAS
+  const e1 = eo(p(t, 54.4, 54.8)), x2 = X(2) + 40;
+  chip('T1', x2, 210, e1, C.mint, 80); arrow(x2, 236, x2, 322, eo(p(t, 54.6, 55.2)), e1, C.mint, 3);
+  txt('空桶：CAS', x2, 160, {size:22, weight:800, color:C.mint, alpha:eo(p(t, 55.2, 55.6))});
+  if (t > 55.4){ const e = eo(p(t, 55.4, 55.8)); arrow(x2, 398, x2, 426, e, e, 'rgba(255,255,255,.4)', 2); box(x2 - 32, 428, 64, 44, e, {fill:'rgba(110,231,200,.15)', stroke:C.mint, r:8}); }
+  // T2：锁桶 6 的头节点
+  const e2 = eo(p(t, 56, 56.4)), x6 = X(6) + 40;
+  chip('T2', x6, 210, e2, C.gold, 80); arrow(x6, 236, x6, 322, eo(p(t, 56.2, 56.8)), e2, C.gold, 3);
+  lockIcon(x6 + 58, 452, .9, eo(p(t, 56.8, 57.2)), C.gold);
+  txt('锁头节点', x6 + 120, 452, {size:20, weight:800, color:C.gold, align:'left', alpha:eo(p(t, 57, 57.4))});
+  // T3：同一个桶，等待
+  const e3 = eo(p(t, 57.6, 58)), x5 = X(5) + 10;
+  chip('T3', x5 - 30, 210, e3, C.rose, 80); arrow(x5 - 10, 236, x6 - 20, 322, eo(p(t, 57.8, 58.3)), e3*.7, C.rose, 2);
+  txt('同一个桶：等待', x5 - 70, 160, {size:22, weight:800, color:C.rose, alpha:eo(p(t, 58.2, 58.6))});
+  // T4：另一个桶，并行
+  const e4 = eo(p(t, 58.6, 59)), x9 = X(9) + 40;
+  chip('T4', x9, 210, e4, C.gold, 80); arrow(x9, 236, x9, 322, eo(p(t, 58.8, 59.4)), e4, C.gold, 3);
+  lockIcon(x9 + 58, 452, .9, eo(p(t, 59.2, 59.6)), C.gold);
+  txt('不同桶：并行', x9, 160, {size:22, weight:800, color:C.gold, alpha:eo(p(t, 59.4, 59.8))});
+  // T5：读不加锁
+  const e5 = eo(p(t, 59.8, 60.2));
+  chip('T5', x6, 680, e5, C.blue, 80); arrow(x6, 655, x6, 546, eo(p(t, 60, 60.5)), e5, C.blue, 3);
+  txt('get：不加锁，照样能读', x6 + 60, 680, {size:22, weight:800, color:C.blue, align:'left', alpha:eo(p(t, 60.3, 60.7))});
+  const b = eo(p(t, 55, 55.5));
+  panel(1290, 160, 530, 610, 'putVal（简化）', b);
+  const L = [['f = tabAt(tab, i)', '// volatile 读', C.text], ['if (f == null)', '', C.text], ['  CAS 放入，不加锁', '', C.mint], ['else if (f.hash == MOVED)', '', C.text], ['  正在扩容：先帮忙迁移', '', C.acc], ['else synchronized (f) {', '', C.text], ['  链表 / 红黑树里插入', '', C.gold], ['}', '', C.text], ['链表超过 8 → 树化', '', C.muted], ['addCount(1)', '// 计数', C.text]];
+  L.forEach(([s, cm, c], i) => { const e = eo(p(t, 55.4 + i*.45, 55.8 + i*.45)), y = 250 + i*50;
+    txt(s, 1320, y, {size:22, weight:600, font:MONO, color:c, align:'left', alpha:e});
+    if (cm) txt(cm, 1790, y, {size:18, weight:600, font:MONO, color:C.muted, align:'right', alpha:e}); });
+  card('空桶：CAS', ['没有竞争，就不加锁'], 120, 800, 540, 200, eo(p(t, 61.4, 61.9)), C.mint);
+  card('非空桶：锁头节点', ['synchronized，锁粒度 = 一个桶'], 690, 800, 540, 200, eo(p(t, 62, 62.5)), C.gold);
+  card('读：完全不加锁', ['数组元素、val、next 都是 volatile'], 1260, 800, 560, 200, eo(p(t, 62.6, 63.1)), C.blue);
+}
+
+/* ============ 场景 7 · 扩容、计数、null、复合操作 (65–78s) ============ */
+function s7(t){
+  rise('扩容、计数、null 和复合操作', W/2, 90, t, 65.2, {size:54, weight:900});
+  const a = eo(p(t, 65.6, 66.1));
+  box(100, 150, 900, 620, a, {fill:'rgba(255,255,255,.03)', stroke:'rgba(255,255,255,.18)', r:24});
+  txt('多个线程一起扩容', 550, 195, {size:30, weight:900, color:C.acc, alpha:a});
+  const prog = p(t, 67, 70), done = Math.floor(prog*16);
+  for (let i = 0; i < 16; i++){ const fwd = 15 - i < done;
+    cell(140 + i*52, 300, 46, 50, a, {label:fwd ? 'F' : '', lc:'#07080f', fill:fwd ? 'rgba(153,246,228,.55)' : 'rgba(255,255,255,.05)', stroke:fwd ? C.acc : 'rgba(255,255,255,.3)'}); }
+  for (let i = 0; i < 32; i++){ const lit = (15 - (i % 16)) < done;
+    box(140 + i*26, 440, 22, 50, a, {fill:lit ? 'rgba(153,246,228,.35)' : 'rgba(255,255,255,.04)', stroke:'rgba(255,255,255,.2)', r:4}); }
+  txt('旧数组', 140, 270, {size:20, weight:700, color:C.muted, align:'left', alpha:a}); txt('新数组（2 倍）', 140, 520, {size:20, weight:700, color:C.muted, align:'left', alpha:a});
+  chip('T1', 140 + 14*52, 380, eo(p(t, 66.4, 66.8)), C.mint, 80); chip('T2', 140 + 9*52, 380, eo(p(t, 67.4, 67.8)), C.gold, 80);
+  txt('从后往前，每个线程认领一段桶（示意）', 760, 270, {size:20, weight:700, color:C.muted, alpha:eo(p(t, 66.6, 67))});
+  txt('迁移完的桶放一个 ForwardingNode（F）', 140, 590, {size:24, weight:800, align:'left', alpha:eo(p(t, 69.2, 69.6))});
+  txt('get 遇到 F → 去新数组里查', 140, 645, {size:24, weight:700, color:C.blue, align:'left', alpha:eo(p(t, 69.8, 70.2))});
+  txt('put 遇到 F → 先帮忙迁移，再写入', 140, 700, {size:24, weight:700, color:C.gold, align:'left', alpha:eo(p(t, 70.3, 70.7))});
+  const b = eo(p(t, 70.6, 71.1));
+  box(1040, 150, 780, 300, b, {fill:'rgba(255,255,255,.03)', stroke:'rgba(255,255,255,.18)', r:24});
+  txt('计数：思路同 LongAdder', 1430, 195, {size:30, weight:900, color:C.acc, alpha:b});
+  cell(1080, 250, 190, 64, b, {label:'baseCount', lc:C.text, size:22});
+  const k = clamp((t - 71.2)*4, 0, 40);
+  ['cell0', 'cell1', 'cell2', 'cell3'].forEach((s, i) => { cell(1300 + i*124, 250, 110, 64, b, {label:s + ':' + Math.floor(k*(1 + i*.3) % 50), lc:C.acc, size:18, fill:'rgba(153,246,228,.08)', stroke:'rgba(153,246,228,.5)'}); });
+  txt('先 CAS 改 baseCount；竞争激烈时，分散到不同的 cell', 1430, 360, {size:22, weight:700, alpha:eo(p(t, 71.4, 71.8))});
+  txt('size() = baseCount + 所有 cell 之和（并发下是近似值）', 1430, 405, {size:22, weight:700, color:C.muted, alpha:eo(p(t, 71.9, 72.3))});
+  const c = eo(p(t, 72.6, 73.1));
+  box(1040, 480, 780, 290, c, {fill:'rgba(255,211,138,.05)', stroke:'rgba(255,211,138,.5)', r:24});
+  txt('为什么不允许 null 键和值？', 1080, 530, {size:28, weight:900, color:C.gold, align:'left', alpha:c});
+  ['get(k) 返回 null：是「没有这个 key」，还是「值是 null」？', '单线程可以再调用 containsKey 确认；', '并发下两次调用之间，别的线程可能已经改了'].forEach((s, i) =>
+    txt(s, 1080, 600 + i*50, {size:22, weight:600, color:'#d9d2e4', align:'left', alpha:eo(p(t, 73.2 + i*.4, 73.6 + i*.4))}));
+  const d = eo(p(t, 74.6, 75.1));
+  box(100, 800, 1720, 220, d, {fill:'rgba(153,246,228,.05)', stroke:'rgba(153,246,228,.5)', r:24});
+  txt('每个方法线程安全 ≠ 组合起来也安全', W/2, 845, {size:30, weight:900, color:C.acc, alpha:d});
+  txt('if (!map.containsKey(k)) map.put(k, v);', 150, 910, {size:24, weight:700, font:MONO, color:C.rose, align:'left', alpha:eo(p(t, 75.4, 75.8))});
+  txt('✗ 两步之间可能被别的线程插队', 150, 965, {size:22, weight:700, color:C.rose, align:'left', alpha:eo(p(t, 75.6, 76))});
+  ['map.putIfAbsent(k, v)', 'map.merge(word, 1, Integer::sum)', 'map.computeIfAbsent(k, f)'].forEach((s, i) =>
+    txt('✓ ' + s, 1040, 900 + i*44, {size:23, weight:700, font:MONO, color:C.mint, align:'left', alpha:eo(p(t, 76 + i*.3, 76.4 + i*.3))}));
+}
+
+/* ============ 场景 8 · 收尾 (78–84s) ============ */
+function s8(t){
+  [['HashMap', '数组 + 链表 + 红黑树'], ['不安全', '丢数据，JDK 7 会成环'], ['JDK 8 CHM', 'CAS + 只锁桶头'], ['复合操作', '用 merge / compute']].forEach(([a, b], i) => {
+    const st = 78.2 + i*.25, e = eback(p(t, st, st + .5)); if (e <= 0) return;
+    const x = 330 + i*420, y = 330;
+    ctx.save(); ctx.translate(x, y); ctx.scale(e, e); ctx.translate(-x, -y);
+    box(x - 185, y - 90, 370, 180, clamp(e), {fill:'rgba(153,246,228,.08)', stroke:'rgba(153,246,228,.5)', r:26}); ctx.restore();
+    txt(a, x, y - 22, {size:40, weight:900, color:C.acc, alpha:clamp(e)}); txt(b, x, y + 40, {size:24, weight:600, color:C.muted, alpha:clamp(e)});
+  });
+  rise('锁的范围越小，能同时干活的线程越多', W/2, 600, t, 79.2, {size:60, weight:900, glow:22});
+  rise('关注拾星，一起搞懂后端', W/2, 760, t, 80, {size:36, weight:500, color:C.muted});
+}
+/* ============ 总调度 ============ */
+const SCENES = [[s1,-1,7],[s2,7,18],[s3,18,31],[s4,31,42],[s5,42,53],[s6,53,65],[s7,65,78],[s8,78,84]];
+function draw(t){
+  t = clamp(t, 0, DUR);
+  ctx.save(); ctx.globalAlpha = 1; ctx.clearRect(0,0,W,H); background(t);
+  for (const [fn,a,b] of SCENES){
+    if (t < a || t > b) continue;
+    SA = sceneA(t, a, b, b === DUR ? .8 : .5);
+    if (SA > 0){ ctx.save(); fn(t); ctx.restore(); }
+  }
+  SA = 1; vignette();
+  const fo = p(t, DUR - .8, DUR);
+  if (fo > 0){ ctx.globalAlpha = fo; ctx.fillStyle = '#000'; ctx.fillRect(0,0,W,H); }
+  ctx.restore();
+}
+
+/* ============ 播放器 / 逐帧渲染接口 ============ */
+const isRender = new URLSearchParams(location.search).has('render');
+window.DURATION = DUR;
+window.renderFrame = t => draw(t);
+const btn = document.getElementById('btn'), seek = document.getElementById('seek'), timeEl = document.getElementById('time');
+const fmt = s => `${Math.floor(s/60)}:${String(Math.floor(s%60)).padStart(2,'0')}`;
+function fit(){
+  if (isRender){ cv.style.width = W+'px'; cv.style.height = H+'px'; return; }
+  const w = Math.min(innerWidth - 32, (innerHeight - 84)*16/9);
+  cv.style.width = w + 'px'; cv.style.height = w*9/16 + 'px';
+}
+addEventListener('resize', fit); fit();
+
+let cur = 0, playing = !isRender, last = null;
+function toggle(){ if (cur >= DUR) cur = 0; playing = !playing; }
+btn.onclick = toggle; cv.onclick = toggle;
+addEventListener('keydown', e => { if (e.code === 'Space'){ e.preventDefault(); toggle(); } });
+seek.oninput = () => { cur = +seek.value; draw(cur); };
+function loop(ts){
+  if (playing && last != null){ cur += (ts - last)/1000; if (cur >= DUR){ cur = DUR; playing = false; } }
+  last = ts; draw(cur);
+  seek.value = cur; timeEl.textContent = `${fmt(cur)} / ${fmt(DUR)}`;
+  btn.textContent = playing ? '❚❚' : (cur >= DUR ? '↺' : '▶');
+  requestAnimationFrame(loop);
+}
+document.fonts.ready.then(() => {
+  window.ready = true;
+  if (isRender) draw(0); else requestAnimationFrame(loop);
+});
+</script>
+</body>
+</html>

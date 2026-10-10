@@ -1,0 +1,422 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>I/O 模型：从 BIO 到 epoll 与 Reactor · 拾星</title>
+<style>
+  :root{--bg:#07080f;--fg:#f4ede4;--muted:#9a93a8;--acc:#f0abfc}
+  html,body{margin:0;height:100%;background:var(--bg);color:var(--fg);
+    font-family:-apple-system,"PingFang SC","Noto Sans SC","Noto Sans CJK SC","Microsoft YaHei",sans-serif}
+  body{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;overflow:hidden}
+  #stage{display:block;background:#07080f;border-radius:12px;box-shadow:0 20px 60px rgba(0,0,0,.55);cursor:pointer}
+  #bar{display:flex;align-items:center;gap:12px;width:min(calc(100vw - 32px),640px)}
+  #btn{width:40px;height:40px;border-radius:50%;border:1px solid rgba(240,171,252,.5);background:transparent;
+    color:var(--acc);font-size:16px;cursor:pointer;flex:none}
+  #seek{flex:1;accent-color:var(--acc)}
+  #time{font-variant-numeric:tabular-nums;font-size:13px;color:var(--muted);min-width:84px;text-align:right}
+  body.render{display:block}
+  body.render #bar{display:none}
+  body.render #stage{border-radius:0;box-shadow:none}
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="bar">
+  <button id="btn" aria-label="播放/暂停">❚❚</button>
+  <input id="seek" type="range" min="0" max="84" step="0.01" value="0">
+  <span id="time">0:00 / 1:24</span>
+</div>
+<script>
+/* ============ 基础设置（横屏 1920×1080） ============ */
+const W = 1920, H = 1080, DUR = 84;
+const cv = document.getElementById('stage'), ctx = cv.getContext('2d');
+cv.width = W; cv.height = H;
+const FONT = '"PingFang SC","Noto Sans SC","Noto Sans CJK SC","Source Han Sans SC","Microsoft YaHei",sans-serif';
+const MONO = '"JetBrains Mono","SF Mono",Menlo,Consolas,"DejaVu Sans Mono","Noto Sans Mono CJK SC","PingFang SC","Microsoft YaHei",monospace';
+const C = {acc:'#f0abfc', mint:'#6ee7c8', gold:'#ffd38a', coral:'#ff9e7a', rose:'#ff8a8a', blue:'#9cc3ff', text:'#f4ede4', muted:'#9a93a8', dim:'#4a4558', panel:'#0f0e1f'};
+
+const clamp = (x,a=0,b=1) => Math.max(a, Math.min(b, x));
+const lerp = (a,b,t) => a + (b-a)*t;
+const p = (t,a,b) => clamp((t-a)/(b-a));
+const eo = x => 1 - Math.pow(1-x, 3);
+const eio = x => x < .5 ? 4*x*x*x : 1 - Math.pow(-2*x+2, 3)/2;
+const eback = x => { const c1=1.70158, c3=c1+1; return 1 + c3*Math.pow(x-1,3) + c1*Math.pow(x-1,2); };
+function rnd(seed){ let s = seed>>>0; return () => { s = (s*1664525 + 1013904223)>>>0; return s/4294967296; }; }
+
+let SA = 1;
+const al = a => { ctx.globalAlpha = clamp(SA*a); };
+const sceneA = (t,a,b,f=.5) => Math.min(p(t,a,a+f), 1 - p(t,b-f,b));
+
+function txt(s, x, y, o = {}){
+  const {size=64, weight=700, color=C.text, alpha=1, align='center', glow=0, scale=1, font=FONT} = o;
+  if (alpha <= 0) return;
+  ctx.save(); al(alpha);
+  ctx.font = `${weight} ${size}px ${font}`;
+  ctx.textAlign = align; ctx.textBaseline = 'middle'; ctx.fillStyle = color;
+  if (glow){ ctx.shadowColor = color; ctx.shadowBlur = glow; }
+  if (scale !== 1){ ctx.translate(x, y); ctx.scale(scale, scale); ctx.fillText(s, 0, 0); }
+  else ctx.fillText(s, x, y);
+  ctx.restore();
+}
+function rise(s, x, y, t, t0, o = {}, d = .7){
+  const e = eo(p(t, t0, t0+d));
+  if (e <= 0) return;
+  txt(s, x, y + (1-e)*36, {...o, alpha:(o.alpha ?? 1)*e});
+}
+function rr(x,y,w,h,r){ ctx.beginPath(); ctx.roundRect(x,y,w,h,r); }
+function box(x, y, w, h, a, o = {}){
+  const {fill='rgba(255,255,255,.05)', stroke='rgba(240,171,252,.35)', lw=2, glow=0, r=18, dash=null} = o;
+  if (a <= 0) return;
+  ctx.save(); al(a); rr(x, y, w, h, r); ctx.fillStyle = fill; ctx.fill();
+  if (dash) ctx.setLineDash(dash);
+  ctx.strokeStyle = stroke; ctx.lineWidth = lw; if (glow){ ctx.shadowColor = stroke; ctx.shadowBlur = glow; } ctx.stroke(); ctx.restore();
+}
+function arrow(x1, y1, x2, y2, e, a, color = C.acc, lw = 3){
+  if (e <= 0 || a <= 0) return;
+  const x = lerp(x1, x2, e), y = lerp(y1, y2, e), ang = Math.atan2(y2 - y1, x2 - x1);
+  ctx.save(); al(a); ctx.strokeStyle = color; ctx.fillStyle = color; ctx.lineWidth = lw; ctx.lineCap = 'round';
+  ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x, y); ctx.stroke();
+  if (e > .85){ ctx.translate(x, y); ctx.rotate(ang); ctx.beginPath(); ctx.moveTo(4, 0); ctx.lineTo(-14, -9); ctx.lineTo(-14, 9); ctx.closePath(); ctx.fill(); }
+  ctx.restore();
+}
+function panel(x, y, w, h, title, a){
+  box(x, y, w, h, a, {fill:C.panel, stroke:'rgba(255,255,255,.1)', r:20});
+  if (a <= 0) return;
+  ctx.save(); al(a); ctx.strokeStyle = 'rgba(255,255,255,.07)'; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(x, y + 52); ctx.lineTo(x + w, y + 52); ctx.stroke();
+  ['#ff6b6b','#ffd166','#6ee7a0'].forEach((c, i) => { ctx.fillStyle = c; ctx.globalAlpha = clamp(SA*a*.8); ctx.beginPath(); ctx.arc(x + 30 + i*24, y + 26, 7, 0, 6.283); ctx.fill(); });
+  ctx.restore();
+  txt(title, x + w/2, y + 27, {size:22, weight:500, color:C.muted, font:MONO, alpha:a});
+}
+
+/* ============ 背景 ============ */
+const PARTS = (() => { const r = rnd(281); return Array.from({length:100}, () => ({
+  x:r()*W, y:r()*H, s:r()*2.2+.5, v:r()*12+4, ph:r()*6.283, c:r()<.25})); })();
+function background(t){
+  const g = ctx.createLinearGradient(0,0,W,H);
+  g.addColorStop(0,'#0a0916'); g.addColorStop(.55,'#110f24'); g.addColorStop(1,'#18122c');
+  ctx.globalAlpha = 1; ctx.fillStyle = g; ctx.fillRect(0,0,W,H);
+  const gx = W*.5 + Math.sin(t*.27)*140;
+  const rg = ctx.createRadialGradient(gx, H*.45, 0, gx, H*.45, 950);
+  rg.addColorStop(0,'rgba(240,171,252,0.09)'); rg.addColorStop(1,'rgba(240,171,252,0)');
+  ctx.fillStyle = rg; ctx.fillRect(0,0,W,H);
+  ctx.fillStyle = C.acc;
+  for (let x = 40; x < W; x += 80) for (let y = 40; y < H; y += 80){ ctx.globalAlpha = .06; ctx.fillRect(x, y, 2, 2); }
+  for (const q of PARTS){
+    const y = ((q.y - t*q.v) % H + H) % H, x = q.x + Math.sin(t*.35 + q.ph)*12;
+    ctx.globalAlpha = .2 + .3*(.5 + .5*Math.sin(t*1.2 + q.ph));
+    ctx.fillStyle = q.c ? C.acc : '#d8d0ff';
+    ctx.beginPath(); ctx.arc(x, y, q.s, 0, 6.283); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+}
+function vignette(){
+  const v = ctx.createRadialGradient(W/2, H/2, W*.28, W/2, H/2, W*.62);
+  v.addColorStop(0,'rgba(0,0,0,0)'); v.addColorStop(1,'rgba(0,0,0,.55)');
+  ctx.globalAlpha = 1; ctx.fillStyle = v; ctx.fillRect(0,0,W,H);
+}
+function codeLine(s, x, y, size, a, kw = /\b(public|class|static|void|new|return)\b/){
+  const parts = s.split(/("[^"]*"|\b(?:public|class|static|void|new|return|getstatic|ldc|invokevirtual)\b)/g);
+  ctx.save(); al(a); ctx.font = `500 ${size}px ${MONO}`; ctx.textBaseline = 'middle'; ctx.textAlign = 'left';
+  let xx = x;
+  for (const seg of parts){ if (!seg) continue;
+    ctx.fillStyle = seg.startsWith('"') ? C.mint : /^(public|class|static|void|new|return|getstatic|ldc|invokevirtual)$/.test(seg) ? C.acc : C.text;
+    ctx.fillText(seg, xx, y); xx += ctx.measureText(seg).width; }
+  ctx.restore();
+}
+
+function card(h, lines, x, y, w, hh, a, c = C.acc, o = {}){
+  const {hs=30, ls=22, lh=40} = o;
+  box(x, y, w, hh, a, {fill:'rgba(240,171,252,.05)', stroke:c === C.acc ? 'rgba(240,171,252,.5)' : c, r:20});
+  txt(h, x + 30, y + 44, {size:hs, weight:900, color:c, align:'left', alpha:a});
+  lines.forEach((s, i) => txt(s, x + 30, y + 96 + i*lh, {size:ls, weight:600, color:'#d9d2e4', align:'left', alpha:a}));
+}
+function chip(s, x, y, w, h, a, o = {}){
+  const {fill='rgba(255,255,255,.06)', stroke='rgba(255,255,255,.3)', size=24, color=C.text, sub, font=FONT, glow=0, dash=null} = o;
+  box(x, y, w, h, a, {fill, stroke, r:14, glow, dash});
+  txt(s, x + w/2, y + h/2 - (sub ? 13 : 0), {size, weight:800, color, alpha:a, font});
+  if (sub) txt(sub, x + w/2, y + h/2 + 20, {size:18, weight:600, color:C.muted, alpha:a});
+}
+function dot(x, y, r, a, col, glow = 0){
+  if (a <= 0) return;
+  ctx.save(); al(a); ctx.fillStyle = col; if (glow){ ctx.shadowColor = col; ctx.shadowBlur = glow; }
+  ctx.beginPath(); ctx.arc(x, y, r, 0, 6.283); ctx.fill(); ctx.restore();
+}
+function line(x1, y1, x2, y2, a, col, lw = 2, dash = null){
+  if (a <= 0) return;
+  ctx.save(); al(a); ctx.strokeStyle = col; ctx.lineWidth = lw; if (dash) ctx.setLineDash(dash);
+  ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x2, y2); ctx.stroke(); ctx.restore();
+}
+const ACC_F = 'rgba(240,171,252,.12)', ACC_S = 'rgba(240,171,252,.55)';
+
+/* ============ 场景 1 · 钩子 (0–7s) ============ */
+function s1(t){
+  rise('一万个连接，就要开一万个线程吗？', W/2, 110, t, .2, {size:56, weight:900});
+  const a = eo(p(t, .8, 1.3));
+  panel(120, 190, 820, 600, '一个连接一个线程', a);
+  const k = eio(p(t, 1.2, 3.4)), n = Math.round(lerp(1, 10000, k*k)), shown = Math.ceil(k*112);
+  for (let i = 0; i < 112; i++){
+    if (i >= shown) break;
+    const cx = 160 + (i % 16)*46, cy = 262 + Math.floor(i/16)*46, hot = clamp(k*1.3 - .3);
+    box(cx, cy, 36, 36, a, {fill:`rgba(255,138,138,${.10 + .25*hot})`, stroke:`rgba(255,138,138,${.35 + .4*hot})`, r:7, lw:1.5});
+  }
+  txt('线程数：' + n.toLocaleString('en-US'), 530, 630, {size:36, weight:900, font:MONO, color:k > .7 ? C.rose : C.text, alpha:a});
+  txt('绝大多数线程都卡在「等数据」，什么也没干', 530, 690, {size:24, weight:700, color:C.muted, alpha:eo(p(t, 2.6, 3))});
+  txt('栈内存 + 上下文切换，机器先扛不住了', 530, 742, {size:26, weight:800, color:C.rose, alpha:eo(p(t, 3.2, 3.6))});
+  const b = eo(p(t, 3.4, 3.9)), cx = 1390, cy = 440;
+  panel(980, 190, 820, 600, 'Redis（6.0 之前）', b);
+  for (let i = 0; i < 20; i++){
+    const ang = i/20*6.283 - 1.57, x = cx + Math.cos(ang)*175, y = cy + Math.sin(ang)*150, on = Math.sin(t*3 + i*1.7) > .6;
+    line(cx + Math.cos(ang)*64, cy + Math.sin(ang)*64, x, y, b*(on ? .9 : .25), on ? C.acc : 'rgba(255,255,255,.4)', on ? 3 : 1.5);
+    dot(x, y, 11, b, on ? C.acc : '#8a8398', on ? 14 : 0);
+  }
+  dot(cx, cy, 62, b, 'rgba(240,171,252,.18)'); box(cx - 62, cy - 62, 124, 124, b, {fill:'rgba(0,0,0,0)', stroke:C.acc, r:62, glow:18});
+  txt('1 个线程', cx, cy, {size:26, weight:900, color:C.acc, alpha:b});
+  txt('一个主线程处理所有连接的读写和命令', cx, 670, {size:26, weight:800, alpha:eo(p(t, 4, 4.4))});
+  txt('照样能扛住上万个连接', cx, 724, {size:24, weight:700, color:C.mint, alpha:eo(p(t, 4.4, 4.8))});
+  const c = eo(p(t, 5, 5.5));
+  box(510, 830, 900, 100, c, {fill:'rgba(240,171,252,.12)', stroke:C.acc, r:24, glow:20});
+  txt('秘诀：I/O 多路复用（epoll）+ 事件循环', W/2, 880, {size:36, weight:900, color:C.acc, alpha:c});
+  rise('一个线程，怎么同时盯住上万个连接？', W/2, 1000, t, 5.8, {size:32, weight:800, color:C.gold});
+}
+
+/* ============ 场景 2 · 两个阶段 + 零拷贝 (7–19s) ============ */
+function s2(t){
+  rise('一次 read()，其实分两步', W/2, 90, t, 7.2, {size:56, weight:900});
+  const a = eo(p(t, 7.6, 8.1));
+  [['用户空间', 180, 170, 'rgba(240,171,252,.05)'], ['内核空间', 380, 230, 'rgba(255,255,255,.04)'], ['硬件', 640, 130, 'rgba(255,255,255,.025)']].forEach(([s, y, h, f]) => {
+    box(100, y, 1080, h, a, {fill:f, stroke:'rgba(255,255,255,.16)', r:16}); txt(s, 130, y + 32, {size:22, weight:800, color:C.muted, align:'left', alpha:a}); });
+  chip('应用线程', 160, 240, 260, 90, a, {sub:'调用 read(fd, buf)'});
+  chip('用户缓冲区 buf', 760, 240, 360, 90, a, {fill:ACC_F, stroke:ACC_S});
+  chip('Socket 接收缓冲区', 760, 470, 360, 100, a);
+  chip('网卡', 230, 670, 240, 80, a);
+  // 阶段 ①：数据从网卡到内核缓冲区
+  const e1 = eo(p(t, 8.8, 9.6));
+  arrow(470, 700, 755, 545, e1, a, C.gold, 4);
+  txt('①', 560, 590, {size:34, weight:900, color:C.gold, alpha:e1});
+  const pk = p(t, 9.6, 11.2);
+  for (let i = 0; i < 4; i++){ const q = clamp(pk*1.6 - i*.2); if (q > 0 && q < 1) dot(lerp(480, 750, q), lerp(696, 548, q), 9, a, C.gold, 10); }
+  const fill1 = clamp(p(t, 10, 11.6)) - clamp(p(t, 12.6, 13.4));
+  if (fill1 > 0) box(780, 546, 320*fill1, 14, a, {fill:C.gold, stroke:C.gold, r:6});
+  // 阶段 ②：内核 → 用户
+  const e2 = eo(p(t, 12, 12.6));
+  arrow(940, 466, 940, 336, e2, a, C.acc, 4);
+  txt('②', 990, 400, {size:34, weight:900, color:C.acc, alpha:e2});
+  const fill2 = clamp(p(t, 12.6, 13.4));
+  if (fill2 > 0) box(780, 316, 320*fill2, 12, a, {fill:C.acc, stroke:C.acc, r:6});
+  const done = t > 13.4;
+  txt(done ? '拿到数据 ✓' : '等待中…', 590, 285, {size:24, weight:800, color:done ? C.mint : C.rose, alpha:a});
+  txt('① 等待数据就绪：数据包到达网卡，放进内核的 Socket 缓冲区（可能要等很久）', 100, 830, {size:24, weight:700, color:C.gold, align:'left', alpha:eo(p(t, 9.4, 9.9))});
+  txt('② 拷贝数据：内核把数据从 Socket 缓冲区拷贝到用户的 buf（很快，但要占用 CPU）', 100, 885, {size:24, weight:700, color:C.acc, align:'left', alpha:eo(p(t, 12.4, 12.9))});
+  rise('各种 I/O 模型的区别：在这两个阶段里，线程要不要等、由谁来等', 640, 960, t, 14, {size:26, weight:900, color:C.text});
+  card('顺带一提：零拷贝', ['发文件的老办法：read + write', '磁盘 → 内核 → 用户 → 内核 → 网卡', '数据在用户空间白白绕一圈'], 1240, 180, 580, 290, eo(p(t, 15.2, 15.7)), C.acc, {ls:22, lh:42});
+  card('sendfile / mmap', ['sendfile：页缓存直接送进 socket，', '数据不进用户空间', 'mmap：把文件映射进进程地址空间', 'CPU 拷贝和上下文切换都更少'], 1240, 500, 580, 320, eo(p(t, 16.3, 16.8)), C.mint, {ls:22, lh:42});
+  rise('Kafka、Nginx 发文件都用到了它', 1530, 885, t, 17.2, {size:22, weight:700, color:C.muted});
+}
+
+/* ============ 场景 3 · BIO 与非阻塞 (19–31s) ============ */
+function s3(t){
+  rise('阻塞 I/O 与非阻塞 I/O', W/2, 90, t, 19.2, {size:56, weight:900});
+  const a = eo(p(t, 19.6, 20.1));
+  box(100, 170, 820, 680, a, {fill:'rgba(255,255,255,.03)', stroke:'rgba(255,255,255,.18)', r:24});
+  txt('阻塞 I/O（BIO）', 510, 225, {size:38, weight:900, color:C.gold, alpha:a});
+  for (let i = 0; i < 4; i++){
+    const e = eo(p(t, 20.3 + i*.35, 20.7 + i*.35)), y = 290 + i*88;
+    if (i === 3){ txt('……  × 10000', 510, y + 30, {size:28, weight:800, font:MONO, color:C.muted, alpha:e}); continue; }
+    chip('连接 ' + (i + 1), 150, y, 170, 60, e, {size:22});
+    arrow(326, y + 30, 400, y + 30, e, e, C.muted, 2.5);
+    chip('线程 ' + (i + 1), 410, y, 170, 60, e, {size:22, fill:'rgba(255,211,138,.10)', stroke:C.gold});
+    txt('阻塞在 read()…', 610, y + 30, {size:22, weight:700, font:MONO, color:C.rose, align:'left', alpha:e*(.6 + .4*Math.sin(t*4 + i))});
+  }
+  txt('✓ 代码直观：一个连接就是一段顺序逻辑', 150, 690, {size:25, weight:700, color:C.mint, align:'left', alpha:eo(p(t, 22.2, 22.6))});
+  txt('✗ C10K：上万连接 = 上万线程', 150, 745, {size:25, weight:700, color:C.rose, align:'left', alpha:eo(p(t, 22.8, 23.2))});
+  txt('    内存和上下文切换都扛不住', 150, 795, {size:25, weight:700, color:C.rose, align:'left', alpha:eo(p(t, 22.8, 23.2))});
+  const b = eo(p(t, 23.8, 24.3));
+  box(1000, 170, 820, 680, b, {fill:'rgba(255,255,255,.03)', stroke:'rgba(255,255,255,.18)', r:24});
+  txt('非阻塞 I/O', 1410, 225, {size:38, weight:900, color:C.acc, alpha:b});
+  const rows = ['read(fd) → EAGAIN  还没数据', 'read(fd) → EAGAIN  还没数据', 'read(fd) → EAGAIN  还没数据', 'read(fd) → EAGAIN  还没数据', 'read(fd) → 128 字节  ✓'];
+  rows.forEach((s, i) => { const e = eo(p(t, 24.4 + i*.35, 24.7 + i*.35)), last = i === 4;
+    txt(s, 1060, 300 + i*58, {size:24, weight:600, font:MONO, color:last ? C.mint : C.muted, align:'left', alpha:e}); });
+  txt('↑ 第 ② 步拷贝时，线程仍然要等', 1060, 600, {size:22, weight:700, color:C.gold, align:'left', alpha:eo(p(t, 26.4, 26.8))});
+  txt('✓ 线程不会卡死，可以去干别的', 1050, 690, {size:25, weight:700, color:C.mint, align:'left', alpha:eo(p(t, 27, 27.4))});
+  txt('✗ 只能反复轮询：一万个连接问一圈，', 1050, 745, {size:25, weight:700, color:C.rose, align:'left', alpha:eo(p(t, 27.6, 28))});
+  txt('    大部分是白问，CPU 空转', 1050, 795, {size:25, weight:700, color:C.rose, align:'left', alpha:eo(p(t, 27.6, 28))});
+  rise('要是内核能直接告诉我「哪些连接有数据了」就好了 → I/O 多路复用', W/2, 940, t, 28.6, {size:30, weight:900, color:C.gold});
+}
+
+/* ============ 场景 4 · select / poll / epoll (31–44s) ============ */
+function s4(t){
+  rise('I/O 多路复用：select → poll → epoll', W/2, 90, t, 31.2, {size:54, weight:900});
+  const flow = [['1 个线程', 160, 240], ['同时等很多 fd', 520, 330], ['返回就绪的 fd', 970, 300], ['只对它们 read', 1390, 300]];
+  flow.forEach(([s, x, w], i) => { const e = eo(p(t, 31.6 + i*.4, 32 + i*.4));
+    chip(s, x, 180, w, 80, e, i === 1 ? {fill:ACC_F, stroke:C.acc, color:C.acc} : {});
+    if (i) arrow(flow[i - 1][1] + flow[i - 1][2] + 8, 220, x - 8, 220, e, e, C.acc, 3); });
+  const cols = [
+    ['select', ['fd_set 位图，最多 1024 个 fd', '每次调用都把整个集合拷进内核', '内核遍历全部 fd', '返回后，用户还要再遍历一遍'], 'O(n)', C.rose, 33.6],
+    ['poll', ['pollfd 数组，没有 1024 的上限', '但每次仍要全量拷贝', '内核仍要遍历全部 fd', '连接越多越慢'], 'O(n)', C.gold, 35.4],
+    ['epoll', ['epoll_ctl 注册一次，长期有效', '内核用红黑树管理所有 fd', '数据到达时回调，放进就绪链表', 'epoll_wait 只返回就绪的 fd'], 'O(就绪数)', C.mint, 37.2]];
+  cols.forEach(([h, ls, big, c, ts], i) => { const e = eo(p(t, ts, ts + .5)), x = 120 + i*570;
+    box(x, 310, 540, 540, e, {fill:'rgba(255,255,255,.03)', stroke:i === 2 ? C.acc : 'rgba(255,255,255,.2)', r:22, glow:i === 2 ? 14 : 0});
+    txt(h, x + 270, 365, {size:42, weight:900, font:MONO, color:i === 2 ? C.acc : C.text, alpha:e});
+    ls.forEach((s, j) => txt(s, x + 36, 445 + j*62, {size:23, weight:600, color:'#d9d2e4', align:'left', alpha:eo(p(t, ts + .3 + j*.25, ts + .7 + j*.25))}));
+    txt(big, x + 270, 770, {size:40, weight:900, font:MONO, color:c, alpha:eo(p(t, ts + 1.2, ts + 1.6))}); });
+  rise('Redis、Nginx、Netty、Java NIO 在 Linux 上，底层都是 epoll', W/2, 930, t, 39.6, {size:30, weight:900, color:C.gold});
+  rise('连接数多、活跃的少（大多数长连接都在发呆）时，epoll 的优势最明显', W/2, 995, t, 40.6, {size:24, weight:700, color:C.muted});
+}
+
+/* ============ 场景 5 · epoll 内部 + LT/ET (44–55s) ============ */
+function s5(t){
+  rise('epoll 内部：红黑树 + 就绪链表', W/2, 90, t, 44.2, {size:54, weight:900});
+  const a = eo(p(t, 44.6, 45.1));
+  box(100, 170, 880, 640, a, {fill:'rgba(255,255,255,.03)', stroke:'rgba(255,255,255,.18)', r:24});
+  txt('epoll 实例（在内核里）', 540, 215, {size:28, weight:900, color:C.acc, alpha:a});
+  txt('红黑树：所有被监听的 fd', 340, 270, {size:22, weight:700, color:C.muted, alpha:a});
+  const N = [[7, 340, 330], [3, 230, 420], [12, 450, 420], [1, 170, 510], [5, 290, 510], [9, 400, 510], [15, 510, 510]];
+  const E = [[0, 1], [0, 2], [1, 3], [1, 4], [2, 5], [2, 6]];
+  E.forEach(([i, j]) => line(N[i][1], N[i][2], N[j][1], N[j][2], a*.6, 'rgba(255,255,255,.4)', 2));
+  const hits = {5:46.6, 12:47.8};
+  N.forEach(([fd, x, y], i) => { const h = hits[fd], on = h && t > h, red = i === 1 || i === 2;
+    dot(x, y, 30, a, on ? C.acc : (red ? 'rgba(255,138,138,.55)' : 'rgba(80,76,96,.95)'), on ? 18 : 0);
+    txt(String(fd), x, y, {size:24, weight:900, font:MONO, color:on ? '#1a0f22' : C.text, alpha:a}); });
+  txt('epoll_ctl 增删 fd：O(log n)', 340, 600, {size:22, weight:700, font:MONO, color:C.muted, alpha:eo(p(t, 45.6, 46))});
+  txt('就绪链表', 790, 270, {size:22, weight:700, color:C.muted, alpha:a});
+  box(670, 300, 240, 260, a, {fill:'rgba(240,171,252,.05)', stroke:'rgba(240,171,252,.4)', r:14, dash:[8, 6]});
+  [[5, 46.6, 290, 510], [12, 47.8, 450, 420]].forEach(([fd, ts, sx, sy], i) => { const k = eio(p(t, ts, ts + .8)); if (k <= 0) return;
+    const x = lerp(sx, 790, k), y = lerp(sy, 350 + i*80, k);
+    chip('fd ' + fd, x - 90, y - 30, 180, 60, 1, {fill:ACC_F, stroke:C.acc, color:C.acc, font:MONO, size:24}); });
+  txt('数据到达 → 回调 → 放进就绪链表', 790, 600, {size:22, weight:700, color:C.acc, alpha:eo(p(t, 46.8, 47.2))});
+  const w = eo(p(t, 49, 49.5));
+  box(140, 660, 800, 110, w, {fill:'rgba(134,239,172,.08)', stroke:C.mint, r:16});
+  txt('epoll_wait() → [5, 12]', 540, 696, {size:30, weight:800, font:MONO, color:C.mint, alpha:w});
+  txt('只把就绪的 fd 交给用户，不用再遍历全部', 540, 740, {size:22, weight:700, alpha:w});
+  card('LT 水平触发（默认）', ['缓冲区里还有数据，', '每次 epoll_wait 都会再通知', '没读完也不怕，下次还会提醒', 'Java NIO 的 Selector 就是这种'], 1030, 170, 790, 300, eo(p(t, 50.4, 50.9)), C.acc, {ls:23, lh:46});
+  card('ET 边缘触发', ['只在「有新数据到来」时通知一次', '没读完的数据，要等新数据来才会再提醒', '所以 fd 要设成非阻塞，一直读到 EAGAIN', '通知次数少，Nginx 用的就是 ET'], 1030, 500, 790, 310, eo(p(t, 52, 52.5)), C.gold, {ls:23, lh:46});
+  rise('LT 更不容易出错；ET 效率更高，但读写必须循环到底', W/2, 900, t, 53.4, {size:28, weight:800, color:C.gold});
+}
+
+/* ============ 场景 6 · 五种 I/O 模型 (55–66s) ============ */
+function s6(t){
+  rise('五种 I/O 模型：看两个阶段谁在等', W/2, 90, t, 55.2, {size:54, weight:900});
+  const a = eo(p(t, 55.6, 56.1));
+  txt('① 等数据', 260, 280, {size:28, weight:900, color:C.gold, alpha:a}); txt('② 拷数据', 260, 440, {size:28, weight:900, color:C.acc, alpha:a});
+  const B = ['rgba(255,138,138,.16)', C.rose], F = ['rgba(134,239,172,.12)', C.mint], Y = ['rgba(255,211,138,.12)', C.gold];
+  const M = [['阻塞 I/O', ['阻塞', B], ['阻塞', B]], ['非阻塞 I/O', ['反复轮询', Y], ['阻塞', B]], ['I/O 多路复用', ['阻塞在 epoll_wait', Y, '一次等很多 fd'], ['阻塞', B]],
+             ['信号驱动', ['不阻塞', F, '内核发 SIGIO'], ['阻塞', B]], ['异步 I/O', ['不阻塞', F], ['不阻塞', F, '内核拷完再通知']]];
+  M.forEach(([h, c1, c2], i) => { const e = eo(p(t, 56.2 + i*.45, 56.7 + i*.45)), x = 400 + i*286;
+    txt(h, x + 130, 190, {size:27, weight:900, alpha:e});
+    [c1, c2].forEach(([s, [f, st], sub], j) => { const y = 225 + j*160;
+      box(x, y, 260, 130, e, {fill:f, stroke:st, r:16});
+      txt(s, x + 130, y + 65 - (sub ? 16 : 0), {size:26, weight:900, color:st, alpha:e});
+      if (sub) txt(sub, x + 130, y + 65 + 24, {size:19, weight:700, color:C.text, alpha:e}); }); });
+  const b = eo(p(t, 58.8, 59.3));
+  line(405, 560, 1513, 560, b, C.muted, 3); line(405, 548, 405, 560, b, C.muted, 3); line(1513, 548, 1513, 560, b, C.muted, 3);
+  txt('同步 I/O：第 ② 步都要线程自己等', 959, 600, {size:24, weight:800, color:C.muted, alpha:b});
+  line(1549, 560, 1799, 560, b, C.acc, 3); line(1549, 548, 1549, 560, b, C.acc, 3); line(1799, 548, 1799, 560, b, C.acc, 3);
+  txt('异步 I/O', 1674, 600, {size:24, weight:900, color:C.acc, alpha:b});
+  card('阻塞 vs 非阻塞', ['看调用本身：数据没好时，', '是等着，还是立刻返回'], 120, 660, 820, 210, eo(p(t, 60, 60.5)), C.gold);
+  card('同步 vs 异步', ['看结果怎么来：是你自己去取（同步），', '还是内核弄好了通知你（异步）'], 980, 660, 820, 210, eo(p(t, 61, 61.5)));
+  rise('Linux 上的真异步：io_uring（5.1 起），提交队列 + 完成队列，系统调用更少', W/2, 950, t, 62.4, {size:26, weight:800, color:C.text});
+  rise('「非阻塞」≠「异步」：epoll 是同步非阻塞', W/2, 1010, t, 63.4, {size:26, weight:800, color:C.gold});
+}
+
+/* ============ 场景 7 · Reactor (66–78s) ============ */
+function s7(t){
+  rise('Reactor 模式：把多路复用组织起来', W/2, 90, t, 66.2, {size:54, weight:900});
+  rise('Java NIO 三件套：Channel（连接）· Buffer（数据）· Selector（多路复用器）', W/2, 158, t, 66.6, {size:26, weight:700, color:C.muted});
+  const cols = [['单 Reactor 单线程', 67.2], ['单 Reactor 多线程', 69.4], ['主从 Reactor', 71.6]];
+  cols.forEach(([h, ts], i) => { const e = eo(p(t, ts, ts + .5)), x = 120 + i*570, cx = x + 270;
+    box(x, 210, 540, 640, e, {fill:'rgba(255,255,255,.03)', stroke:i === 2 ? C.acc : 'rgba(255,255,255,.2)', r:22});
+    txt(h, cx, 258, {size:32, weight:900, color:i === 2 ? C.acc : C.text, alpha:e});
+    const e2 = eo(p(t, ts + .4, ts + .9)), e3 = eo(p(t, ts + .8, ts + 1.3));
+    if (i < 2){
+      chip('Reactor', cx - 150, 300, 300, 84, e2, {fill:ACC_F, stroke:C.acc, color:C.acc, sub:'epoll_wait + 分发'});
+      chip('Acceptor', x + 40, 450, 210, 70, e3, {size:22, sub:null});
+      chip('Handler', x + 290, 450, 210, 70, e3, {size:22});
+      arrow(cx - 60, 388, x + 150, 444, e3, e3, C.acc, 2.5); arrow(cx + 60, 388, x + 390, 444, e3, e3, C.acc, 2.5);
+      txt('建立连接', x + 145, 545, {size:19, weight:700, color:C.muted, alpha:e3});
+      txt(i === 0 ? 'read → 业务 → write' : 'read / write', x + 395, 545, {size:19, weight:700, color:C.muted, alpha:e3});
+      if (i === 0){
+        box(x + 20, 285, 500, 290, e3, {fill:'rgba(0,0,0,0)', stroke:C.gold, r:18, dash:[8, 6]});
+        txt('以上全在 1 个线程里', cx, 610, {size:22, weight:800, color:C.gold, alpha:e3});
+      } else {
+        arrow(x + 395, 566, x + 395, 606, e3, e3, C.gold, 2.5);
+        chip('业务线程池', x + 290, 610, 210, 64, e3, {size:22, fill:'rgba(255,211,138,.10)', stroke:C.gold, color:C.gold});
+        txt('耗时计算交出去', x + 150, 642, {size:19, weight:700, color:C.muted, alpha:e3});
+      }
+    } else {
+      chip('主 Reactor', cx - 150, 300, 300, 84, e2, {fill:ACC_F, stroke:C.acc, color:C.acc, sub:'只负责 accept'});
+      [0, 1, 2].forEach(j => { const sx = x + 30 + j*165;
+        chip('从 Reactor', sx, 450, 150, 70, e3, {size:20, sub:null});
+        arrow(cx, 388, sx + 75, 444, e3, e3, C.acc, 2.5); });
+      txt('各自一个 epoll，负责读写', cx, 545, {size:19, weight:700, color:C.muted, alpha:e3});
+      arrow(cx, 566, cx, 606, e3, e3, C.gold, 2.5);
+      chip('业务线程池（可选）', cx - 150, 610, 300, 64, e3, {size:22, fill:'rgba(255,211,138,.10)', stroke:C.gold, color:C.gold});
+    }
+    const notes = [['Redis 6.0 之前的主流程', '简单、无锁；一个慢命令卡住所有人'], ['I/O 在 Reactor，计算进线程池', '一个 Reactor 扛全部 I/O，仍是瓶颈'], ['Netty：boss 接连接，worker 读写', 'Kafka 的网络层也是这个结构']][i];
+    const e4 = eo(p(t, ts + 1.2, ts + 1.7));
+    txt(notes[0], cx, 740, {size:23, weight:800, color:C.text, alpha:e4}); txt(notes[1], cx, 790, {size:21, weight:600, color:C.muted, alpha:e4}); });
+  rise('Reactor = 事件循环：等事件 → 分发 → 处理（同步非阻塞）', W/2, 920, t, 74, {size:30, weight:900, color:C.gold});
+  rise('它的异步版本叫 Proactor（如 Windows 的 IOCP）', W/2, 985, t, 75, {size:24, weight:700, color:C.muted});
+}
+
+/* ============ 场景 8 · 收尾 (78–84s) ============ */
+function s8(t){
+  [['两个阶段', '等数据 + 拷数据'], ['BIO', '一连接一线程'], ['epoll', '只返回就绪的 fd'], ['Reactor', '事件循环 + 分发']].forEach(([a, b], i) => {
+    const st = 78.2 + i*.25, e = eback(p(t, st, st + .5)); if (e <= 0) return;
+    const x = 330 + i*420, y = 330;
+    ctx.save(); ctx.translate(x, y); ctx.scale(e, e); ctx.translate(-x, -y);
+    box(x - 185, y - 90, 370, 180, clamp(e), {fill:'rgba(240,171,252,.08)', stroke:'rgba(240,171,252,.5)', r:26}); ctx.restore();
+    txt(a, x, y - 22, {size:40, weight:900, color:C.acc, alpha:clamp(e)}); txt(b, x, y + 40, {size:24, weight:600, color:C.muted, alpha:clamp(e)});
+  });
+  rise('别让线程等数据，让就绪的数据来找线程', W/2, 600, t, 79.2, {size:58, weight:900, glow:22});
+  rise('关注拾星，一起搞懂后端', W/2, 760, t, 80, {size:36, weight:500, color:C.muted});
+}
+/* ============ 总调度 ============ */
+const SCENES = [[s1,-1,7],[s2,7,19],[s3,19,31],[s4,31,44],[s5,44,55],[s6,55,66],[s7,66,78],[s8,78,84]];
+function draw(t){
+  t = clamp(t, 0, DUR);
+  ctx.save(); ctx.globalAlpha = 1; ctx.clearRect(0,0,W,H); background(t);
+  for (const [fn,a,b] of SCENES){
+    if (t < a || t > b) continue;
+    SA = sceneA(t, a, b, b === DUR ? .8 : .5);
+    if (SA > 0){ ctx.save(); fn(t); ctx.restore(); }
+  }
+  SA = 1; vignette();
+  const fo = p(t, DUR - .8, DUR);
+  if (fo > 0){ ctx.globalAlpha = fo; ctx.fillStyle = '#000'; ctx.fillRect(0,0,W,H); }
+  ctx.restore();
+}
+
+/* ============ 播放器 / 逐帧渲染接口 ============ */
+const isRender = new URLSearchParams(location.search).has('render');
+window.DURATION = DUR;
+window.renderFrame = t => draw(t);
+const btn = document.getElementById('btn'), seek = document.getElementById('seek'), timeEl = document.getElementById('time');
+const fmt = s => `${Math.floor(s/60)}:${String(Math.floor(s%60)).padStart(2,'0')}`;
+function fit(){
+  if (isRender){ cv.style.width = W+'px'; cv.style.height = H+'px'; return; }
+  const w = Math.min(innerWidth - 32, (innerHeight - 84)*16/9);
+  cv.style.width = w + 'px'; cv.style.height = w*9/16 + 'px';
+}
+addEventListener('resize', fit); fit();
+
+let cur = 0, playing = !isRender, last = null;
+function toggle(){ if (cur >= DUR) cur = 0; playing = !playing; }
+btn.onclick = toggle; cv.onclick = toggle;
+addEventListener('keydown', e => { if (e.code === 'Space'){ e.preventDefault(); toggle(); } });
+seek.oninput = () => { cur = +seek.value; draw(cur); };
+function loop(ts){
+  if (playing && last != null){ cur += (ts - last)/1000; if (cur >= DUR){ cur = DUR; playing = false; } }
+  last = ts; draw(cur);
+  seek.value = cur; timeEl.textContent = `${fmt(cur)} / ${fmt(DUR)}`;
+  btn.textContent = playing ? '❚❚' : (cur >= DUR ? '↺' : '▶');
+  requestAnimationFrame(loop);
+}
+document.fonts.ready.then(() => {
+  window.ready = true;
+  if (isRender) draw(0); else requestAnimationFrame(loop);
+});
+</script>
+</body>
+</html>

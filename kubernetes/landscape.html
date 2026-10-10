@@ -1,0 +1,399 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Kubernetes 入门：容器的调度员 · 拾星</title>
+<style>
+  :root{--bg:#07080f;--fg:#f4ede4;--muted:#9a93a8;--acc:#93c5fd}
+  html,body{margin:0;height:100%;background:var(--bg);color:var(--fg);
+    font-family:-apple-system,"PingFang SC","Noto Sans SC","Noto Sans CJK SC","Microsoft YaHei",sans-serif}
+  body{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;overflow:hidden}
+  #stage{display:block;background:#07080f;border-radius:12px;box-shadow:0 20px 60px rgba(0,0,0,.55);cursor:pointer}
+  #bar{display:flex;align-items:center;gap:12px;width:min(calc(100vw - 32px),640px)}
+  #btn{width:40px;height:40px;border-radius:50%;border:1px solid rgba(147,197,253,.5);background:transparent;
+    color:var(--acc);font-size:16px;cursor:pointer;flex:none}
+  #seek{flex:1;accent-color:var(--acc)}
+  #time{font-variant-numeric:tabular-nums;font-size:13px;color:var(--muted);min-width:84px;text-align:right}
+  body.render{display:block}
+  body.render #bar{display:none}
+  body.render #stage{border-radius:0;box-shadow:none}
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="bar">
+  <button id="btn" aria-label="播放/暂停">❚❚</button>
+  <input id="seek" type="range" min="0" max="84" step="0.01" value="0">
+  <span id="time">0:00 / 1:24</span>
+</div>
+<script>
+/* ============ 基础设置（横屏 1920×1080） ============ */
+const W = 1920, H = 1080, DUR = 84;
+const cv = document.getElementById('stage'), ctx = cv.getContext('2d');
+cv.width = W; cv.height = H;
+const FONT = '"PingFang SC","Noto Sans SC","Noto Sans CJK SC","Source Han Sans SC","Microsoft YaHei",sans-serif';
+const MONO = '"JetBrains Mono","SF Mono",Menlo,Consolas,"DejaVu Sans Mono","Noto Sans Mono CJK SC","PingFang SC","Microsoft YaHei",monospace';
+const C = {acc:'#93c5fd', mint:'#6ee7c8', gold:'#ffd38a', coral:'#ff9e7a', rose:'#ff8a8a', blue:'#9cc3ff', text:'#f4ede4', muted:'#9a93a8', dim:'#4a4558', panel:'#0f0e1f'};
+
+const clamp = (x,a=0,b=1) => Math.max(a, Math.min(b, x));
+const lerp = (a,b,t) => a + (b-a)*t;
+const p = (t,a,b) => clamp((t-a)/(b-a));
+const eo = x => 1 - Math.pow(1-x, 3);
+const eio = x => x < .5 ? 4*x*x*x : 1 - Math.pow(-2*x+2, 3)/2;
+const eback = x => { const c1=1.70158, c3=c1+1; return 1 + c3*Math.pow(x-1,3) + c1*Math.pow(x-1,2); };
+function rnd(seed){ let s = seed>>>0; return () => { s = (s*1664525 + 1013904223)>>>0; return s/4294967296; }; }
+
+let SA = 1;
+const al = a => { ctx.globalAlpha = clamp(SA*a); };
+const sceneA = (t,a,b,f=.5) => Math.min(p(t,a,a+f), 1 - p(t,b-f,b));
+
+function txt(s, x, y, o = {}){
+  const {size=64, weight=700, color=C.text, alpha=1, align='center', glow=0, scale=1, font=FONT} = o;
+  if (alpha <= 0) return;
+  ctx.save(); al(alpha);
+  ctx.font = `${weight} ${size}px ${font}`;
+  ctx.textAlign = align; ctx.textBaseline = 'middle'; ctx.fillStyle = color;
+  if (glow){ ctx.shadowColor = color; ctx.shadowBlur = glow; }
+  if (scale !== 1){ ctx.translate(x, y); ctx.scale(scale, scale); ctx.fillText(s, 0, 0); }
+  else ctx.fillText(s, x, y);
+  ctx.restore();
+}
+function rise(s, x, y, t, t0, o = {}, d = .7){
+  const e = eo(p(t, t0, t0+d));
+  if (e <= 0) return;
+  txt(s, x, y + (1-e)*36, {...o, alpha:(o.alpha ?? 1)*e});
+}
+function rr(x,y,w,h,r){ ctx.beginPath(); ctx.roundRect(x,y,w,h,r); }
+function box(x, y, w, h, a, o = {}){
+  const {fill='rgba(255,255,255,.05)', stroke='rgba(147,197,253,.35)', lw=2, glow=0, r=18, dash=null} = o;
+  if (a <= 0) return;
+  ctx.save(); al(a); rr(x, y, w, h, r); ctx.fillStyle = fill; ctx.fill();
+  if (dash) ctx.setLineDash(dash);
+  ctx.strokeStyle = stroke; ctx.lineWidth = lw; if (glow){ ctx.shadowColor = stroke; ctx.shadowBlur = glow; } ctx.stroke(); ctx.restore();
+}
+function arrow(x1, y1, x2, y2, e, a, color = C.acc, lw = 3){
+  if (e <= 0 || a <= 0) return;
+  const x = lerp(x1, x2, e), y = lerp(y1, y2, e), ang = Math.atan2(y2 - y1, x2 - x1);
+  ctx.save(); al(a); ctx.strokeStyle = color; ctx.fillStyle = color; ctx.lineWidth = lw; ctx.lineCap = 'round';
+  ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x, y); ctx.stroke();
+  if (e > .85){ ctx.translate(x, y); ctx.rotate(ang); ctx.beginPath(); ctx.moveTo(4, 0); ctx.lineTo(-14, -9); ctx.lineTo(-14, 9); ctx.closePath(); ctx.fill(); }
+  ctx.restore();
+}
+function panel(x, y, w, h, title, a){
+  box(x, y, w, h, a, {fill:C.panel, stroke:'rgba(255,255,255,.1)', r:20});
+  if (a <= 0) return;
+  ctx.save(); al(a); ctx.strokeStyle = 'rgba(255,255,255,.07)'; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(x, y + 52); ctx.lineTo(x + w, y + 52); ctx.stroke();
+  ['#ff6b6b','#ffd166','#6ee7a0'].forEach((c, i) => { ctx.fillStyle = c; ctx.globalAlpha = clamp(SA*a*.8); ctx.beginPath(); ctx.arc(x + 30 + i*24, y + 26, 7, 0, 6.283); ctx.fill(); });
+  ctx.restore();
+  txt(title, x + w/2, y + 27, {size:22, weight:500, color:C.muted, font:MONO, alpha:a});
+}
+
+/* ============ 背景 ============ */
+const PARTS = (() => { const r = rnd(313); return Array.from({length:100}, () => ({
+  x:r()*W, y:r()*H, s:r()*2.2+.5, v:r()*12+4, ph:r()*6.283, c:r()<.25})); })();
+function background(t){
+  const g = ctx.createLinearGradient(0,0,W,H);
+  g.addColorStop(0,'#0a0916'); g.addColorStop(.55,'#110f24'); g.addColorStop(1,'#18122c');
+  ctx.globalAlpha = 1; ctx.fillStyle = g; ctx.fillRect(0,0,W,H);
+  const gx = W*.5 + Math.sin(t*.27)*140;
+  const rg = ctx.createRadialGradient(gx, H*.45, 0, gx, H*.45, 950);
+  rg.addColorStop(0,'rgba(147,197,253,0.09)'); rg.addColorStop(1,'rgba(147,197,253,0)');
+  ctx.fillStyle = rg; ctx.fillRect(0,0,W,H);
+  ctx.fillStyle = C.acc;
+  for (let x = 40; x < W; x += 80) for (let y = 40; y < H; y += 80){ ctx.globalAlpha = .06; ctx.fillRect(x, y, 2, 2); }
+  for (const q of PARTS){
+    const y = ((q.y - t*q.v) % H + H) % H, x = q.x + Math.sin(t*.35 + q.ph)*12;
+    ctx.globalAlpha = .2 + .3*(.5 + .5*Math.sin(t*1.2 + q.ph));
+    ctx.fillStyle = q.c ? C.acc : '#d8d0ff';
+    ctx.beginPath(); ctx.arc(x, y, q.s, 0, 6.283); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+}
+function vignette(){
+  const v = ctx.createRadialGradient(W/2, H/2, W*.28, W/2, H/2, W*.62);
+  v.addColorStop(0,'rgba(0,0,0,0)'); v.addColorStop(1,'rgba(0,0,0,.55)');
+  ctx.globalAlpha = 1; ctx.fillStyle = v; ctx.fillRect(0,0,W,H);
+}
+function codeLine(s, x, y, size, a, kw = /\b(public|class|static|void|new|return)\b/){
+  const parts = s.split(/("[^"]*"|\b(?:public|class|static|void|new|return|getstatic|ldc|invokevirtual)\b)/g);
+  ctx.save(); al(a); ctx.font = `500 ${size}px ${MONO}`; ctx.textBaseline = 'middle'; ctx.textAlign = 'left';
+  let xx = x;
+  for (const seg of parts){ if (!seg) continue;
+    ctx.fillStyle = seg.startsWith('"') ? C.mint : /^(public|class|static|void|new|return|getstatic|ldc|invokevirtual)$/.test(seg) ? C.acc : C.text;
+    ctx.fillText(seg, xx, y); xx += ctx.measureText(seg).width; }
+  ctx.restore();
+}
+
+function card(h, lines, x, y, w, hh, a, c = C.acc, o = {}){
+  const {hs=30, ls=22, lh=40, font=FONT} = o;
+  box(x, y, w, hh, a, {fill:'rgba(147,197,253,.05)', stroke:c === C.acc ? 'rgba(147,197,253,.5)' : c, r:20});
+  txt(h, x + 30, y + 44, {size:hs, weight:900, color:c, align:'left', alpha:a});
+  lines.forEach((s, i) => txt(s, x + 30, y + 96 + i*lh, {size:ls, weight:600, color:'#d9d2e4', align:'left', alpha:a, font}));
+}
+function comp(name, sub, x, y, w, h, a, o = {}){
+  const {ns=26, ss=19, c=C.acc, fill='rgba(147,197,253,.08)', stroke='rgba(147,197,253,.5)', glow=0} = o;
+  box(x, y, w, h, a, {fill, stroke, r:14, glow});
+  txt(name, x + w/2, y + h/2 - (sub ? 16 : 0), {size:ns, weight:800, font:MONO, color:c, alpha:a});
+  if (sub) txt(sub, x + w/2, y + h/2 + 20, {size:ss, weight:600, color:C.muted, alpha:a});
+}
+function pod(x, y, w, h, a, o = {}){
+  const {label='Pod', c=C.acc, fill='rgba(147,197,253,.14)', sub, size=20, dash=null} = o;
+  if (a <= 0) return;
+  box(x, y, w, h, a, {fill, stroke:c, r:10, dash});
+  txt(label, x + w/2, y + h/2 - (sub ? 12 : 0), {size, weight:800, color:c, alpha:a});
+  if (sub) txt(sub, x + w/2, y + h/2 + 16, {size:18, weight:600, font:MONO, color:C.muted, alpha:a});
+}
+function chip(s, x, y, w, a, c = C.acc){
+  box(x - w/2, y - 32, w, 64, a, {fill:'rgba(255,255,255,.05)', stroke:c, r:32});
+  txt(s, x, y, {size:26, weight:800, color:c, alpha:a});
+}
+
+/* ============ 场景 1 · 钩子 (0–7s) ============ */
+function s1(t){
+  rise('3 台服务器、几十个容器，全靠手动管？', W/2, 96, t, .2, {size:52, weight:900});
+  const down = p(t, 1.8, 2.2);
+  [0, 1, 2].forEach(m => { const a = eo(p(t, .6 + m*.2, 1 + m*.2)), x = 210 + m*550, y = 200, dead = m === 1 && down > 0;
+    box(x, y, 400, 300, a, {fill:dead ? 'rgba(255,138,138,.08)' : 'rgba(255,255,255,.04)', stroke:dead ? C.rose : 'rgba(255,255,255,.28)', r:20, glow:dead ? 14 : 0});
+    txt('服务器 ' + (m + 1), x + 200, y + 36, {size:26, weight:800, color:dead ? C.rose : C.text, alpha:a});
+    for (let i = 0; i < 12; i++){ const cx = x + 32 + (i % 4)*88, cy = y + 74 + Math.floor(i/4)*68;
+      const ca = a*eo(p(t, .8 + m*.2 + i*.04, 1.1 + m*.2 + i*.04))*(dead ? 1 - down*.8 : 1);
+      box(cx, cy, 72, 52, ca, {fill:dead ? 'rgba(255,138,138,.12)' : 'rgba(147,197,253,.16)', stroke:dead ? C.rose : 'rgba(147,197,253,.6)', r:8}); }
+    if (dead) txt('✗ 宕机', x + 200, y + 300 + 40, {size:30, weight:900, color:C.rose, alpha:down}); });
+  const Q = ['放到哪台机器？', '挂了谁来重启？', '流量大了怎么扩容？', 'IP 总在变怎么访问？', '新版本怎么不停机发布？'];
+  Q.forEach((s, i) => chip(s, 210 + i*375, 640, 345, eo(p(t, 2.5 + i*.35, 2.9 + i*.35)), i % 2 ? C.gold : C.coral));
+  const k = eo(p(t, 4.6, 5.1));
+  box(460, 760, 1000, 170, k, {fill:'rgba(147,197,253,.12)', stroke:C.acc, r:24, glow:22});
+  txt('Kubernetes（K8s）：容器的调度员', W/2, 815, {size:42, weight:900, color:C.acc, alpha:k});
+  txt('你只说「要什么」，它负责做到，并且一直保持', W/2, 880, {size:28, weight:700, alpha:eo(p(t, 5.2, 5.6))});
+}
+
+/* ============ 场景 2 · 声明式与控制循环 (7–19s) ============ */
+function s2(t){
+  rise('声明式：描述「要什么」，而不是「怎么做」', W/2, 90, t, 7.2, {size:50, weight:900});
+  card('命令式：一步步下指令', ['在机器 A 上启动 3 个容器', '挂了一个？发现后再手动启动一个', '换版本？逐个停掉旧的、启动新的'], 120, 180, 800, 270, eo(p(t, 7.7, 8.2)), C.gold);
+  card('声明式：写下期望状态', ['replicas: 3', 'image: shop:v2', '剩下的交给 Kubernetes 自己去对齐'], 120, 480, 800, 270, eo(p(t, 8.8, 9.3)), C.acc, {font:MONO});
+  const a = eo(p(t, 10, 10.5));
+  const N = [['期望状态', 'replicas = 3', 1400, 250], ['观察实际', '数一数 Pod', 1660, 470], ['比较差异', '期望 − 实际', 1400, 690], ['执行动作', '创建 / 删除 Pod', 1140, 470]];
+  const act = t > 10.8 ? Math.floor((t - 10.8)/.7) % 4 : -1;
+  N.forEach(([h, s, x, y], i) => { const on = i === act;
+    box(x - 120, y - 46, 240, 92, a, {fill:on ? 'rgba(147,197,253,.22)' : 'rgba(147,197,253,.06)', stroke:on ? C.acc : 'rgba(147,197,253,.45)', r:16, glow:on ? 18 : 0});
+    txt(h, x, y - 14, {size:26, weight:900, color:on ? C.acc : C.text, alpha:a}); txt(s, x, y + 22, {size:19, weight:600, color:C.muted, alpha:a}); });
+  [[1520, 296, 1640, 422], [1640, 518, 1520, 644], [1280, 644, 1160, 518], [1160, 422, 1280, 296]].forEach(([x1, y1, x2, y2], i) => arrow(x1, y1, x2, y2, eo(p(t, 10.3 + i*.15, 10.7 + i*.15)), a, C.acc, 3));
+  const kill = p(t, 13.6, 14), heal = eo(p(t, 15.4, 16));
+  [0, 1, 2].forEach(i => { const x = 1300 + i*75, dead = i === 1;
+    if (dead){ if (kill < 1) pod(x, 440, 60, 56, a*(1 - kill), {label:'', c:kill > 0 ? C.rose : C.acc});
+      if (heal > 0) pod(x, 440, 60, 56, heal, {label:'', c:C.mint, fill:'rgba(110,231,200,.18)'}); }
+    else pod(x, 440, 60, 56, a, {label:''}); });
+  const cnt = t < 13.8 ? 3 : t < 15.6 ? 2 : 3;
+  txt('实际：' + cnt + ' 个', 1400, 530, {size:22, weight:800, color:cnt < 3 ? C.rose : C.mint, alpha:a});
+  rise('控制器 = 永不停止的循环：观察 → 比较 → 行动，这叫「调和」（Reconcile）', W/2, 850, t, 16.2, {size:30, weight:900, color:C.gold});
+  rise('Kubernetes 的几乎所有功能，都是一个个这样的控制器', W/2, 920, t, 16.9, {size:26, weight:700, color:C.muted});
+}
+
+/* ============ 场景 3 · 架构 (19–31s) ============ */
+function s3(t){
+  rise('架构：控制平面 + 工作节点', W/2, 86, t, 19.2, {size:54, weight:900});
+  const a = eo(p(t, 19.6, 20.1));
+  box(470, 150, 1330, 380, a, {fill:'rgba(147,197,253,.03)', stroke:'rgba(147,197,253,.35)', r:24, dash:[10, 8]});
+  txt('控制平面（Control Plane）：集群的「大脑」', 500, 188, {size:24, weight:800, color:C.acc, align:'left', alpha:a});
+  const b = eo(p(t, 20.3, 20.8));
+  box(560, 250, 560, 200, b, {fill:'rgba(147,197,253,.16)', stroke:C.acc, r:20, glow:16});
+  txt('kube-apiserver', 840, 305, {size:36, weight:900, font:MONO, color:C.acc, alpha:b});
+  txt('集群唯一的入口（REST API）', 840, 360, {size:22, weight:700, alpha:b});
+  txt('认证 · 鉴权 · 准入校验', 840, 405, {size:20, weight:600, color:C.muted, alpha:b});
+  [['etcd', '存全部集群状态，只有 apiserver 读写'], ['kube-scheduler', '给新 Pod 挑选节点'], ['kube-controller-manager', '运行各种控制器（调和循环）']].forEach(([n, s], i) => {
+    const e = eo(p(t, 21 + i*.5, 21.4 + i*.5)), y = 210 + i*104;
+    comp(n, s, 1240, y, 520, 88, e, {ns:24, ss:19});
+    arrow(1122, 330 + (i - 1)*44, 1236, y + 44, eo(p(t, 21.2 + i*.5, 21.6 + i*.5)), e, C.acc, 3); });
+  const k = eo(p(t, 22.6, 23.1));
+  comp('kubectl', '你 / CI 流水线', 120, 300, 260, 100, k, {c:C.gold, fill:'rgba(255,211,138,.10)', stroke:C.gold});
+  arrow(382, 350, 556, 350, eo(p(t, 23, 23.4)), k, C.gold, 3);
+  [0, 1, 2].forEach(n => { const e = eo(p(t, 23.8 + n*.4, 24.3 + n*.4)), x = 120 + n*570;
+    box(x, 610, 540, 230, e, {fill:'rgba(255,255,255,.04)', stroke:'rgba(255,255,255,.28)', r:20});
+    txt('工作节点 ' + (n + 1), x + 270, 640, {size:24, weight:800, alpha:e});
+    ['kubelet', 'kube-proxy', '容器运行时'].forEach((s, j) => { box(x + 24 + j*170, 672, 152, 50, e, {fill:'rgba(147,197,253,.10)', stroke:'rgba(147,197,253,.5)', r:10});
+      txt(s, x + 100 + j*170, 697, {size:20, weight:800, font:MONO, color:C.acc, alpha:e}); });
+    for (let i = 0; i < 4; i++) pod(x + 24 + i*126, 748, 110, 66, e*eo(p(t, 24.4 + n*.4 + i*.1, 24.8 + n*.4 + i*.1)), {label:'Pod', size:22});
+    arrow(x + 270, 606, lerp(700, 980, n/2), 454, eo(p(t, 25.4 + n*.2, 25.9 + n*.2)), e*.8, C.muted, 2); });
+  txt('watch', 1010, 545, {size:20, weight:700, font:MONO, color:C.muted, alpha:eo(p(t, 26, 26.4))});
+  [['kubelet', '节点上的「管家」：按 apiserver 的要求启停 Pod，执行探针，上报状态'], ['kube-proxy', '维护 Service 的转发规则（iptables / IPVS）'], ['容器运行时', '真正拉镜像、跑容器：containerd、CRI-O']].forEach(([n, s], i) => {
+    const e = eo(p(t, 26.6 + i*.5, 27 + i*.5)), y = 885 + i*50;
+    txt(n, 300, y, {size:24, weight:800, font:MONO, color:C.acc, align:'right', alpha:e}); txt(s, 330, y, {size:24, weight:600, align:'left', alpha:e}); });
+}
+
+/* ============ 场景 4 · Pod 与 Deployment (31–44s) ============ */
+function s4(t){
+  rise('Pod、ReplicaSet 与 Deployment', W/2, 86, t, 31.2, {size:54, weight:900});
+  const a = eo(p(t, 31.6, 32.1));
+  box(120, 170, 580, 420, a, {fill:'rgba(147,197,253,.05)', stroke:C.acc, r:22, dash:[10, 8]});
+  txt('Pod', 150, 214, {size:36, weight:900, color:C.acc, align:'left', alpha:a});
+  txt('IP 10.244.1.7', 670, 214, {size:22, weight:700, font:MONO, color:C.muted, align:'right', alpha:a});
+  comp('app', 'Java 应用容器', 160, 260, 240, 120, eo(p(t, 32.2, 32.6)), {ns:28});
+  comp('sidecar', '日志采集容器', 420, 260, 240, 120, eo(p(t, 32.5, 32.9)), {ns:28});
+  [['共享网络：同一个 IP，localhost 互通', 410], ['共享存储卷（Volume）', 480]].forEach(([s, y], i) => { const e = eo(p(t, 33 + i*.4, 33.4 + i*.4));
+    box(160, y - 26, 500, 52, e, {fill:'rgba(255,255,255,.05)', stroke:'rgba(255,255,255,.25)', r:10}); txt(s, 410, y, {size:22, weight:700, alpha:e}); });
+  txt('通常 1 个主容器 + 少量辅助容器', 410, 548, {size:20, weight:600, color:C.muted, alpha:eo(p(t, 33.8, 34.2))});
+  [['最小调度单位：同一 Pod 的容器总在同一节点', C.text], ['用完即弃：挂了就换新的，IP 也会变', C.gold]].forEach(([s, c], i) =>
+    txt(s, 120, 650 + i*50, {size:24, weight:800, color:c, align:'left', alpha:eo(p(t, 34.2 + i*.5, 34.6 + i*.5))}));
+  const h = eo(p(t, 34.6, 35.1));
+  comp('Deployment', '版本与发布策略', 800, 170, 300, 96, h, {ns:26});
+  arrow(1104, 218, 1176, 218, h, h, C.acc, 3);
+  comp('ReplicaSet', '保证副本数 = 3', 1180, 170, 300, 96, eo(p(t, 35, 35.5)), {ns:26});
+  arrow(1484, 218, 1556, 218, eo(p(t, 35.3, 35.7)), h, C.acc, 3);
+  [0, 1, 2].forEach(i => pod(1560 + i*82, 188, 70, 60, eo(p(t, 35.5 + i*.1, 35.9 + i*.1)), {label:'Pod', size:18}));
+  const pa = eo(p(t, 36, 36.5));
+  panel(780, 310, 1020, 400, 'kubectl set image deploy/shop app=shop:v2', pa);
+  txt('v1', 830, 440, {size:28, weight:900, font:MONO, color:C.muted, alpha:pa}); txt('v2', 830, 580, {size:28, weight:900, font:MONO, color:C.acc, alpha:pa});
+  const T0 = 37, cyc = 1.6;
+  let avail = 0;
+  for (let i = 0; i < 3; i++){
+    const st = T0 + i*cyc, born = p(t, st, st + .3), ready = t >= st + .8, gone = p(t, st + 1.1, st + 1.4);
+    const v1a = pa*(1 - gone); if (v1a > 0) pod(900 + i*150, 400, 130, 80, v1a, {label:gone > 0 ? '终止中' : 'v1', c:gone > 0 ? C.rose : C.muted, fill:'rgba(255,255,255,.06)'});
+    if (born > 0) pod(900 + i*150, 540, 130, 80, eo(born), ready ? {label:'v2'} : {label:'启动中', c:C.gold, fill:'rgba(255,211,138,.08)', dash:[6, 5]});
+    avail += (gone < 1 ? 1 : 0) + (ready ? 1 : 0); }
+  if (pa > 0){ txt('可用 Pod：' + avail, 1600, 470, {size:28, weight:900, color:C.mint, alpha:pa});
+    txt('新 Pod 就绪后', 1600, 530, {size:21, weight:600, color:C.muted, alpha:pa}); txt('才下线一个旧的', 1600, 562, {size:21, weight:600, color:C.muted, alpha:pa}); }
+  txt('maxSurge=1 · maxUnavailable=0：始终不少于 3 个可用', 1290, 670, {size:22, weight:700, color:C.acc, alpha:eo(p(t, 37.4, 37.8))});
+  rise('新版有问题？kubectl rollout undo：切回保留着的旧 ReplicaSet', 1290, 770, t, 41.4, {size:24, weight:800, color:C.gold});
+  rise('Deployment 管版本，ReplicaSet 管数量，Pod 才真正跑容器', W/2, 900, t, 42.2, {size:32, weight:900});
+}
+
+/* ============ 场景 5 · Service 与 Ingress (44–56s) ============ */
+function s5(t){
+  rise('Service：给一组 Pod 一个稳定的入口', W/2, 86, t, 44.2, {size:52, weight:900});
+  const a = eo(p(t, 44.6, 45.1));
+  comp('前端 Pod', '调用 shop', 120, 320, 240, 100, a, {c:C.text, fill:'rgba(255,255,255,.06)', stroke:'rgba(255,255,255,.35)', ns:24});
+  arrow(364, 370, 476, 370, eo(p(t, 45, 45.4)), a, C.text, 3);
+  const b = eo(p(t, 45.2, 45.7));
+  box(480, 250, 400, 240, b, {fill:'rgba(147,197,253,.14)', stroke:C.acc, r:20, glow:16});
+  txt('Service: shop', 680, 290, {size:28, weight:900, font:MONO, color:C.acc, alpha:b});
+  [['ClusterIP 10.96.0.12', C.text], ['selector: app=shop', C.text], ['DNS: shop.default.svc', C.muted]].forEach(([s, c], i) => txt(s, 680, 348 + i*46, {size:21, weight:700, font:MONO, color:c, alpha:b}));
+  const kill = p(t, 49, 49.4), heal = eo(p(t, 50.2, 50.7));
+  const P = [['10.244.1.7', 0], ['10.244.2.4', 1], ['10.244.3.5', 0]];
+  P.forEach(([ip, d], i) => { const y = 200 + i*150, e = eo(p(t, 45.8 + i*.2, 46.2 + i*.2));
+    if (!d){ pod(1000, y, 280, 100, e, {label:'Pod  app=shop', sub:ip, size:22}); arrow(884, 370, 996, y + 50, eo(p(t, 46.2, 46.6)), e, C.acc, 3); }
+    else {
+      if (kill < 1){ pod(1000, y, 280, 100, e*(1 - kill), {label:kill > 0 ? '✗ 崩溃' : 'Pod  app=shop', sub:ip, size:22, c:kill > 0 ? C.rose : C.acc}); arrow(884, 370, 996, y + 50, eo(p(t, 46.2, 46.6)), e*(1 - kill), C.acc, 3); }
+      if (heal > 0){ pod(1000, y, 280, 100, heal, {label:'新 Pod  app=shop', sub:'10.244.2.9', size:22, c:C.mint, fill:'rgba(110,231,200,.14)'}); arrow(884, 370, 996, y + 50, heal, heal, C.mint, 3); } } });
+  if (t > 46.8 && t < 56){ const ph = ((t - 46.8)*1.4) % 1, alive = [0, 2].concat(t < 49 || t > 50.8 ? [1] : []), tgt = alive[Math.floor((t - 46.8)*1.4) % alive.length];
+    const y2 = 250 + tgt*150; ctx.save(); al(.9*b); ctx.fillStyle = C.gold; ctx.beginPath(); ctx.arc(lerp(884, 996, ph), lerp(370, y2, ph), 8, 0, 6.283); ctx.fill(); ctx.restore(); }
+  const c = eo(p(t, 47, 47.5));
+  panel(1360, 190, 440, 360, 'EndpointSlice', c);
+  const eps = [['10.244.1.7', 1], [t < 49.6 ? '10.244.2.4' : '10.244.2.9', t < 49.6 ? 1 : t > 50.8 ? 2 : 0], ['10.244.3.5', 1]];
+  eps.forEach(([ip, st], i) => { if (st === 0) return; const col = st === 2 ? C.mint : C.text;
+    txt(ip + ':8080', 1400, 290 + i*60, {size:22, weight:700, font:MONO, color:col, align:'left', alpha:c*eo(p(t, 47.4 + i*.2, 47.8 + i*.2))}); });
+  txt('Pod 变了，列表自动更新', 1580, 490, {size:21, weight:700, color:C.gold, alpha:eo(p(t, 50.8, 51.2))});
+  [['ClusterIP', ['集群内部的虚拟 IP', '默认类型，只在集群内可访问']], ['NodePort', ['每个节点开放同一个端口', '默认范围 30000–32767']], ['LoadBalancer', ['由云厂商创建外部负载均衡器', '把公网流量引进集群']], ['Ingress', ['七层 HTTP 路由', '按域名 / 路径转到不同 Service']]].forEach(([h, ls], i) =>
+    card(h, ls, 120 + i*425, 630, 400, 210, eo(p(t, 51.4 + i*.5, 51.8 + i*.5)), i === 3 ? C.gold : C.acc, {hs:28, ls:21, lh:36}));
+  rise('Service 按标签选中 Pod，kube-proxy 把发往虚拟 IP 的流量转发并负载均衡到后端', W/2, 920, t, 53.6, {size:26, weight:800, color:C.text});
+}
+
+/* ============ 场景 6 · kubectl apply 之后 (56–67s) ============ */
+function s6(t){
+  rise('一次 kubectl apply 之后，发生了什么？', W/2, 86, t, 56.2, {size:52, weight:900});
+  const R = [['kube-apiserver', '认证、鉴权、准入校验，把对象写进 etcd'], ['Deployment 控制器', '发现新的 Deployment，创建 ReplicaSet'], ['ReplicaSet 控制器', '实际 0 个 ≠ 期望 3 个，创建 3 个 Pod'],
+             ['kube-scheduler', '发现未调度的 Pod：过滤 + 打分，绑定节点'], ['kubelet', '拉镜像，通过容器运行时启动容器，跑探针'], ['EndpointSlice 控制器', 'Pod 就绪后加入 Service 端点，开始接流量']];
+  R.forEach(([n, d], i) => { const st = 56.8 + i*1.15, e = eo(p(t, st, st + .5)), y = 200 + i*104;
+    if (i) arrow(160, y - 70, 160, y - 34, e, e, 'rgba(147,197,253,.6)', 2);
+    ctx.save(); al(e); ctx.fillStyle = 'rgba(147,197,253,.18)'; ctx.strokeStyle = C.acc; ctx.lineWidth = 2; ctx.beginPath(); ctx.arc(160, y, 28, 0, 6.283); ctx.fill(); ctx.stroke(); ctx.restore();
+    txt(String(i + 1), 160, y, {size:26, weight:900, color:C.acc, alpha:e});
+    txt(n, 210, y, {size:25, weight:800, font:MONO, color:C.acc, align:'left', alpha:e});
+    txt(d, 560, y, {size:24, weight:600, align:'left', alpha:eo(p(t, st + .2, st + .7))}); });
+  const pa = eo(p(t, 58.4, 58.9));
+  panel(1260, 180, 540, 560, 'kubectl get pods -w', pa);
+  txt('NAME           READY  STATUS', 1290, 270, {size:19, weight:700, font:MONO, color:C.muted, align:'left', alpha:pa});
+  [['0/1', 'Pending', 59.2, C.gold], ['0/1', 'Pending → node-2', 60.4, C.gold], ['0/1', 'ContainerCreating', 61.6, C.text], ['0/1', 'Running', 62.4, C.text], ['1/1', 'Running', 63.4, C.mint]].forEach(([r, s, ts, c], i) =>
+    txt('shop-7d9f-x2k  ' + r + '    ' + s, 1290, 330 + i*56, {size:19, weight:700, font:MONO, color:c, align:'left', alpha:eo(p(t, ts, ts + .4))}));
+  txt('Running ≠ 就绪：探针通过才是 1/1', 1530, 660, {size:21, weight:700, color:C.gold, alpha:eo(p(t, 63.8, 64.2))});
+  rise('每个组件只 watch 自己关心的变化，各做一步，没有一个「总指挥」', W/2, 870, t, 64, {size:30, weight:900, color:C.gold});
+  rise('任何一步失败都会被重试：这就是控制循环带来的韧性', W/2, 940, t, 64.8, {size:26, weight:700, color:C.muted});
+}
+
+/* ============ 场景 7 · 探针、资源、HPA (67–78s) ============ */
+function s7(t){
+  rise('让应用跑得稳：探针、资源、自动扩缩', W/2, 86, t, 67.2, {size:52, weight:900});
+  card('健康检查（探针）', ['liveness 存活探针', '  失败 → 重启容器', 'readiness 就绪探针', '  失败 → 从 Service 摘除', 'startup：给慢启动的应用留时间'], 120, 170, 520, 440, eo(p(t, 67.6, 68.1)), C.acc, {ls:24, lh:60});
+  card('requests / limits', ['requests：调度时的「预订量」', '  按它找放得下的节点', 'limits：运行时的上限', '  由 cgroups 实现', 'CPU 超限限流，内存超限 OOMKilled'], 700, 170, 520, 440, eo(p(t, 68.8, 69.3)), C.gold, {ls:24, lh:60});
+  const h = eo(p(t, 70, 70.5));
+  box(1280, 170, 520, 440, h, {fill:'rgba(147,197,253,.05)', stroke:'rgba(147,197,253,.5)', r:20});
+  txt('HPA 自动扩缩容', 1310, 214, {size:30, weight:900, color:C.acc, align:'left', alpha:h});
+  const up = p(t, 71, 72.4), sc = p(t, 73, 73.8), cpu = Math.round(sc > 0 ? lerp(90, 54, eo(sc)) : lerp(45, 90, up));
+  txt('平均 CPU', 1310, 290, {size:22, weight:700, color:C.muted, align:'left', alpha:h});
+  box(1430, 272, 260, 36, h, {fill:'rgba(255,255,255,.05)', stroke:'rgba(255,255,255,.25)', r:8});
+  if (h > 0){ ctx.save(); al(h); ctx.fillStyle = cpu > 60 ? C.rose : C.mint; rr(1432, 274, 256*cpu/100, 32, 7); ctx.fill(); ctx.restore();
+    ctx.save(); al(h); ctx.strokeStyle = C.gold; ctx.lineWidth = 3; ctx.setLineDash([5, 4]); ctx.beginPath(); ctx.moveTo(1432 + 256*.6, 264); ctx.lineTo(1432 + 256*.6, 316); ctx.stroke(); ctx.restore(); }
+  txt(cpu + '%', 1770, 290, {size:24, weight:800, font:MONO, color:cpu > 60 ? C.rose : C.mint, align:'right', alpha:h});
+  txt('目标 60%', 1585, 340, {size:19, weight:700, color:C.gold, alpha:h});
+  const n = sc > .3 ? 5 : 3;
+  for (let i = 0; i < 5; i++){ const e = i < 3 ? h : eo(p(t, 73.2 + (i - 3)*.2, 73.6 + (i - 3)*.2)); pod(1312 + i*96, 380, 84, 60, e, {label:'Pod', size:20, c:i < 3 ? C.acc : C.mint}); }
+  txt('副本数 ' + n, 1540, 475, {size:26, weight:900, color:n > 3 ? C.mint : C.text, alpha:h});
+  txt('期望副本 = ⌈当前副本 × 当前值 / 目标值⌉', 1540, 525, {size:20, weight:700, alpha:eo(p(t, 74, 74.4))});
+  txt('⌈3 × 90 / 60⌉ = ⌈4.5⌉ = 5', 1540, 568, {size:21, weight:800, font:MONO, color:C.mint, alpha:eo(p(t, 74.4, 74.8))});
+  [['ConfigMap', '配置与镜像分离'], ['Secret', '敏感配置（默认只做 Base64）'], ['Namespace', '按团队 / 环境划分资源']].forEach(([k, v], i) => { const e = eo(p(t, 75 + i*.35, 75.4 + i*.35)), x = 120 + i*570;
+    box(x, 680, 540, 90, e, {fill:'rgba(255,255,255,.04)', stroke:'rgba(255,255,255,.25)', r:16});
+    txt(k, x + 24, 725, {size:24, weight:900, font:MONO, color:C.acc, align:'left', alpha:e}); txt(v, x + 516, 725, {size:21, weight:600, color:C.muted, align:'right', alpha:e}); });
+  rise('调度、自愈、扩缩容、服务发现、发布：全都交给控制器', W/2, 880, t, 76.2, {size:32, weight:900, color:C.gold});
+}
+
+/* ============ 场景 8 · 收尾 (78–84s) ============ */
+function s8(t){
+  [['声明式', '期望状态 + 控制循环'], ['调度', 'scheduler 为 Pod 选节点'], ['Deployment', '副本、滚动更新、回滚'], ['Service', '稳定入口 + 负载均衡']].forEach(([a, b], i) => {
+    const st = 78.2 + i*.25, e = eback(p(t, st, st + .5)); if (e <= 0) return;
+    const x = 330 + i*420, y = 330;
+    ctx.save(); ctx.translate(x, y); ctx.scale(e, e); ctx.translate(-x, -y);
+    box(x - 185, y - 90, 370, 180, clamp(e), {fill:'rgba(147,197,253,.08)', stroke:'rgba(147,197,253,.5)', r:26}); ctx.restore();
+    txt(a, x, y - 22, {size:40, weight:900, color:C.acc, alpha:clamp(e)}); txt(b, x, y + 40, {size:24, weight:600, color:C.muted, alpha:clamp(e)});
+  });
+  rise('你只管说「要什么」，Kubernetes 负责一直做到', W/2, 600, t, 79.2, {size:58, weight:900, glow:22});
+  rise('关注拾星，一起搞懂后端', W/2, 760, t, 80, {size:36, weight:500, color:C.muted});
+}
+/* ============ 总调度 ============ */
+const SCENES = [[s1,-1,7],[s2,7,19],[s3,19,31],[s4,31,44],[s5,44,56],[s6,56,67],[s7,67,78],[s8,78,84]];
+function draw(t){
+  t = clamp(t, 0, DUR);
+  ctx.save(); ctx.globalAlpha = 1; ctx.clearRect(0,0,W,H); background(t);
+  for (const [fn,a,b] of SCENES){
+    if (t < a || t > b) continue;
+    SA = sceneA(t, a, b, b === DUR ? .8 : .5);
+    if (SA > 0){ ctx.save(); fn(t); ctx.restore(); }
+  }
+  SA = 1; vignette();
+  const fo = p(t, DUR - .8, DUR);
+  if (fo > 0){ ctx.globalAlpha = fo; ctx.fillStyle = '#000'; ctx.fillRect(0,0,W,H); }
+  ctx.restore();
+}
+
+/* ============ 播放器 / 逐帧渲染接口 ============ */
+const isRender = new URLSearchParams(location.search).has('render');
+window.DURATION = DUR;
+window.renderFrame = t => draw(t);
+const btn = document.getElementById('btn'), seek = document.getElementById('seek'), timeEl = document.getElementById('time');
+const fmt = s => `${Math.floor(s/60)}:${String(Math.floor(s%60)).padStart(2,'0')}`;
+function fit(){
+  if (isRender){ cv.style.width = W+'px'; cv.style.height = H+'px'; return; }
+  const w = Math.min(innerWidth - 32, (innerHeight - 84)*16/9);
+  cv.style.width = w + 'px'; cv.style.height = w*9/16 + 'px';
+}
+addEventListener('resize', fit); fit();
+
+let cur = 0, playing = !isRender, last = null;
+function toggle(){ if (cur >= DUR) cur = 0; playing = !playing; }
+btn.onclick = toggle; cv.onclick = toggle;
+addEventListener('keydown', e => { if (e.code === 'Space'){ e.preventDefault(); toggle(); } });
+seek.oninput = () => { cur = +seek.value; draw(cur); };
+function loop(ts){
+  if (playing && last != null){ cur += (ts - last)/1000; if (cur >= DUR){ cur = DUR; playing = false; } }
+  last = ts; draw(cur);
+  seek.value = cur; timeEl.textContent = `${fmt(cur)} / ${fmt(DUR)}`;
+  btn.textContent = playing ? '❚❚' : (cur >= DUR ? '↺' : '▶');
+  requestAnimationFrame(loop);
+}
+document.fonts.ready.then(() => {
+  window.ready = true;
+  if (isRender) draw(0); else requestAnimationFrame(loop);
+});
+</script>
+</body>
+</html>

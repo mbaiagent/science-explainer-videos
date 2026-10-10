@@ -1,0 +1,384 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>幂等性设计：重复请求不出错 · 拾星</title>
+<style>
+  :root{--bg:#07080f;--fg:#f4ede4;--muted:#9a93a8;--acc:#bef264}
+  html,body{margin:0;height:100%;background:var(--bg);color:var(--fg);
+    font-family:-apple-system,"PingFang SC","Noto Sans SC","Noto Sans CJK SC","Microsoft YaHei",sans-serif}
+  body{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;overflow:hidden}
+  #stage{display:block;background:#07080f;border-radius:12px;box-shadow:0 20px 60px rgba(0,0,0,.55);cursor:pointer}
+  #bar{display:flex;align-items:center;gap:12px;width:min(calc(100vw - 32px),640px)}
+  #btn{width:40px;height:40px;border-radius:50%;border:1px solid rgba(190,242,100,.5);background:transparent;
+    color:var(--acc);font-size:16px;cursor:pointer;flex:none}
+  #seek{flex:1;accent-color:var(--acc)}
+  #time{font-variant-numeric:tabular-nums;font-size:13px;color:var(--muted);min-width:84px;text-align:right}
+  body.render{display:block}
+  body.render #bar{display:none}
+  body.render #stage{border-radius:0;box-shadow:none}
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="bar">
+  <button id="btn" aria-label="播放/暂停">❚❚</button>
+  <input id="seek" type="range" min="0" max="82" step="0.01" value="0">
+  <span id="time">0:00 / 1:22</span>
+</div>
+<script>
+/* ============ 基础设置（横屏 1920×1080） ============ */
+const W = 1920, H = 1080, DUR = 82;
+const cv = document.getElementById('stage'), ctx = cv.getContext('2d');
+cv.width = W; cv.height = H;
+const FONT = '"PingFang SC","Noto Sans SC","Noto Sans CJK SC","Source Han Sans SC","Microsoft YaHei",sans-serif';
+const MONO = '"JetBrains Mono","SF Mono",Menlo,Consolas,"DejaVu Sans Mono","Noto Sans Mono CJK SC","PingFang SC","Microsoft YaHei",monospace';
+const C = {acc:'#bef264', mint:'#6ee7c8', gold:'#ffd38a', coral:'#ff9e7a', rose:'#ff8a8a', blue:'#9cc3ff', text:'#f4ede4', muted:'#9a93a8', dim:'#4a4558', panel:'#0f0e1f'};
+
+const clamp = (x,a=0,b=1) => Math.max(a, Math.min(b, x));
+const lerp = (a,b,t) => a + (b-a)*t;
+const p = (t,a,b) => clamp((t-a)/(b-a));
+const eo = x => 1 - Math.pow(1-x, 3);
+const eio = x => x < .5 ? 4*x*x*x : 1 - Math.pow(-2*x+2, 3)/2;
+const eback = x => { const c1=1.70158, c3=c1+1; return 1 + c3*Math.pow(x-1,3) + c1*Math.pow(x-1,2); };
+function rnd(seed){ let s = seed>>>0; return () => { s = (s*1664525 + 1013904223)>>>0; return s/4294967296; }; }
+
+let SA = 1;
+const al = a => { ctx.globalAlpha = clamp(SA*a); };
+const sceneA = (t,a,b,f=.5) => Math.min(p(t,a,a+f), 1 - p(t,b-f,b));
+
+function txt(s, x, y, o = {}){
+  const {size=64, weight=700, color=C.text, alpha=1, align='center', glow=0, scale=1, font=FONT} = o;
+  if (alpha <= 0) return;
+  ctx.save(); al(alpha);
+  ctx.font = `${weight} ${size}px ${font}`;
+  ctx.textAlign = align; ctx.textBaseline = 'middle'; ctx.fillStyle = color;
+  if (glow){ ctx.shadowColor = color; ctx.shadowBlur = glow; }
+  if (scale !== 1){ ctx.translate(x, y); ctx.scale(scale, scale); ctx.fillText(s, 0, 0); }
+  else ctx.fillText(s, x, y);
+  ctx.restore();
+}
+function rise(s, x, y, t, t0, o = {}, d = .7){
+  const e = eo(p(t, t0, t0+d));
+  if (e <= 0) return;
+  txt(s, x, y + (1-e)*36, {...o, alpha:(o.alpha ?? 1)*e});
+}
+function rr(x,y,w,h,r){ ctx.beginPath(); ctx.roundRect(x,y,w,h,r); }
+function box(x, y, w, h, a, o = {}){
+  const {fill='rgba(255,255,255,.05)', stroke='rgba(190,242,100,.35)', lw=2, glow=0, r=18, dash=null} = o;
+  if (a <= 0) return;
+  ctx.save(); al(a); rr(x, y, w, h, r); ctx.fillStyle = fill; ctx.fill();
+  if (dash) ctx.setLineDash(dash);
+  ctx.strokeStyle = stroke; ctx.lineWidth = lw; if (glow){ ctx.shadowColor = stroke; ctx.shadowBlur = glow; } ctx.stroke(); ctx.restore();
+}
+function arrow(x1, y1, x2, y2, e, a, color = C.acc, lw = 3){
+  if (e <= 0 || a <= 0) return;
+  const x = lerp(x1, x2, e), y = lerp(y1, y2, e), ang = Math.atan2(y2 - y1, x2 - x1);
+  ctx.save(); al(a); ctx.strokeStyle = color; ctx.fillStyle = color; ctx.lineWidth = lw; ctx.lineCap = 'round';
+  ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x, y); ctx.stroke();
+  if (e > .85){ ctx.translate(x, y); ctx.rotate(ang); ctx.beginPath(); ctx.moveTo(4, 0); ctx.lineTo(-14, -9); ctx.lineTo(-14, 9); ctx.closePath(); ctx.fill(); }
+  ctx.restore();
+}
+function panel(x, y, w, h, title, a){
+  box(x, y, w, h, a, {fill:C.panel, stroke:'rgba(255,255,255,.1)', r:20});
+  if (a <= 0) return;
+  ctx.save(); al(a); ctx.strokeStyle = 'rgba(255,255,255,.07)'; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(x, y + 52); ctx.lineTo(x + w, y + 52); ctx.stroke();
+  ['#ff6b6b','#ffd166','#6ee7a0'].forEach((c, i) => { ctx.fillStyle = c; ctx.globalAlpha = clamp(SA*a*.8); ctx.beginPath(); ctx.arc(x + 30 + i*24, y + 26, 7, 0, 6.283); ctx.fill(); });
+  ctx.restore();
+  txt(title, x + w/2, y + 27, {size:22, weight:500, color:C.muted, font:MONO, alpha:a});
+}
+
+/* ============ 背景 ============ */
+const PARTS = (() => { const r = rnd(331); return Array.from({length:100}, () => ({
+  x:r()*W, y:r()*H, s:r()*2.2+.5, v:r()*12+4, ph:r()*6.283, c:r()<.25})); })();
+function background(t){
+  const g = ctx.createLinearGradient(0,0,W,H);
+  g.addColorStop(0,'#0a0916'); g.addColorStop(.55,'#110f24'); g.addColorStop(1,'#18122c');
+  ctx.globalAlpha = 1; ctx.fillStyle = g; ctx.fillRect(0,0,W,H);
+  const gx = W*.5 + Math.sin(t*.27)*140;
+  const rg = ctx.createRadialGradient(gx, H*.45, 0, gx, H*.45, 950);
+  rg.addColorStop(0,'rgba(190,242,100,0.09)'); rg.addColorStop(1,'rgba(190,242,100,0)');
+  ctx.fillStyle = rg; ctx.fillRect(0,0,W,H);
+  ctx.fillStyle = C.acc;
+  for (let x = 40; x < W; x += 80) for (let y = 40; y < H; y += 80){ ctx.globalAlpha = .06; ctx.fillRect(x, y, 2, 2); }
+  for (const q of PARTS){
+    const y = ((q.y - t*q.v) % H + H) % H, x = q.x + Math.sin(t*.35 + q.ph)*12;
+    ctx.globalAlpha = .2 + .3*(.5 + .5*Math.sin(t*1.2 + q.ph));
+    ctx.fillStyle = q.c ? C.acc : '#d8d0ff';
+    ctx.beginPath(); ctx.arc(x, y, q.s, 0, 6.283); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+}
+function vignette(){
+  const v = ctx.createRadialGradient(W/2, H/2, W*.28, W/2, H/2, W*.62);
+  v.addColorStop(0,'rgba(0,0,0,0)'); v.addColorStop(1,'rgba(0,0,0,.55)');
+  ctx.globalAlpha = 1; ctx.fillStyle = v; ctx.fillRect(0,0,W,H);
+}
+function codeLine(s, x, y, size, a, kw = /\b(public|class|static|void|new|return)\b/){
+  const parts = s.split(/("[^"]*"|\b(?:public|class|static|void|new|return|getstatic|ldc|invokevirtual)\b)/g);
+  ctx.save(); al(a); ctx.font = `500 ${size}px ${MONO}`; ctx.textBaseline = 'middle'; ctx.textAlign = 'left';
+  let xx = x;
+  for (const seg of parts){ if (!seg) continue;
+    ctx.fillStyle = seg.startsWith('"') ? C.mint : /^(public|class|static|void|new|return|getstatic|ldc|invokevirtual)$/.test(seg) ? C.acc : C.text;
+    ctx.fillText(seg, xx, y); xx += ctx.measureText(seg).width; }
+  ctx.restore();
+}
+
+function card(h, lines, x, y, w, hh, a, c = C.acc, o = {}){
+  const {hs=30, ls=22, lh=40, font=FONT, t0=null, t=0} = o;
+  box(x, y, w, hh, a, {fill:'rgba(190,242,100,.05)', stroke:c === C.acc ? 'rgba(190,242,100,.5)' : c, r:20});
+  txt(h, x + 30, y + 44, {size:hs, weight:900, color:c, align:'left', alpha:a});
+  lines.forEach((s, i) => { const e = t0 == null ? a : Math.min(a, eo(p(t, t0 + i*.4, t0 + i*.4 + .4)));
+    txt(s, x + 30, y + 96 + i*lh, {size:ls, weight:600, color:'#e2e6d6', align:'left', alpha:e, font}); });
+}
+function node(label, sub, x, y, a, c = C.text, w = 240, h = 120){
+  box(x - w/2, y - h/2, w, h, a, {fill:'rgba(255,255,255,.05)', stroke:'rgba(255,255,255,.3)', r:20});
+  txt(label, x, y - (sub ? 14 : 0), {size:30, weight:900, color:c, alpha:a});
+  if (sub) txt(sub, x, y + 28, {size:19, weight:600, color:C.muted, alpha:a});
+}
+function packet(s, x, y, a, c, w = 260){
+  box(x - w/2, y - 28, w, 56, a, {fill:'rgba(20,18,36,.92)', stroke:c, r:14});
+  txt(s, x, y, {size:21, weight:700, font:MONO, color:c, alpha:a});
+}
+function chip(s, x, y, a, c = C.text, o = {}){
+  const {size=22, font=FONT, weight=700, pad=18} = o;
+  if (a <= 0) return;
+  ctx.save(); ctx.font = `${weight} ${size}px ${font}`; const w = ctx.measureText(s).width + pad*2; ctx.restore();
+  box(x - w/2, y - size*.95, w, size*1.9, a, {fill:'#141428', stroke:c === C.text ? 'rgba(255,255,255,.25)' : c, r:12});
+  txt(s, x, y, {size, weight, color:c, alpha:a, font});
+}
+function vline(x, y1, y2, a){
+  if (a <= 0) return;
+  ctx.save(); al(a); ctx.strokeStyle = 'rgba(255,255,255,.22)'; ctx.lineWidth = 3; ctx.setLineDash([8, 8]);
+  ctx.beginPath(); ctx.moveTo(x, y1); ctx.lineTo(x, y2); ctx.stroke(); ctx.restore();
+}
+function code(title, lines, x, y, w, h, a, t, t0, size = 24, lh = 44){
+  panel(x, y, w, h, title, a);
+  lines.forEach(([s, c], i) => txt(s, x + 36, y + 96 + i*lh, {size, weight:600, font:MONO, color:c || C.text, align:'left', alpha:Math.min(a, eo(p(t, t0 + i*.25, t0 + i*.25 + .4)))}));
+}
+
+/* ============ 场景 1 · 钩子：点了三次，扣了三次 (0–7s) ============ */
+function s1(t){
+  rise('网络一卡，用户连点三次「支付」，钱扣了三次', W/2, 110, t, .2, {size:52, weight:900});
+  const a = eo(p(t, .6, 1.1));
+  box(200, 220, 380, 620, a, {fill:'rgba(255,255,255,.04)', stroke:'rgba(255,255,255,.3)', r:44});
+  txt('订单 A1001', 390, 320, {size:28, weight:800, color:C.muted, alpha:a});
+  txt('¥ 99.00', 390, 420, {size:60, weight:900, alpha:a});
+  txt('加载中…', 390, 520, {size:24, weight:700, color:C.gold, alpha:a*(.5 + .5*Math.sin(t*6))});
+  box(250, 650, 280, 90, a, {fill:'rgba(190,242,100,.18)', stroke:C.acc, r:20});
+  txt('立即支付', 390, 695, {size:32, weight:900, color:C.acc, alpha:a});
+  [1.3, 1.9, 2.5].forEach((ts, i) => { const k = p(t, ts, ts + .6);
+    if (k > 0 && k < 1){ ctx.save(); al(1 - k); ctx.strokeStyle = C.acc; ctx.lineWidth = 4; ctx.beginPath(); ctx.arc(390, 695, 30 + k*90, 0, 6.283); ctx.stroke(); ctx.restore(); }
+    txt('×' + (i + 1), 470 + i*0, 790, {size:30, weight:900, color:C.gold, alpha:t >= ts && t < [1.9, 2.5, 99][i] ? 1 : 0});
+    const m = p(t, ts + .1, ts + 1.1);
+    if (m > 0 && m < 1) packet('POST /pay', lerp(720, 920, eio(m)), 410 + i*90, clamp(m*5), C.text, 200);
+  });
+  ctx.save(); al(a*.6); ctx.strokeStyle = 'rgba(255,255,255,.3)'; ctx.setLineDash([10, 10]); ctx.lineWidth = 3; ctx.beginPath(); ctx.moveTo(600, 500); ctx.lineTo(1030, 500); ctx.stroke(); ctx.restore();
+  node('支付服务', '', 1160, 500, a, C.text, 240, 120);
+  panel(1380, 220, 420, 460, 'account_log', eo(p(t, .9, 1.4)));
+  [2.4, 3.0, 3.6].forEach((ts, i) => { const e = eo(p(t, ts, ts + .4));
+    txt('用户 42', 1420, 330 + i*70, {size:24, weight:700, color:C.muted, align:'left', alpha:e});
+    txt('- ¥99.00', 1760, 330 + i*70, {size:28, weight:900, font:MONO, color:C.rose, align:'right', alpha:e}); });
+  const s = eo(p(t, 4.2, 4.6));
+  ctx.save(); al(s); ctx.strokeStyle = 'rgba(255,255,255,.25)'; ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(1410, 545); ctx.lineTo(1770, 545); ctx.stroke(); ctx.restore();
+  txt('合计', 1420, 600, {size:26, weight:800, alpha:s, align:'left'}); txt('- ¥297.00', 1760, 600, {size:34, weight:900, font:MONO, color:C.rose, align:'right', alpha:s, glow:12});
+  rise('重复请求是常态，不是意外：写接口必须「幂等」', W/2, 960, t, 5, {size:38, weight:900, color:C.acc});
+}
+
+/* ============ 场景 2 · 重复请求从哪来 (7–18s) ============ */
+function s2(t){
+  rise('重复请求从哪来？', W/2, 90, t, 7.2, {size:56, weight:900});
+  const a = eo(p(t, 7.6, 8.1)), cx = 200, sx = 820;
+  txt('客户端', cx, 180, {size:30, weight:900, alpha:a}); txt('服务端', sx, 180, {size:30, weight:900, alpha:a});
+  vline(cx, 210, 740, a); vline(sx, 210, 740, a);
+  const e1 = eo(p(t, 7.9, 8.6));
+  arrow(cx + 12, 270, sx - 12, 270, e1, clamp(p(t, 7.9, 8.2)), C.text, 3); txt('① 扣款请求', 510, 240, {size:26, weight:800, alpha:clamp(p(t, 7.9, 8.2))});
+  chip('✓ 扣款成功', sx, 340, eo(p(t, 8.6, 9)), C.mint, {size:22});
+  const e2 = eo(p(t, 9.2, 9.8));
+  arrow(sx - 12, 420, lerp(sx - 12, 540, 1), 420, e2, clamp(p(t, 9.2, 9.5)), C.muted, 3);
+  txt('② 响应', 690, 390, {size:24, weight:800, color:C.muted, alpha:clamp(p(t, 9.2, 9.5))});
+  txt('✗', 510, 420, {size:52, weight:900, color:C.rose, alpha:eo(p(t, 9.7, 10))}); txt('丢包 / 超时', 380, 420, {size:22, weight:700, color:C.rose, alpha:eo(p(t, 9.8, 10.1))});
+  chip('等不到响应…', cx, 500, eo(p(t, 10.2, 10.6)), C.gold, {size:22});
+  const e3 = eo(p(t, 10.8, 11.4));
+  arrow(cx + 12, 580, sx - 12, 580, e3, clamp(p(t, 10.8, 11.1)), C.gold, 3); txt('③ 重试', 510, 550, {size:26, weight:800, color:C.gold, alpha:clamp(p(t, 10.8, 11.1))});
+  chip('✗ 又扣了一次', sx, 660, eo(p(t, 11.5, 11.9)), C.rose, {size:22});
+  [['用户连点 / 刷新重提交', '按钮没防抖，页面一卡就多点几下'], ['超时重试', '请求其实成功了，只是响应丢了'], ['网关、RPC 框架自动重试', '对超时或失败的调用自动再发一次'], ['MQ「至少一次」投递', '消费成功但确认没送达，消息会再来']].forEach(([h, d], i) =>
+    card(h, [d], 1000, 170 + i*155, 800, 135, eo(p(t, 8.4 + i*.9, 8.9 + i*.9)), C.acc, {hs:28, ls:23}));
+  const k = eo(p(t, 13.6, 14.1));
+  box(120, 820, 1680, 170, k, {fill:'rgba(255,211,138,.08)', stroke:C.gold, r:24});
+  txt('客户端分不清「没执行」和「执行了但响应丢了」，只能重试', W/2, 875, {size:32, weight:900, color:C.gold, alpha:k});
+  txt('所以服务端必须扛得住重复：同一个操作，执行多少次都只生效一次', W/2, 940, {size:26, weight:700, alpha:eo(p(t, 14.6, 15.1))});
+}
+
+/* ============ 场景 3 · 幂等的定义 (18–29s) ============ */
+function s3(t){
+  rise('幂等：执行一次和执行多次，效果相同', W/2, 90, t, 18.2, {size:54, weight:900});
+  rise('f(f(x)) = f(x)', W/2, 165, t, 18.7, {size:34, weight:700, font:MONO, color:C.acc});
+  [['余额 = 100', '✓ 幂等：执行几次，余额都是 100', C.mint], ['余额 = 余额 + 100', '✗ 不幂等：执行三次，多加了 200', C.rose], ['DELETE 订单 A1001', '✓ 幂等：删一次、删三次，结果都是「不存在」', C.mint]].forEach(([s, d, c], i) => {
+    const e = eo(p(t, 19.2 + i*.9, 19.7 + i*.9)), y = 240 + i*160;
+    box(120, y, 820, 135, e, {fill:'rgba(255,255,255,.04)', stroke:'rgba(255,255,255,.22)', r:18});
+    txt(s, 150, y + 42, {size:28, weight:800, font:MONO, align:'left', alpha:e});
+    txt(d, 150, y + 96, {size:24, weight:800, color:c, align:'left', alpha:eo(p(t, 19.6 + i*.9, 20 + i*.9))}); });
+  const a = eo(p(t, 22.2, 22.7));
+  box(1000, 240, 800, 455, a, {fill:'rgba(255,255,255,.03)', stroke:'rgba(255,255,255,.2)', r:20});
+  txt('HTTP 方法', 1040, 290, {size:28, weight:900, color:C.acc, align:'left', alpha:a});
+  [['GET', '✓', '只读取', C.mint], ['PUT', '✓', '整体替换成同一个值', C.mint], ['DELETE', '✓', '删完都是「不存在」', C.mint], ['POST', '✗', '通常每次都创建新资源', C.rose], ['PATCH', '？', '不保证，取决于实现', C.gold]].forEach(([m, ok, d, c], i) => {
+    const e = eo(p(t, 22.6 + i*.35, 23 + i*.35)), y = 360 + i*68;
+    txt(m, 1040, y, {size:26, weight:800, font:MONO, align:'left', alpha:e});
+    txt(ok, 1230, y, {size:30, weight:900, color:c, alpha:e});
+    txt(d, 1300, y, {size:24, weight:700, color:'#e2e6d6', align:'left', alpha:e}); });
+  rise('看的是服务端状态的「效果」，不是响应：第二次 DELETE 返回 404 也算幂等', W/2, 800, t, 25, {size:28, weight:800, color:C.gold});
+  rise('读接口天然幂等；真正要设计的是「写」：下单、扣款、发券、发消息', W/2, 880, t, 26, {size:28, weight:700});
+}
+
+/* ============ 场景 4 · 唯一约束与 Token (29–41s) ============ */
+function s4(t){
+  rise('方案一：唯一约束　　方案二：防重 Token', W/2, 90, t, 29.2, {size:52, weight:900});
+  const a = eo(p(t, 29.6, 30.1));
+  box(100, 160, 840, 830, a, {fill:'rgba(255,255,255,.025)', stroke:'rgba(255,255,255,.15)', r:24});
+  box(980, 160, 840, 830, eo(p(t, 34.4, 34.9)), {fill:'rgba(255,255,255,.025)', stroke:'rgba(255,255,255,.15)', r:24});
+  txt('唯一索引 / 去重表', 520, 210, {size:32, weight:900, color:C.acc, alpha:a});
+  [['请求 1', 300], ['请求 2', 740]].forEach(([s, x], i) => { const e = eo(p(t, 30.2 + i*.2, 30.6 + i*.2));
+    chip(s + '：INSERT A1001', x, 290, e, C.text, {size:21});
+    arrow(x, 320, 520 + (i ? 60 : -60), 395, eo(p(t, 30.6, 31.1)), e, C.text, 3); });
+  const d = eo(p(t, 31, 31.5));
+  box(330, 400, 380, 120, d, {fill:'rgba(190,242,100,.10)', stroke:C.acc, r:18});
+  txt('orders 表', 520, 440, {size:28, weight:900, alpha:d}); txt('UNIQUE (order_no)', 520, 485, {size:22, weight:700, font:MONO, color:C.acc, alpha:d});
+  txt('✓ 请求 1：插入成功', 150, 580, {size:26, weight:800, color:C.mint, align:'left', alpha:eo(p(t, 31.6, 32))});
+  txt('✗ 请求 2：Duplicate key，被数据库挡下', 150, 635, {size:26, weight:800, color:C.rose, align:'left', alpha:eo(p(t, 32, 32.4))});
+  txt('→ 捕获冲突，查出已有订单，返回同样的结果', 150, 690, {size:24, weight:700, align:'left', alpha:eo(p(t, 32.5, 32.9))});
+  code('SQL', [['CREATE UNIQUE INDEX uk_order_no', C.acc], ['    ON orders (order_no);']], 140, 745, 760, 205, eo(p(t, 33, 33.5)), t, 33.3, 23, 42);
+  const b = eo(p(t, 34.4, 34.9));
+  txt('Token 机制（防表单重复提交）', 1400, 210, {size:32, weight:900, color:C.acc, alpha:b});
+  [['① 打开下单页：服务端发一个 token', 'SET idem:tk_9f2 1 EX 600', 35.0],
+   ['② 用户提交：请求里带上这个 token', 'POST /orders  token=tk_9f2', 35.9],
+   ['③ 服务端原子删除，看返回值', 'DEL idem:tk_9f2', 36.8]].forEach(([h, c, ts], i) => { const e = eo(p(t, ts, ts + .5)), y = 260 + i*165;
+    box(1020, y, 760, 135, e, {fill:'rgba(190,242,100,.06)', stroke:'rgba(190,242,100,.45)', r:16});
+    txt(h, 1050, y + 42, {size:24, weight:800, align:'left', alpha:e});
+    txt(c, 1050, y + 94, {size:23, weight:700, font:MONO, color:C.acc, align:'left', alpha:e}); });
+  txt('返回 1 → 第一次，正常处理', 1050, 790, {size:26, weight:800, color:C.mint, align:'left', alpha:eo(p(t, 37.8, 38.2))});
+  txt('返回 0 → 重复提交，拒绝或返回已有结果', 1050, 845, {size:26, weight:800, color:C.gold, align:'left', alpha:eo(p(t, 38.3, 38.7))});
+  txt('不能先 GET 再 DEL：两个请求会同时「看到」token', 1050, 930, {size:23, weight:700, color:C.rose, align:'left', alpha:eo(p(t, 39, 39.4))});
+}
+
+/* ============ 场景 5 · 乐观锁与状态机 (41–52s) ============ */
+function s5(t){
+  rise('方案三：乐观锁版本号　　方案四：状态机', W/2, 90, t, 41.2, {size:52, weight:900});
+  code('扣款：带上读到的版本号', [['UPDATE account', C.acc], ['   SET balance = balance - 99,'], ['       version = version + 1'], [' WHERE id = 42 AND version = 5;', C.gold]], 120, 170, 820, 300, eo(p(t, 41.6, 42.1)), t, 41.9);
+  txt('第 1 次：影响 1 行 → 扣款成功，version 变成 6', 150, 530, {size:25, weight:800, color:C.mint, align:'left', alpha:eo(p(t, 43.2, 43.6))});
+  txt('第 2 次（重复）：影响 0 行 → 版本已变，不会再扣', 150, 590, {size:25, weight:800, color:C.gold, align:'left', alpha:eo(p(t, 43.9, 44.3))});
+  txt('「判断」和「修改」在同一条语句里，原子完成', 150, 660, {size:23, weight:700, color:C.muted, align:'left', alpha:eo(p(t, 44.6, 45))});
+  const a = eo(p(t, 45.2, 45.7));
+  const S = {wait:[1130, 230, '待支付', C.gold], paid:[1420, 230, '已支付', C.acc], ship:[1700, 230, '已发货', C.mint], cancel:[1130, 400, '已取消', C.muted]};
+  Object.values(S).forEach(([x, y, s, c], i) => { const e = eo(p(t, 45.3 + i*.2, 45.7 + i*.2));
+    box(x - 95, y - 38, 190, 76, e, {fill:'rgba(255,255,255,.05)', stroke:c, r:38}); txt(s, x, y, {size:26, weight:900, color:c, alpha:e}); });
+  arrow(1230, 230, 1318, 230, eo(p(t, 46, 46.5)), a, C.acc, 3); arrow(1520, 230, 1598, 230, eo(p(t, 46.2, 46.7)), a, C.mint, 3); arrow(1130, 272, 1130, 356, eo(p(t, 46.4, 46.9)), a, C.muted, 3);
+  txt('只能单向流转', 1480, 400, {size:24, weight:800, color:C.muted, alpha:eo(p(t, 46.8, 47.2))});
+  code('支付回调', [["UPDATE orders SET status = '已支付'", C.acc], [" WHERE id = 1001 AND status = '待支付';", C.gold]], 1000, 470, 820, 200, eo(p(t, 47.4, 47.9)), t, 47.7, 23, 44);
+  txt('影响 1 行 → 状态推进，再执行后续逻辑', 1030, 730, {size:25, weight:800, color:C.mint, align:'left', alpha:eo(p(t, 48.6, 49))});
+  txt('影响 0 行 → 已支付过（或已取消），直接返回', 1030, 790, {size:25, weight:800, color:C.gold, align:'left', alpha:eo(p(t, 49.1, 49.5))});
+  rise('共同点：把「检查」写进 WHERE 条件，用影响行数判断是不是第一次', W/2, 920, t, 49.8, {size:30, weight:900, color:C.acc});
+}
+
+/* ============ 场景 6 · 幂等键 (52–64s) ============ */
+function s6(t){
+  rise('幂等键 Idempotency-Key：支付 API 的常见做法', W/2, 90, t, 52.2, {size:50, weight:900});
+  code('请求', [['POST /v1/payments'], ['Idempotency-Key: 7f3a9c1e-…', C.acc], ['{ "amount": 9900,'], ['  "order": "A1001" }']], 120, 170, 760, 310, eo(p(t, 52.6, 53.1)), t, 52.9, 24, 46);
+  txt('客户端为「这一次操作」生成唯一 key', 150, 525, {size:24, weight:800, color:C.gold, align:'left', alpha:eo(p(t, 54, 54.4))});
+  txt('超时重试时，原样带上同一个 key', 150, 570, {size:24, weight:800, color:C.gold, align:'left', alpha:eo(p(t, 54.4, 54.8))});
+  const a = eo(p(t, 54.8, 55.3));
+  box(960, 170, 840, 80, a, {fill:'rgba(190,242,100,.14)', stroke:C.acc, r:18, glow:12});
+  txt('服务端：这个 key 见过吗？', 1380, 210, {size:30, weight:900, color:C.acc, alpha:a});
+  [['没见过', '记下 key（处理中）→ 执行 → 保存响应', C.mint], ['已完成', '直接返回第一次保存的响应', C.acc], ['处理中', '返回 409，提示稍后重试', C.gold], ['参数变了', '报错：同一个 key 不能换请求内容', C.rose]].forEach(([k, d, c], i) => {
+    const e = eo(p(t, 55.6 + i*.8, 56.1 + i*.8)), y = 320 + i*105;
+    ctx.save(); al(e*a); ctx.strokeStyle = 'rgba(255,255,255,.25)'; ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(990, 252); ctx.lineTo(990, y); ctx.lineTo(1010, y); ctx.stroke(); ctx.restore();
+    txt(k, 1020, y, {size:25, weight:900, color:c, align:'left', alpha:e});
+    box(1160, y - 36, 640, 72, e, {fill:'rgba(255,255,255,.04)', stroke:c, r:14});
+    txt(d, 1185, y, {size:23, weight:700, align:'left', alpha:e}); });
+  card('分布式锁 + 判重', ['① 按业务 key 加分布式锁', '② 查处理记录：做过 → 直接返回结果', '③ 没做过 → 执行业务，写入处理记录', '④ 释放锁'], 120, 630, 760, 320, eo(p(t, 59.2, 59.7)), C.acc, {ls:23, lh:50, t0:59.5, t});
+  txt('锁挡住同时到达的重复，判重挡住先后到达的重复', 1380, 790, {size:25, weight:800, color:C.muted, alpha:eo(p(t, 61.4, 61.8))});
+  rise('重复请求拿到的，应该是和第一次一模一样的结果', 1380, 890, t, 62, {size:30, weight:900, color:C.acc});
+}
+
+/* ============ 场景 7 · MQ 消费幂等与三个坑 (64–76s) ============ */
+function s7(t){
+  rise('MQ 消费幂等，以及三个坑', W/2, 90, t, 64.2, {size:54, weight:900});
+  const a = eo(p(t, 64.6, 65.1));
+  node('生产者', '', 240, 260, a, C.text, 220, 100); node('消息队列', '', 720, 260, a, C.text, 240, 100); node('消费者', '', 1200, 260, a, C.text, 220, 100);
+  node('去重表', 'UNIQUE (msg_id)', 1650, 260, a, C.acc, 260, 100);
+  arrow(352, 260, 596, 260, eo(p(t, 65, 65.5)), a, C.muted, 3);
+  [[65.4, 230, '第 1 次'], [66.8, 290, '重新投递']].forEach(([ts, y, s], i) => { const k = p(t, ts, ts + 1);
+    if (k > 0 && k < 1) packet('m-1001', lerp(925, 1005, eio(k)), y, clamp(k*5), i ? C.gold : C.text, 140); });
+  arrow(1312, 260, 1516, 260, eo(p(t, 66.2, 66.6)), a, C.acc, 3);
+  txt('✓ 第 1 次：插入成功 → 处理业务 → ack', 1200, 360, {size:23, weight:800, color:C.mint, alpha:eo(p(t, 66.4, 66.8))});
+  txt('ack 丢失 → 同一条消息再投一次', 640, 360, {size:23, weight:800, color:C.gold, alpha:eo(p(t, 66.6, 67))});
+  txt('↻ 第 2 次：msg_id 已存在 → 跳过业务，直接 ack', 1200, 405, {size:23, weight:800, color:C.acc, alpha:eo(p(t, 67.8, 68.2))});
+  rise('「至少一次」投递 + 消费端去重 = 效果上的「恰好一次」', W/2, 490, t, 68.4, {size:30, weight:900, color:C.gold});
+  [['坑一：先查后插的竞态', ['两个请求同时查：都「不存在」', '于是都插入、都执行了业务', '→ 用唯一约束或原子操作兜底', '→ 去重记录与业务放同一事务']],
+   ['坑二：去重记录留多久', ['太短：重试还没结束就被清掉', '太长：存储一直膨胀', '→ 至少覆盖最大重试窗口', '→ 按业务定，如保留 24 小时']],
+   ['坑三：重复请求返回什么', ['不该报「重复提交」错误', '而是返回第一次的结果', '→ 客户端才能放心重试', '→ 需要把首次响应存下来']]].forEach(([h, ls], i) =>
+    card(h, ls, 120 + i*570, 570, 540, 340, eo(p(t, 69.6 + i*1.6, 70.1 + i*1.6)), i === 0 ? C.rose : i === 1 ? C.gold : C.acc, {ls:23, lh:62, t0:69.9 + i*1.6, t}));
+}
+
+/* ============ 场景 8 · 收尾 (76–82s) ============ */
+function s8(t){
+  [['唯一约束', '数据库兜底'], ['Token', '防重复提交'], ['条件更新', '版本号 / 状态机'], ['幂等键', '返回首次结果']].forEach(([a, b], i) => {
+    const st = 76.2 + i*.25, e = eback(p(t, st, st + .5)); if (e <= 0) return;
+    const x = 330 + i*420, y = 330;
+    ctx.save(); ctx.translate(x, y); ctx.scale(e, e); ctx.translate(-x, -y);
+    box(x - 185, y - 90, 370, 180, clamp(e), {fill:'rgba(190,242,100,.08)', stroke:'rgba(190,242,100,.5)', r:26}); ctx.restore();
+    txt(a, x, y - 22, {size:40, weight:900, color:C.acc, alpha:clamp(e)}); txt(b, x, y + 40, {size:24, weight:600, color:C.muted, alpha:clamp(e)});
+  });
+  rise('网络可以重试，钱只能扣一次', W/2, 600, t, 77.2, {size:62, weight:900, glow:22});
+  rise('关注拾星，一起搞懂后端', W/2, 760, t, 78, {size:36, weight:500, color:C.muted});
+}
+/* ============ 总调度 ============ */
+const SCENES = [[s1,-1,7],[s2,7,18],[s3,18,29],[s4,29,41],[s5,41,52],[s6,52,64],[s7,64,76],[s8,76,82]];
+function draw(t){
+  t = clamp(t, 0, DUR);
+  ctx.save(); ctx.globalAlpha = 1; ctx.clearRect(0,0,W,H); background(t);
+  for (const [fn,a,b] of SCENES){
+    if (t < a || t > b) continue;
+    SA = sceneA(t, a, b, b === DUR ? .8 : .5);
+    if (SA > 0){ ctx.save(); fn(t); ctx.restore(); }
+  }
+  SA = 1; vignette();
+  const fo = p(t, DUR - .8, DUR);
+  if (fo > 0){ ctx.globalAlpha = fo; ctx.fillStyle = '#000'; ctx.fillRect(0,0,W,H); }
+  ctx.restore();
+}
+
+/* ============ 播放器 / 逐帧渲染接口 ============ */
+const isRender = new URLSearchParams(location.search).has('render');
+window.DURATION = DUR;
+window.renderFrame = t => draw(t);
+const btn = document.getElementById('btn'), seek = document.getElementById('seek'), timeEl = document.getElementById('time');
+const fmt = s => `${Math.floor(s/60)}:${String(Math.floor(s%60)).padStart(2,'0')}`;
+function fit(){
+  if (isRender){ cv.style.width = W+'px'; cv.style.height = H+'px'; return; }
+  const w = Math.min(innerWidth - 32, (innerHeight - 84)*16/9);
+  cv.style.width = w + 'px'; cv.style.height = w*9/16 + 'px';
+}
+addEventListener('resize', fit); fit();
+
+let cur = 0, playing = !isRender, last = null;
+function toggle(){ if (cur >= DUR) cur = 0; playing = !playing; }
+btn.onclick = toggle; cv.onclick = toggle;
+addEventListener('keydown', e => { if (e.code === 'Space'){ e.preventDefault(); toggle(); } });
+seek.oninput = () => { cur = +seek.value; draw(cur); };
+function loop(ts){
+  if (playing && last != null){ cur += (ts - last)/1000; if (cur >= DUR){ cur = DUR; playing = false; } }
+  last = ts; draw(cur);
+  seek.value = cur; timeEl.textContent = `${fmt(cur)} / ${fmt(DUR)}`;
+  btn.textContent = playing ? '❚❚' : (cur >= DUR ? '↺' : '▶');
+  requestAnimationFrame(loop);
+}
+document.fonts.ready.then(() => {
+  window.ready = true;
+  if (isRender) draw(0); else requestAnimationFrame(loop);
+});
+</script>
+</body>
+</html>

@@ -1,0 +1,1027 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>RPC 原理：像调本地方法一样调远程服务 · 拾星</title>
+<meta name="description" content="RPC 的目标与完整调用链路，动态代理与反射、序列化方式对比、协议帧与粘包拆包、请求 ID 多路复用，服务发现、负载均衡与超时重试，RPC 与 HTTP REST 的取舍，附 Java 21 手写迷你 RPC">
+<link rel="stylesheet" href="../assets/article.css">
+<style>:root{--acc:#c4b5fd}</style>
+</head>
+<body>
+<div class="wrap">
+  <nav class="top"><a href="../index.html">← 拾星 · 全部内容</a><a class="watch" href="landscape.html">▶ 看视频</a></nav>
+  <header class="hero">
+    <div class="tag">拾星 · 计算机与后端</div>
+    <h1>RPC 原理：像调本地方法一样调远程服务</h1>
+    <p>RPC 的目标与完整调用链路，动态代理与反射、序列化方式对比、协议帧与粘包拆包、请求 ID 多路复用，服务发现、负载均衡与超时重试，RPC 与 HTTP REST 的取舍，附 Java 21 手写迷你 RPC</p>
+    <div class="meta">约 50 分钟读完 · 配套视频 1:24</div>
+  </header>
+  <nav class="toc">
+<ul>
+<li><a href="#rpc">为什么需要 RPC</a></li>
+<li><a href="#_2">一次调用的完整链路</a></li>
+<li><a href="#_3">两端的关键：动态代理与反射</a></li>
+<li><a href="#_5">序列化：对象 ⇄ 字节</a></li>
+<li><a href="#_8">协议设计：给字节流划出边界</a></li>
+<li><a href="#id">请求 ID：一条连接上的多路复用</a></li>
+<li><a href="#java-21-rpc">动手：用 Java 21 写一个迷你 RPC</a></li>
+<li><a href="#_12">服务治理：让远程调用可靠</a></li>
+<li><a href="#rpc-http-rest">RPC 还是 HTTP REST</a></li>
+<li><a href="#_20">实践中的坑</a></li>
+<li><a href="#_21">高频面试题速答</a></li>
+<li><a href="#_22">总结</a></li>
+</ul>
+</nav>
+
+  <article>
+<figure><img src="img/f-6.4.jpg" alt="一行看似普通的方法调用，背后是一整条跨机器的链路" loading="lazy"><figcaption>一行看似普通的方法调用，背后是一整条跨机器的链路</figcaption></figure>
+<h2 id="rpc">为什么需要 RPC</h2>
+<p>一个系统刚开始往往是<strong>单体应用</strong>：下单、用户、库存、支付都在同一个进程里，订单模块要查用户，直接调用 <code>userService.getUser(42)</code> 就行，几纳秒到几微秒就返回了。</p>
+<p>随着业务和团队变大，系统会被拆成多个独立部署的服务（微服务）。用户服务跑在另一组机器上，订单服务想拿到用户信息，就必须<strong>通过网络</strong>去问它。最原始的做法是自己动手：</p>
+<ol>
+<li>拼一个 HTTP 请求，把参数转成 JSON；</li>
+<li>选一台用户服务的机器，建立连接，发出去；</li>
+<li>等响应，处理超时、连接失败；</li>
+<li>把返回的 JSON 解析回对象，判断是成功还是出错。</li>
+</ol>
+<p>每调一个接口都写一遍，既啰嗦又容易出错。<strong>RPC</strong>（Remote Procedure Call，远程过程调用）要解决的就是这件事：</p>
+<blockquote>
+<p><strong>让调用远程服务，看起来就像调用一个本地方法。</strong></p>
+</blockquote>
+<p>调用方只面对一个接口：</p>
+<pre><code class="language-java">String r = helloService.hello(&quot;拾星&quot;);   // 实际上在另一台机器上执行
+</code></pre>
+<p>序列化、网络传输、找机器、超时处理……全部由 RPC 框架在背后完成。RPC 这个概念早在 20 世纪 80 年代就被系统地提出并实现，后来的 CORBA、Java RMI、Thrift、Dubbo、gRPC 都是这一思想在不同时代的实现。</p>
+<h3 id="_1">远程调用终究不是本地调用</h3>
+<p>「像本地调用一样」只是<strong>写法上</strong>的像。本质上有几处根本不同，后文的很多设计都是为了应对它们：</p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>本地调用</th>
+<th>远程调用</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>耗时</td>
+<td>纳秒～微秒</td>
+<td>内网通常是亚毫秒到毫秒级，跨地域可达几十毫秒以上</td>
+</tr>
+<tr>
+<td>失败方式</td>
+<td>要么成功，要么抛异常</td>
+<td>还可能<strong>超时</strong>：不知道对方到底执行了没有</td>
+</tr>
+<tr>
+<td>参数传递</td>
+<td>传引用，双方共享同一块内存</td>
+<td>只能<strong>按值</strong>传递：参数被序列化成字节，对方拿到的是一份拷贝</td>
+</tr>
+<tr>
+<td>部分失败</td>
+<td>进程挂了大家一起挂</td>
+<td>对方可能挂了、慢了、网络断了，而你还活着</td>
+</tr>
+<tr>
+<td>版本</td>
+<td>编译时就一致</td>
+<td>双方独立部署，接口可能不一致</td>
+</tr>
+</tbody>
+</table>
+<p>一篇经典的技术报告《A Note on Distributed Computing》（1994）专门论证过：试图把远程对象和本地对象完全等同看待，是很多分布式系统问题的根源。好的 RPC 框架会让调用<strong>写起来</strong>像本地调用，但工程师心里必须清楚：<strong>网络还在那里</strong>。</p>
+<h2 id="_2">一次调用的完整链路</h2>
+<figure><img src="img/f-16.jpg" alt="客户端从业务代码到网络，服务端从网络到实现类，结果原路返回" loading="lazy"><figcaption>客户端从业务代码到网络，服务端从网络到实现类，结果原路返回</figcaption></figure>
+<p>把 <code>helloService.hello("拾星")</code> 这一次调用拆开，会经过下面这些步骤：</p>
+<table>
+<thead>
+<tr>
+<th>步骤</th>
+<th>位置</th>
+<th>做了什么</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>① 业务代码</td>
+<td>客户端</td>
+<td>调用接口方法，以为它是本地对象</td>
+</tr>
+<tr>
+<td>② 代理 Stub</td>
+<td>客户端</td>
+<td>框架生成的代理对象拦截调用，把「调哪个接口、哪个方法、什么参数」打包成<strong>请求对象</strong>，分配<strong>请求 ID</strong></td>
+</tr>
+<tr>
+<td>③ 服务发现 + 负载均衡</td>
+<td>客户端</td>
+<td>从注册中心拿到的地址列表里选一台服务器，从连接池拿一条连接</td>
+</tr>
+<tr>
+<td>④ 序列化</td>
+<td>客户端</td>
+<td>请求对象 → 字节</td>
+</tr>
+<tr>
+<td>⑤ 协议编码</td>
+<td>客户端</td>
+<td>加上帧头（魔数、版本、请求 ID、长度……），变成一个完整的<strong>帧</strong></td>
+</tr>
+<tr>
+<td>⑥ 网络传输</td>
+<td>TCP</td>
+<td>字节流发往服务端</td>
+</tr>
+<tr>
+<td>⑦ 协议解码</td>
+<td>服务端</td>
+<td>从字节流中按长度切出完整的一帧</td>
+</tr>
+<tr>
+<td>⑧ 反序列化</td>
+<td>服务端</td>
+<td>字节 → 请求对象</td>
+</tr>
+<tr>
+<td>⑨ 调度 + 反射调用</td>
+<td>服务端</td>
+<td>按「接口名 + 方法名 + 参数类型」找到实现类和方法，放进业务线程池执行</td>
+</tr>
+<tr>
+<td>⑩ 原路返回</td>
+<td>两端</td>
+<td>结果（或异常）→ 序列化 → 编码 → 网络 → 客户端解码 → 反序列化 → 按请求 ID 唤醒等待的调用方</td>
+</tr>
+</tbody>
+</table>
+<p>最早的 RPC 设计就把这套结构概括为：<strong>用户代码 ↔ 用户 Stub ↔ RPC 运行时 ↔ 网络 ↔ RPC 运行时 ↔ 服务端 Stub ↔ 服务实现</strong>。几十年过去，框架换了一代又一代，骨架基本没变。</p>
+<p>下面按顺序拆开每一层。</p>
+<h2 id="_3">两端的关键：动态代理与反射</h2>
+<figure><img src="img/f-27.jpg" alt="客户端用动态代理把方法调用变成请求对象，服务端用反射找到实现并调用" loading="lazy"><figcaption>客户端用动态代理把方法调用变成请求对象，服务端用反射找到实现并调用</figcaption></figure>
+<h3 id="stub">客户端：Stub 是怎么来的</h3>
+<p>调用方手里只有一个<strong>接口</strong>，没有实现类。那 <code>helloService</code> 这个对象是哪来的？答案是 RPC 框架在运行时（或编译时）<strong>生成了一个实现了该接口的代理对象</strong>，也叫 <strong>Stub</strong>（桩）。它的每个方法都只做一件事：把调用信息打包，发出去，等结果。</p>
+<p>生成 Stub 的方式主要有三种：</p>
+<table>
+<thead>
+<tr>
+<th>方式</th>
+<th>原理</th>
+<th>例子</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>JDK 动态代理</td>
+<td><code>java.lang.reflect.Proxy</code> 在运行时生成实现指定接口的类，所有方法调用都转到一个 <code>InvocationHandler</code></td>
+<td>本文的迷你 RPC；很多框架的默认或可选实现</td>
+</tr>
+<tr>
+<td>字节码生成</td>
+<td>用 Javassist、ByteBuddy 等直接生成代理类的字节码，少一层反射分派，性能更好</td>
+<td>Dubbo 默认使用 Javassist 生成代理</td>
+</tr>
+<tr>
+<td>IDL 代码生成</td>
+<td>先写接口描述文件（IDL），再用工具<strong>在编译前</strong>生成客户端 Stub 和服务端骨架代码</td>
+<td>gRPC（<code>.proto</code>）、Thrift（<code>.thrift</code>）</td>
+</tr>
+</tbody>
+</table>
+<p>JDK 动态代理的核心只有几行：</p>
+<pre><code class="language-java">HelloService hs = (HelloService) Proxy.newProxyInstance(loader,
+    new Class&lt;?&gt;[]{HelloService.class},
+    (proxy, method, args) -&gt; {
+        var req = new RpcRequest(nextId(), &quot;HelloService&quot;,
+                method.getName(), method.getParameterTypes(), args);
+        return client.send(req).get(3, TimeUnit.SECONDS);   // 发出去，等结果
+    });
+</code></pre>
+<p>注意请求里除了方法名，还带上了<strong>参数类型列表</strong>：Java 允许方法重载，<code>hello(String)</code> 和 <code>hello(String, int)</code> 是两个不同的方法，只靠名字找不准。</p>
+<h3 id="_4">服务端：从「名字」找到「方法」</h3>
+<p>服务端启动时，把实现类注册到一张表里：<code>接口名 → 实现对象</code>。收到请求后：</p>
+<pre><code class="language-java">Object impl = services.get(req.iface());
+Method m = impl.getClass().getMethod(req.method(), req.paramTypes());
+Object result = m.invoke(impl, req.args());
+</code></pre>
+<p>这就是最朴素的<strong>反射调用</strong>。生产级框架会做一些优化：</p>
+<ul>
+<li><strong>缓存 Method 对象</strong>：<code>getMethod</code> 查找有开销，可以在启动时就建好「方法签名 → Method」的映射；</li>
+<li><strong>避免反射</strong>：Dubbo 会为实现类生成一个 Wrapper 类，用普通的 <code>if/switch</code> 直接调用方法；gRPC 由代码生成器生成服务端骨架，按方法编号分派，同样不需要反射；</li>
+<li><strong>线程模型</strong>：网络 I/O 线程只负责收发和解码，业务逻辑放到独立的<strong>业务线程池</strong>执行，否则一个慢方法会卡住整条连接的收发。业务线程池满了，就要拒绝请求（Dubbo 里常见的「线程池耗尽」报错就是这种情况，线程池原理见本系列《线程池》）。</li>
+</ul>
+<h2 id="_5">序列化：对象 ⇄ 字节</h2>
+<figure><img src="img/f-39.jpg" alt="JSON 与 Protobuf 编码同一个对象的对比，以及四种序列化方式的特点" loading="lazy"><figcaption>JSON 与 Protobuf 编码同一个对象的对比，以及四种序列化方式的特点</figcaption></figure>
+<p>网络上只能传字节。<strong>序列化</strong>把内存里的对象变成字节，<strong>反序列化</strong>再变回来。它直接决定了三件事：<strong>传多少字节</strong>、<strong>编解码要花多少 CPU</strong>、<strong>能不能跨语言</strong>。</p>
+<h3 id="_6">同一个对象，两种编码</h3>
+<p>对象 <code>User{id=150, name="拾星"}</code>：</p>
+<ul>
+<li><strong>JSON</strong>：<code>{"id":150,"name":"拾星"}</code>，<strong>26 字节</strong>。字段名原样带着，人能直接看懂；</li>
+<li><strong>Protobuf</strong>：<code>08 96 01 12 06 e6 8b be e6 98 9f</code>，<strong>11 字节</strong>。</li>
+</ul>
+<p>Protobuf 之所以小，是因为它<strong>不传字段名</strong>，只传「字段编号 + 值」。双方事先通过 <code>.proto</code> 文件约定好「1 号字段是 id，2 号字段是 name」。逐字节拆开：</p>
+<table>
+<thead>
+<tr>
+<th>字节</th>
+<th>含义</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>08</code></td>
+<td>tag = (字段编号 1 &lt;&lt; 3) | 线路类型 0（varint）</td>
+</tr>
+<tr>
+<td><code>96 01</code></td>
+<td>150 的 varint 编码</td>
+</tr>
+<tr>
+<td><code>12</code></td>
+<td>tag = (字段编号 2 &lt;&lt; 3) | 线路类型 2（长度前缀）</td>
+</tr>
+<tr>
+<td><code>06</code></td>
+<td>后面跟着 6 个字节</td>
+</tr>
+<tr>
+<td><code>e6 8b be e6 98 9f</code></td>
+<td>「拾星」的 UTF-8 编码</td>
+</tr>
+</tbody>
+</table>
+<p><strong>varint</strong> 是一种变长整数：每个字节只用低 7 位存数据，最高位为 1 表示「后面还有字节」。小数字只占 1 个字节，这对 ID、数量、状态码这类通常不大的整数非常省空间。</p>
+<p>下面这段 Python 不依赖任何库，手工实现了上面的编码过程：</p>
+<pre><code class="language-python">import json
+
+def varint(n):
+    &quot;&quot;&quot;Protobuf 的变长整数：每字节低 7 位存数据，最高位 1 表示「后面还有」&quot;&quot;&quot;
+    out = bytearray()
+    while True:
+        b, n = n &amp; 0x7F, n &gt;&gt; 7
+        if n:
+            out.append(b | 0x80)
+        else:
+            out.append(b)
+            return bytes(out)
+
+def field(number, wire_type, payload):
+    # 每个字段前面是一个 tag = (字段编号 &lt;&lt; 3) | 线路类型
+    return varint(number &lt;&lt; 3 | wire_type) + payload
+
+user = {&quot;id&quot;: 150, &quot;name&quot;: &quot;拾星&quot;}
+
+js = json.dumps(user, ensure_ascii=False, separators=(&quot;,&quot;, &quot;:&quot;)).encode()
+name = user[&quot;name&quot;].encode()
+pb = field(1, 0, varint(user[&quot;id&quot;])) + field(2, 2, varint(len(name)) + name)   # 0=varint, 2=长度前缀
+
+print(&quot;JSON    &quot;, len(js), &quot;字节:&quot;, js.decode())
+print(&quot;Protobuf&quot;, len(pb), &quot;字节:&quot;, pb.hex(&quot; &quot;))
+print(&quot;150 的 varint:&quot;, varint(150).hex(&quot; &quot;), &quot;| 1 的 varint:&quot;, varint(1).hex(&quot; &quot;), &quot;| 300 的 varint:&quot;, varint(300).hex(&quot; &quot;))
+</code></pre>
+<p>输出：</p>
+<pre><code class="language-text">JSON     26 字节: {&quot;id&quot;:150,&quot;name&quot;:&quot;拾星&quot;}
+Protobuf 11 字节: 08 96 01 12 06 e6 8b be e6 98 9f
+150 的 varint: 96 01 | 1 的 varint: 01 | 300 的 varint: ac 02
+</code></pre>
+<p>用官方的 <code>protobuf</code> 库按同样的定义（<code>int64 id = 1; string name = 2;</code>）序列化，得到的字节完全一致。</p>
+<h3 id="_7">常见序列化方式对比</h3>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>JSON</th>
+<th>Protobuf</th>
+<th>Hessian</th>
+<th>Kryo</th>
+<th>JDK 自带序列化</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>格式</td>
+<td>文本</td>
+<td>二进制</td>
+<td>二进制</td>
+<td>二进制</td>
+<td>二进制</td>
+</tr>
+<tr>
+<td>需要 IDL</td>
+<td>否</td>
+<td>是（<code>.proto</code>）</td>
+<td>否，自描述</td>
+<td>否</td>
+<td>否</td>
+</tr>
+<tr>
+<td>跨语言</td>
+<td>好</td>
+<td>好</td>
+<td>有多语言实现，Java 生态用得最多</td>
+<td>基本只用于 Java</td>
+<td>只能 Java</td>
+</tr>
+<tr>
+<td>体积 / 速度</td>
+<td>体积大、解析较慢</td>
+<td>体积小、速度快</td>
+<td>中等</td>
+<td>体积小、速度快</td>
+<td>体积大、较慢</td>
+</tr>
+<tr>
+<td>可读性</td>
+<td>人能直接读</td>
+<td>需要工具解码</td>
+<td>需要工具解码</td>
+<td>需要工具解码</td>
+<td>需要工具解码</td>
+</tr>
+<tr>
+<td>典型使用</td>
+<td>HTTP REST、对外接口</td>
+<td>gRPC 默认</td>
+<td>Dubbo 2.x 默认（Hessian2）</td>
+<td>Java 内部高性能通信、缓存</td>
+<td>不推荐用于跨服务通信</td>
+</tr>
+</tbody>
+</table>
+<p>几点补充：</p>
+<ul>
+<li><strong>Protobuf 的兼容性规则</strong>：字段靠编号识别，所以<strong>不能修改已有字段的编号和类型</strong>；新增字段是安全的（老代码会跳过不认识的字段）；删除字段后要把编号标记为 <code>reserved</code>，防止将来被复用；</li>
+<li><strong>Kryo</strong> 为了又快又小，默认要求提前<strong>注册类</strong>（把类映射成一个整数 ID），不同服务的注册顺序必须一致，否则解不出来；</li>
+<li><strong>安全</strong>：能「根据字节流里的类名创建任意对象」的序列化方式，都可能被构造恶意数据触发<strong>反序列化漏洞</strong>。JDK 序列化和一些 JSON、Hessian 库都出过这类问题。生产中要开启类白名单，不要反序列化不可信来源的数据。</li>
+</ul>
+<p>选型时问自己三个问题：<strong>要不要跨语言？要不要人能直接读？对性能有多敏感？</strong> 对内的高频调用通常选 Protobuf 或 Hessian 这类二进制格式；对外开放、需要调试方便的接口选 JSON。</p>
+<h2 id="_8">协议设计：给字节流划出边界</h2>
+<figure><img src="img/f-52.jpg" alt="TCP 字节流中的粘包与拆包，以及自定义协议帧的结构" loading="lazy"><figcaption>TCP 字节流中的粘包与拆包，以及自定义协议帧的结构</figcaption></figure>
+<p>序列化得到一串字节后，还不能直接往 TCP 连接里写，因为 <strong>TCP 是字节流，没有「消息」的概念</strong>（TCP 本身的原理见本系列《TCP 三次握手》）。</p>
+<h3 id="_9">粘包与拆包</h3>
+<p>发送端连续写了 3 条消息，接收端调用 <code>read</code> 时，可能出现：</p>
+<ul>
+<li><strong>粘包</strong>：一次 <code>read</code> 读到了「消息 1 + 消息 2 的前半部分」；</li>
+<li><strong>拆包</strong>：消息 2 被拆成两半，分两次 <code>read</code> 才读完。</li>
+</ul>
+<p>原因有很多：发送端的 Nagle 算法会把小数据攒在一起发；一条大消息超过 MSS 会被拆成多个 TCP 段；接收端 <code>read</code> 时缓冲区里有多少就读多少……这些都是 TCP 的正常行为。严格来说「粘包」不是 TCP 的 bug，而是<strong>应用层协议没有定义消息边界</strong>。</p>
+<h3 id="_10">三种划分边界的方法</h3>
+<table>
+<thead>
+<tr>
+<th>方法</th>
+<th>做法</th>
+<th>例子</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>定长</td>
+<td>每条消息固定 N 字节，不足补齐</td>
+<td>少见，浪费空间</td>
+</tr>
+<tr>
+<td>分隔符</td>
+<td>用特殊字符标记消息结尾</td>
+<td>HTTP/1.1 的请求头以空行 <code>\r\n\r\n</code> 结束；按行分隔的文本协议</td>
+</tr>
+<tr>
+<td><strong>长度字段</strong></td>
+<td>消息前面写上消息体的长度</td>
+<td>绝大多数 RPC 协议；HTTP 的 <code>Content-Length</code>；gRPC；Thrift 的 Framed 传输</td>
+</tr>
+</tbody>
+</table>
+<p>RPC 协议几乎都用<strong>长度字段</strong>：先读一个固定长度的帧头，从中拿到消息体的长度 N，再读满 N 个字节，正好是一条完整的消息。Netty 提供了现成的 <code>LengthFieldBasedFrameDecoder</code> 做这件事，大多数基于 Netty 的 RPC 框架都直接用它。</p>
+<h3 id="_11">一个帧头里放什么</h3>
+<p>本文迷你 RPC 的帧头固定 17 字节：</p>
+<table>
+<thead>
+<tr>
+<th>字段</th>
+<th>长度</th>
+<th>作用</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>魔数</td>
+<td>2 字节</td>
+<td>固定值（这里是 <code>0xCAFE</code>），一眼认出「这是我的协议」。端口被扫描、连错服务时可以立即断开，而不是把乱码当成一个超大的长度去读</td>
+</tr>
+<tr>
+<td>版本</td>
+<td>1 字节</td>
+<td>协议升级时新老版本共存</td>
+</tr>
+<tr>
+<td>序列化方式</td>
+<td>1 字节</td>
+<td>告诉对方用哪种方式反序列化消息体</td>
+</tr>
+<tr>
+<td>消息类型</td>
+<td>1 字节</td>
+<td>请求、响应、心跳……</td>
+</tr>
+<tr>
+<td>请求 ID</td>
+<td>8 字节</td>
+<td>把响应和请求对应起来（下一节的核心）</td>
+</tr>
+<tr>
+<td>长度</td>
+<td>4 字节</td>
+<td>消息体有多少字节</td>
+</tr>
+<tr>
+<td>消息体</td>
+<td>N 字节</td>
+<td>序列化后的请求或响应对象</td>
+</tr>
+</tbody>
+</table>
+<p>真实的协议大同小异：</p>
+<ul>
+<li><strong>Dubbo 协议</strong>：16 字节帧头，依次是魔数 <code>0xdabb</code>（2 字节）、标志位（1 字节，包含请求/响应、是否需要回复、是否为心跳等事件、序列化方式编号）、状态（1 字节，用于响应）、请求 ID（8 字节）、消息体长度（4 字节）；</li>
+<li><strong>gRPC</strong>：跑在 HTTP/2 上，每条消息前面是 1 字节的「是否压缩」标志加 4 字节长度，然后是 Protobuf 消息体；调用哪个方法写在 HTTP/2 的 <code>:path</code> 伪头里，形如 <code>/包名.服务名/方法名</code>；</li>
+<li><strong>心跳</strong>：长连接上长时间没有数据时，定期发送心跳帧，及时发现「半死」的连接（对方机器断电了，TCP 并不会马上知道）。</li>
+</ul>
+<h2 id="id">请求 ID：一条连接上的多路复用</h2>
+<figure><img src="img/f-64.jpg" alt="一条连接上同时发出多个请求，响应乱序返回，靠请求 ID 对号；右侧是服务治理的四项能力" loading="lazy"><figcaption>一条连接上同时发出多个请求，响应乱序返回，靠请求 ID 对号；右侧是服务治理的四项能力</figcaption></figure>
+<p>如果一条连接上只能「发一个请求、等它的响应、再发下一个」，那么一个慢请求就会挡住后面所有请求，想要并发就只能开很多连接。</p>
+<p><strong>请求 ID</strong> 解决了这个问题：</p>
+<ol>
+<li>客户端为每个请求分配一个唯一的 ID，并在一张<strong>等待表</strong>里登记 <code>ID → Future</code>；</li>
+<li>多个请求可以连续写到<strong>同一条连接</strong>上，不必等前一个返回；</li>
+<li>服务端并发处理，哪个先处理完就先写回哪个，<strong>响应可以乱序</strong>；</li>
+<li>客户端有一个专门的线程读取响应，按响应里的 ID 从等待表中取出对应的 Future，填入结果，唤醒等待的调用方。</li>
+</ol>
+<figure>
+<svg viewBox="0 0 440 330" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="请求 ID 多路复用">
+  <rect width="440" height="330" fill="#0f0e1c"/>
+  <defs>
+    <marker id="ra" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#c4b5fd"/></marker>
+    <marker id="rm" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#6ee7c8"/></marker>
+  </defs>
+  <g font-family="PingFang SC, Noto Sans SC, sans-serif" text-anchor="middle">
+    <text x="70" y="26" fill="#f4ede4" font-size="15" font-weight="800">客户端</text>
+    <text x="370" y="26" fill="#f4ede4" font-size="15" font-weight="800">服务端</text>
+    <line x1="70" y1="38" x2="70" y2="318" stroke="rgba(255,255,255,.25)" stroke-width="2"/>
+    <line x1="370" y1="38" x2="370" y2="318" stroke="rgba(255,255,255,.25)" stroke-width="2"/>
+    <line x1="72" y1="60" x2="366" y2="78" stroke="#c4b5fd" stroke-width="2" marker-end="url(#ra)"/>
+    <text x="200" y="58" fill="#c4b5fd" font-size="12" font-weight="700">#1 slow(A, 300ms)</text>
+    <line x1="72" y1="92" x2="366" y2="110" stroke="#c4b5fd" stroke-width="2" marker-end="url(#ra)"/>
+    <text x="200" y="90" fill="#c4b5fd" font-size="12" font-weight="700">#2 slow(B, 100ms)</text>
+    <line x1="72" y1="124" x2="366" y2="142" stroke="#c4b5fd" stroke-width="2" marker-end="url(#ra)"/>
+    <text x="200" y="122" fill="#c4b5fd" font-size="12" font-weight="700">#3 slow(C, 200ms)</text>
+    <line x1="368" y1="180" x2="74" y2="198" stroke="#6ee7c8" stroke-width="2" marker-end="url(#rm)"/>
+    <text x="240" y="178" fill="#6ee7c8" font-size="12" font-weight="700">#2 的结果</text>
+    <line x1="368" y1="216" x2="74" y2="234" stroke="#6ee7c8" stroke-width="2" marker-end="url(#rm)"/>
+    <text x="240" y="214" fill="#6ee7c8" font-size="12" font-weight="700">#3 的结果</text>
+    <line x1="368" y1="252" x2="74" y2="270" stroke="#6ee7c8" stroke-width="2" marker-end="url(#rm)"/>
+    <text x="240" y="250" fill="#6ee7c8" font-size="12" font-weight="700">#1 的结果</text>
+    <rect x="110" y="284" width="220" height="38" rx="10" fill="rgba(196,181,253,.12)" stroke="#c4b5fd"/>
+    <text x="220" y="308" fill="#f4ede4" font-size="13" font-weight="700">按 ID 查等待表 → 唤醒对应调用方</text>
+  </g>
+</svg>
+<figcaption>三个请求复用同一条连接，服务端谁先算完谁先回，客户端按请求 ID 把结果交给正确的调用方</figcaption>
+</figure>
+
+<p>这带来几个好处：</p>
+<ul>
+<li><strong>连接复用</strong>：少量长连接就能承载很高的并发。Dubbo 默认每个服务提供者只建立一条共享的长连接；</li>
+<li><strong>天然异步</strong>：调用方拿到的本来就是一个 Future，同步调用只是「发出去后立刻 <code>get()</code> 等待」，框架很容易同时提供同步和异步两种 API；</li>
+<li><strong>超时好处理</strong>：等待超时后，把 ID 从等待表里删掉即可；迟到的响应找不到主人，直接丢弃。</li>
+</ul>
+<p>对比一下 HTTP：HTTP/1.1 虽然支持管线化（pipelining），但要求<strong>响应必须按请求的顺序返回</strong>，前面的慢请求会堵住后面的（队头阻塞），实际几乎没人用，浏览器只好对同一域名开多条连接。<strong>HTTP/2</strong> 引入了「流」（stream），每个流有自己的 ID，多个请求和响应在一条连接上交错传输，本质上就是同一个思路。gRPC 正是借助 HTTP/2 的流实现了多路复用。</p>
+<h2 id="java-21-rpc">动手：用 Java 21 写一个迷你 RPC</h2>
+<p>把前面几节串起来，一个最小但完整的 RPC 框架只需要两百多行。它包含：</p>
+<ul>
+<li><strong>接口 + 实现</strong>：<code>HelloService</code> / <code>HelloServiceImpl</code>；</li>
+<li><strong>动态代理</strong>：客户端用 <code>Proxy.newProxyInstance</code> 生成 Stub；</li>
+<li><strong>序列化</strong>：抽象成 <code>Serializer</code> 接口，演示用 JDK 自带序列化（实际项目换成 Protobuf、Hessian 等）；</li>
+<li><strong>协议</strong>：17 字节帧头 + 消息体，<code>readFully</code> 按长度读满；</li>
+<li><strong>服务端</strong>：<code>ServerSocket</code> + 虚拟线程，按接口名找到实现，反射调用；</li>
+<li><strong>客户端</strong>：一条连接、请求 ID、等待表、独立的读线程、超时。</li>
+</ul>
+<p>保存为 <code>MiniRpc.java</code>，用 JDK 21 直接运行源文件：<code>java MiniRpc.java</code>（如果终端中文乱码，加上 <code>-Dstdout.encoding=UTF-8</code>）。</p>
+<pre><code class="language-java">import java.io.*;
+import java.lang.reflect.*;
+import java.lang.reflect.Proxy;
+import java.net.*;
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.*;
+
+public class MiniRpc {
+
+    // ========== 1. 服务接口与实现（服务端和客户端共享接口） ==========
+    public interface HelloService {
+        String hello(String name);
+        int add(int a, int b);
+        String slow(String tag, long millis);   // 模拟耗时不同的接口
+    }
+
+    static class HelloServiceImpl implements HelloService {
+        public String hello(String name) { return &quot;Hello, &quot; + name; }
+        public int add(int a, int b) { return a + b; }
+        public String slow(String tag, long millis) {
+            try { Thread.sleep(millis); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+            return tag + &quot; 用时 &quot; + millis + &quot;ms&quot;;
+        }
+    }
+
+    // ========== 2. 请求与响应 ==========
+    record RpcRequest(long id, String iface, String method,
+                      Class&lt;?&gt;[] paramTypes, Object[] args) implements Serializable {}
+    record RpcResponse(long id, Object result, String error) implements Serializable {}
+
+    // ========== 3. 序列化（可替换：JSON、Protobuf、Hessian、Kryo……） ==========
+    interface Serializer {
+        byte code();
+        byte[] encode(Object obj) throws IOException;
+        Object decode(byte[] bytes) throws IOException;
+    }
+
+    // 演示用 JDK 自带序列化：省事，但体积大、只能 Java 用，生产中不推荐
+    static class JdkSerializer implements Serializer {
+        public byte code() { return 1; }
+        public byte[] encode(Object obj) throws IOException {
+            var bos = new ByteArrayOutputStream();
+            try (var oos = new ObjectOutputStream(bos)) { oos.writeObject(obj); }
+            return bos.toByteArray();
+        }
+        public Object decode(byte[] bytes) throws IOException {
+            try (var ois = new ObjectInputStream(new ByteArrayInputStream(bytes))) {
+                return ois.readObject();
+            } catch (ClassNotFoundException e) { throw new IOException(e); }
+        }
+    }
+
+    // ========== 4. 协议：17 字节帧头 + 消息体 ==========
+    // | 魔数 2 | 版本 1 | 序列化方式 1 | 消息类型 1 | 请求 ID 8 | 长度 4 | 消息体 N |
+    static final short MAGIC = (short) 0xCAFE;
+    static final byte VERSION = 1, TYPE_REQUEST = 0, TYPE_RESPONSE = 1;
+    static final int HEADER_LEN = 17, MAX_BODY = 8 * 1024 * 1024;
+
+    record Frame(byte type, byte serializer, long id, byte[] body) {}
+
+    static void writeFrame(DataOutputStream out, Frame f) throws IOException {
+        synchronized (out) {                     // 多个线程共用一条连接，写一帧要互斥
+            out.writeShort(MAGIC);
+            out.writeByte(VERSION);
+            out.writeByte(f.serializer());
+            out.writeByte(f.type());
+            out.writeLong(f.id());
+            out.writeInt(f.body().length);
+            out.write(f.body());
+            out.flush();
+        }
+    }
+
+    static Frame readFrame(DataInputStream in) throws IOException {
+        short magic = in.readShort();            // readXxx / readFully 会一直读到够数为止
+        if (magic != MAGIC) throw new IOException(&quot;魔数不对，不是本协议的数据: &quot; + Integer.toHexString(magic &amp; 0xffff));
+        byte version = in.readByte();
+        if (version != VERSION) throw new IOException(&quot;不支持的版本: &quot; + version);
+        byte serializer = in.readByte();
+        byte type = in.readByte();
+        long id = in.readLong();
+        int len = in.readInt();
+        if (len &lt; 0 || len &gt; MAX_BODY) throw new IOException(&quot;非法长度: &quot; + len);
+        byte[] body = new byte[len];
+        in.readFully(body);                      // 按长度读满，粘包、拆包都在这里被处理掉
+        return new Frame(type, serializer, id, body);
+    }
+
+    // ========== 5. 服务端：解码 → 反序列化 → 反射调用 → 写回响应 ==========
+    static class RpcServer {
+        private final Map&lt;String, Object&gt; services = new ConcurrentHashMap&lt;&gt;();
+        private final Serializer serializer = new JdkSerializer();
+        private final ServerSocket ss;
+
+        RpcServer(int port) throws IOException { ss = new ServerSocket(port); }
+        int port() { return ss.getLocalPort(); }
+        &lt;T&gt; void register(Class&lt;T&gt; iface, T impl) { services.put(iface.getName(), impl); }
+
+        void start() {
+            Thread.ofVirtual().start(() -&gt; {
+                while (true) {
+                    try {
+                        Socket s = ss.accept();
+                        Thread.ofVirtual().start(() -&gt; serve(s));
+                    } catch (IOException e) { return; }
+                }
+            });
+        }
+
+        private void serve(Socket s) {
+            try (s; var in = new DataInputStream(new BufferedInputStream(s.getInputStream()));
+                 var out = new DataOutputStream(new BufferedOutputStream(s.getOutputStream()))) {
+                while (true) {
+                    Frame f = readFrame(in);
+                    // 每个请求交给一个虚拟线程处理：慢请求不会挡住同一连接上的快请求
+                    Thread.ofVirtual().start(() -&gt; handle(f, out));
+                }
+            } catch (EOFException e) {
+                // 客户端关闭连接
+            } catch (IOException e) {
+                System.out.println(&quot;[server] 连接异常: &quot; + e.getMessage());
+            }
+        }
+
+        private void handle(Frame f, DataOutputStream out) {
+            RpcResponse resp;
+            try {
+                var req = (RpcRequest) serializer.decode(f.body());
+                Object impl = services.get(req.iface());
+                if (impl == null) throw new IllegalStateException(&quot;没有这个服务: &quot; + req.iface());
+                Method m = impl.getClass().getMethod(req.method(), req.paramTypes());
+                Object result = m.invoke(impl, req.args());
+                resp = new RpcResponse(req.id(), result, null);
+                System.out.printf(&quot;[server] #%d %s%s -&gt; %s%n&quot;, req.id(), req.method(), Arrays.toString(req.args()), result);
+            } catch (InvocationTargetException e) {
+                resp = new RpcResponse(f.id(), null, e.getCause().toString());
+            } catch (Exception e) {
+                resp = new RpcResponse(f.id(), null, e.toString());
+            }
+            try {
+                writeFrame(out, new Frame(TYPE_RESPONSE, serializer.code(), f.id(), serializer.encode(resp)));
+            } catch (IOException ignored) {}
+        }
+    }
+
+    // ========== 6. 客户端：动态代理 + 请求 ID + 等待表 ==========
+    static class RpcClient implements Closeable {
+        private final Socket socket;
+        private final DataOutputStream out;
+        private final DataInputStream in;
+        private final Serializer serializer = new JdkSerializer();
+        private final AtomicLong nextId = new AtomicLong();
+        private final Map&lt;Long, CompletableFuture&lt;RpcResponse&gt;&gt; pending = new ConcurrentHashMap&lt;&gt;();
+        private final long timeoutMs;
+
+        RpcClient(String host, int port, long timeoutMs) throws IOException {
+            this.socket = new Socket(host, port);
+            this.out = new DataOutputStream(new BufferedOutputStream(socket.getOutputStream()));
+            this.in = new DataInputStream(new BufferedInputStream(socket.getInputStream()));
+            this.timeoutMs = timeoutMs;
+            Thread.ofVirtual().start(this::readLoop);   // 单独的线程负责收响应
+        }
+
+        // 收到响应后，按请求 ID 找到对应的 Future 并唤醒调用方：响应可以乱序到达
+        private void readLoop() {
+            try {
+                while (true) {
+                    Frame f = readFrame(in);
+                    var resp = (RpcResponse) serializer.decode(f.body());
+                    var future = pending.remove(f.id());
+                    if (future != null) future.complete(resp);
+                    else System.out.printf(&quot;[client] 丢弃迟到的响应 #%d（调用方早已超时）%n&quot;, f.id());
+                }
+            } catch (IOException e) {
+                pending.values().forEach(fu -&gt; fu.completeExceptionally(e));
+            }
+        }
+
+        CompletableFuture&lt;RpcResponse&gt; send(RpcRequest req) throws IOException {
+            var future = new CompletableFuture&lt;RpcResponse&gt;();
+            pending.put(req.id(), future);              // 先登记，再发送
+            writeFrame(out, new Frame(TYPE_REQUEST, serializer.code(), req.id(), serializer.encode(req)));
+            return future;
+        }
+
+        @SuppressWarnings(&quot;unchecked&quot;)
+        &lt;T&gt; T proxy(Class&lt;T&gt; iface) {
+            return (T) Proxy.newProxyInstance(iface.getClassLoader(), new Class&lt;?&gt;[]{iface},
+                (proxy, method, args) -&gt; {
+                    if (method.getDeclaringClass() == Object.class)       // toString/hashCode 等不走远程
+                        return method.getName().equals(&quot;toString&quot;) ? &quot;RpcProxy(&quot; + iface.getSimpleName() + &quot;)&quot; : method.invoke(this, args);
+                    var req = new RpcRequest(nextId.incrementAndGet(), iface.getName(),
+                            method.getName(), method.getParameterTypes(), args);
+                    try {
+                        RpcResponse resp = send(req).get(timeoutMs, TimeUnit.MILLISECONDS);
+                        if (resp.error() != null) throw new RuntimeException(&quot;远程异常: &quot; + resp.error());
+                        return resp.result();
+                    } catch (TimeoutException e) {
+                        pending.remove(req.id());                         // 超时后不再等待
+                        throw new RuntimeException(&quot;调用超时 #&quot; + req.id() + &quot;（&quot; + timeoutMs + &quot;ms）&quot;);
+                    }
+                });
+        }
+
+        public void close() throws IOException { socket.close(); }
+    }
+
+    // ========== 7. 演示 ==========
+    public static void main(String[] args) throws Exception {
+        var server = new RpcServer(0);                                  // 0 = 随机空闲端口
+        server.register(HelloService.class, new HelloServiceImpl());
+        server.start();
+
+        try (var client = new RpcClient(&quot;127.0.0.1&quot;, server.port(), 1000)) {
+            HelloService helloService = client.proxy(HelloService.class);
+            System.out.println(&quot;代理对象: &quot; + helloService + &quot;，类名 &quot; + helloService.getClass().getSimpleName());
+
+            // ① 像调本地方法一样调远程服务
+            System.out.println(&quot;结果: &quot; + helloService.hello(&quot;拾星&quot;));
+            System.out.println(&quot;结果: 1 + 2 = &quot; + helloService.add(1, 2));
+
+            // ② 同一条连接上并发发出 3 个请求，响应乱序返回，靠请求 ID 对上号
+            System.out.println(&quot;---- 一条连接，3 个请求同时在飞 ----&quot;);
+            long t0 = System.nanoTime();
+            List&lt;Thread&gt; ts = new ArrayList&lt;&gt;();
+            for (var c : List.of(new Object[]{&quot;A&quot;, 300L}, new Object[]{&quot;B&quot;, 100L}, new Object[]{&quot;C&quot;, 200L})) {
+                ts.add(Thread.ofVirtual().start(() -&gt;
+                        System.out.println(&quot;[client] 拿到 &quot; + helloService.slow((String) c[0], (Long) c[1]))));
+                Thread.sleep(20);                                        // 让请求 ID 按 A、B、C 的顺序分配
+            }
+            for (var th : ts) th.join();
+            System.out.printf(&quot;3 个请求总耗时约 %dms（串行要 600ms）%n&quot;, (System.nanoTime() - t0) / 1_000_000);
+
+            // ③ 超时：服务端要 1500ms，客户端只等 1000ms
+            System.out.println(&quot;---- 超时 ----&quot;);
+            try { helloService.slow(&quot;D&quot;, 1500); }
+            catch (RuntimeException e) { System.out.println(&quot;[client] &quot; + e.getMessage()); }
+            Thread.sleep(700);                                           // 等迟到的响应回来，看看它的下场
+        }
+
+        // ④ 粘包演示：3 帧一次性写进同一块缓冲区，解码器照样能逐帧切开
+        System.out.println(&quot;---- 粘包演示 ----&quot;);
+        var ser = new JdkSerializer();
+        var buf = new ByteArrayOutputStream();
+        var dos = new DataOutputStream(buf);
+        for (long id = 1; id &lt;= 3; id++)
+            writeFrame(dos, new Frame(TYPE_REQUEST, ser.code(), id,
+                    ser.encode(new RpcRequest(id, &quot;HelloService&quot;, &quot;hello&quot;, new Class&lt;?&gt;[]{String.class}, new Object[]{&quot;#&quot; + id}))));
+        byte[] all = buf.toByteArray();
+        System.out.println(&quot;缓冲区共 &quot; + all.length + &quot; 字节，第一帧帧头: &quot; + HexFormat.ofDelimiter(&quot; &quot;).formatHex(all, 0, HEADER_LEN));
+        var din = new DataInputStream(new ByteArrayInputStream(all));
+        for (int i = 0; i &lt; 3; i++) {
+            Frame f = readFrame(din);
+            var r = (RpcRequest) ser.decode(f.body());
+            System.out.printf(&quot;解出第 %d 帧: 请求 ID=%d, 消息体 %d 字节, 参数=%s%n&quot;, i + 1, f.id(), f.body().length, r.args()[0]);
+        }
+        try { readFrame(new DataInputStream(new ByteArrayInputStream(new byte[]{'G', 'E', 'T', ' '}))); }
+        catch (IOException e) { System.out.println(&quot;收到不认识的数据: &quot; + e.getMessage()); }
+    }
+}
+</code></pre>
+<p>输出（耗时每次运行略有不同）：</p>
+<pre><code class="language-text">代理对象: RpcProxy(HelloService)，类名 $Proxy0
+[server] #1 hello[拾星] -&gt; Hello, 拾星
+结果: Hello, 拾星
+[server] #2 add[1, 2] -&gt; 3
+结果: 1 + 2 = 3
+---- 一条连接，3 个请求同时在飞 ----
+[server] #4 slow[B, 100] -&gt; B 用时 100ms
+[client] 拿到 B 用时 100ms
+[server] #5 slow[C, 200] -&gt; C 用时 200ms
+[client] 拿到 C 用时 200ms
+[server] #3 slow[A, 300] -&gt; A 用时 300ms
+[client] 拿到 A 用时 300ms
+3 个请求总耗时约 311ms（串行要 600ms）
+---- 超时 ----
+[client] 调用超时 #6（1000ms）
+[server] #6 slow[D, 1500] -&gt; D 用时 1500ms
+[client] 丢弃迟到的响应 #6（调用方早已超时）
+---- 粘包演示 ----
+缓冲区共 945 字节，第一帧帧头: ca fe 01 01 00 00 00 00 00 00 00 00 01 00 00 01 2a
+解出第 1 帧: 请求 ID=1, 消息体 298 字节, 参数=#1
+解出第 2 帧: 请求 ID=2, 消息体 298 字节, 参数=#2
+解出第 3 帧: 请求 ID=3, 消息体 298 字节, 参数=#3
+收到不认识的数据: 魔数不对，不是本协议的数据: 4745
+</code></pre>
+<p>从输出里可以看到这一路讲的每个要点：</p>
+<ol>
+<li><strong>代理对象</strong>：<code>helloService</code> 的真实类型是运行时生成的 <code>$Proxy0</code>，调用它的方法就像调本地方法，结果却来自服务端；</li>
+<li><strong>多路复用</strong>：请求 #3、#4、#5 按顺序发出，服务端按「谁先算完谁先回」的顺序返回了 #4、#5、#3，客户端靠请求 ID 把每个结果交回给正确的线程；三个请求共用一条连接，总耗时约等于最慢的那个（300ms），而不是三者之和；</li>
+<li><strong>超时</strong>：服务端要 1500ms，客户端等到 1000ms 就放弃了。但注意，服务端<strong>仍然把方法执行完了</strong>。超时只代表「我不等了」，不代表「对方没做」，这就是为什么只有<strong>幂等</strong>的接口才能放心重试；</li>
+<li><strong>粘包</strong>：3 帧被一次性写进同一块缓冲区，解码器按帧头里的长度逐帧切开，一条不差；第一帧的帧头 <code>ca fe | 01 | 01 | 00 | 00…01 | 00 00 01 2a</code> 分别是魔数、版本、序列化方式、消息类型、请求 ID=1、长度 298；</li>
+<li><strong>魔数</strong>：收到 <code>GET</code> 这种不认识的数据时，立刻判定不是本协议，不会把乱码当成长度去读一大块数据；</li>
+<li><strong>JDK 序列化的体积</strong>：一个只有一个字符串参数的请求，序列化后有 298 字节，大部分是类描述信息。这正是生产中不用它的原因之一。</li>
+</ol>
+<p>离生产级还差什么？连接断开重连、心跳、服务发现和负载均衡、业务线程池和过载保护、更高效的序列化、基于 NIO（Netty）的网络层、优雅停机、监控和链路追踪……下一节逐个说。</p>
+<h2 id="_12">服务治理：让远程调用可靠</h2>
+<p>调用能跑通只是第一步。真实环境里，一个服务有很多实例，它们会上线、下线、变慢、宕机，<strong>服务治理</strong>就是处理这些情况的一整套机制。</p>
+<h3 id="_13">服务发现</h3>
+<p>客户端怎么知道用户服务有哪些机器？靠<strong>注册中心</strong>：</p>
+<ol>
+<li>服务提供者启动时，把自己的地址（IP、端口、权重、版本等）<strong>注册</strong>到注册中心；</li>
+<li>服务消费者<strong>订阅</strong>它关心的服务，拿到地址列表并缓存在本地；</li>
+<li>实例上线或下线时，注册中心<strong>推送变更</strong>；实例宕机来不及注销的，靠心跳或会话超时被剔除；</li>
+<li>注册中心本身挂了，消费者还可以用<strong>本地缓存</strong>的地址列表继续调用，只是感知不到新的变化。</li>
+</ol>
+<p>常见的注册中心有 ZooKeeper、Nacos、etcd、Consul。在 Kubernetes 里，也可以直接用它的 Service 和 DNS 做服务发现。</p>
+<h3 id="_14">负载均衡</h3>
+<p>拿到地址列表后，每次调用要从中<strong>选一台</strong>。这种在调用方选择的方式叫<strong>客户端负载均衡</strong>，省掉了一层集中式的代理。常见策略：</p>
+<table>
+<thead>
+<tr>
+<th>策略</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>加权随机</td>
+<td>按权重随机选一台，简单且长期看比较均匀，Dubbo 的默认策略</td>
+</tr>
+<tr>
+<td>加权轮询</td>
+<td>按权重依次轮流</td>
+</tr>
+<tr>
+<td>最少活跃调用</td>
+<td>优先选正在处理的请求最少的实例，自动避开慢节点</td>
+</tr>
+<tr>
+<td>一致性哈希</td>
+<td>相同参数总是落到同一台机器，适合有本地缓存或有状态的场景</td>
+</tr>
+</tbody>
+</table>
+<p>各种算法的细节，见本系列《负载均衡与一致性哈希》。</p>
+<h3 id="_15">超时、重试与容错</h3>
+<ul>
+<li><strong>一定要设超时</strong>。没有超时的远程调用，一旦对方卡住，调用方的线程就会一直挂着，线程池很快被占满，故障沿着调用链向上蔓延（雪崩）；</li>
+<li><strong>超时要沿调用链递减</strong>：A 调 B 设了 1 秒，B 调 C 就不应该还设 3 秒。gRPC 的 <strong>deadline</strong> 会随请求一起传递给下游，下游能知道「留给我的时间还剩多少」；</li>
+<li><strong>重试只用于幂等接口</strong>。查询可以重试；扣款、下单这类操作，超时后对方可能已经执行成功，盲目重试会导致重复扣款。必须重试的写操作要先做好幂等（比如用唯一请求号去重）；</li>
+<li><strong>重试要有上限和退避</strong>：限制次数，间隔逐渐拉长并加随机抖动，避免对方刚恢复又被重试流量打垮。</li>
+</ul>
+<p>Dubbo 把调用失败后的处理方式叫<strong>集群容错</strong>策略：默认的 <strong>Failover</strong> 失败后自动换一台重试（默认额外重试 2 次），<strong>Failfast</strong> 失败立即报错（适合非幂等写操作），<strong>Failsafe</strong> 失败时忽略（适合写日志之类的操作），<strong>Failback</strong> 失败后在后台定时重发，<strong>Forking</strong> 同时调多台、谁先返回用谁。</p>
+<p>再往上还有<strong>熔断</strong>（对方持续出错时暂时停止调用，快速失败）、<strong>限流</strong>（保护服务端不被打垮，见本系列《限流算法》）和<strong>降级</strong>（调用失败时返回兜底数据）。</p>
+<h3 id="_16">连接管理</h3>
+<ul>
+<li><strong>长连接 + 复用</strong>：每次调用都新建 TCP 连接，光握手就要多一个往返。RPC 框架都使用长连接：要么像 Dubbo、gRPC 那样一条连接多路复用，要么维护一个<strong>连接池</strong>；</li>
+<li><strong>心跳与重连</strong>：定期检测连接是否健康，断开后自动重连；</li>
+<li><strong>优雅停机</strong>：服务下线前先从注册中心注销、等待处理中的请求完成，再关闭进程，避免调用方看到大量报错。</li>
+</ul>
+<h3 id="_17">可观测性</h3>
+<p>一次用户请求可能经过十几个服务。RPC 框架通常支持在请求里携带<strong>附加信息</strong>（Dubbo 叫 attachment，gRPC 叫 metadata），用来传递 TraceId 等链路追踪信息，配合监控系统就能看到「这个请求在每个服务上各花了多少时间」。</p>
+<h2 id="rpc-http-rest">RPC 还是 HTTP REST</h2>
+<figure><img src="img/f-77.jpg" alt="RPC 与 HTTP REST 的对比，以及 gRPC、Dubbo、Thrift 三个常见框架" loading="lazy"><figcaption>RPC 与 HTTP REST 的对比，以及 gRPC、Dubbo、Thrift 三个常见框架</figcaption></figure>
+<h3 id="_18">两者的区别</h3>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>RPC</th>
+<th>HTTP REST</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>调用方式</td>
+<td>面向<strong>接口和方法</strong>，像调本地函数</td>
+<td>面向<strong>资源</strong>：URL 表示资源，GET / POST / PUT / DELETE 表示操作</td>
+</tr>
+<tr>
+<td>协议</td>
+<td>自定义 TCP 协议，或基于 HTTP/2</td>
+<td>HTTP/1.1 或 HTTP/2</td>
+</tr>
+<tr>
+<td>编码</td>
+<td>多为二进制（Protobuf、Hessian）</td>
+<td>多为 JSON 文本</td>
+</tr>
+<tr>
+<td>接口契约</td>
+<td>IDL 或共享的接口定义，强类型，可以生成代码</td>
+<td>OpenAPI 等文档约定，相对松散</td>
+</tr>
+<tr>
+<td>性能</td>
+<td>消息小、长连接复用，开销低</td>
+<td>文本解析和头部开销稍大，但多数场景够用</td>
+</tr>
+<tr>
+<td>调试</td>
+<td>需要专门工具</td>
+<td>浏览器、curl 就能调</td>
+</tr>
+<tr>
+<td>浏览器支持</td>
+<td>一般不能直接调用</td>
+<td>天然支持</td>
+</tr>
+<tr>
+<td>适合</td>
+<td>内部微服务之间的大量调用</td>
+<td>对外开放 API、前后端交互、跨团队或跨公司对接</td>
+</tr>
+</tbody>
+</table>
+<p>需要澄清两个常见误解：</p>
+<ol>
+<li><strong>RPC 不等于「不用 HTTP」</strong>。RPC 是一种<strong>调用模型</strong>，HTTP 是一种<strong>传输协议</strong>。gRPC 就跑在 HTTP/2 上，它仍然是 RPC；</li>
+<li><strong>REST 也不一定慢</strong>。在网络延迟占大头的场景里，序列化格式的差别可能不明显。真正的差异更多在于<strong>工程体验</strong>：RPC 有强类型契约、生成的客户端代码和内置的服务治理；REST 更通用、更易调试、生态更广。</li>
+</ol>
+<p>常见的组合是：<strong>对内用 RPC 追求效率和强契约，对外用 REST 追求通用性</strong>，在网关处做转换。</p>
+<h3 id="_19">三个常见框架</h3>
+<p><strong>gRPC</strong></p>
+<ul>
+<li>基于 <strong>HTTP/2 + Protobuf</strong>，用 <code>.proto</code> 文件定义服务，代码生成器为十几种语言生成客户端和服务端代码；</li>
+<li>支持四种调用方式：一元调用（一问一答）、服务端流、客户端流、双向流；</li>
+<li>内置 deadline、取消、元数据、拦截器等能力，在云原生领域使用广泛；</li>
+<li>浏览器不能直接调用原生 gRPC，需要 gRPC-Web 加代理，或者通过网关转成 REST。</li>
+</ul>
+<p>参考写法（<code>.proto</code> 定义，需要配合 <code>protoc</code> 和 gRPC 插件生成代码，本文未在本机编译）：</p>
+<pre><code class="language-protobuf">syntax = &quot;proto3&quot;;
+
+package demo;
+
+option java_multiple_files = true;
+
+service HelloService {
+  rpc Hello (HelloRequest) returns (HelloReply);                  // 一元调用
+  rpc HelloStream (HelloRequest) returns (stream HelloReply);     // 服务端流
+}
+
+message HelloRequest {
+  string name = 1;    // 字段编号一旦发布就不要再改
+}
+
+message HelloReply {
+  string message = 1;
+}
+</code></pre>
+<p>生成代码后，客户端的调用同样是「像调本地方法」：<code>stub.hello(HelloRequest.newBuilder().setName("拾星").build())</code>。</p>
+<p><strong>Dubbo</strong></p>
+<ul>
+<li>起源于国内互联网公司、后来成为 Apache 顶级项目的 Java RPC 框架，在国内 Java 生态中应用很广；</li>
+<li>以 Java 接口作为契约，不强制写 IDL；自带丰富的服务治理能力：注册中心、负载均衡、集群容错、路由规则、动态配置等；</li>
+<li>经典的 dubbo 协议基于 TCP 长连接，2.x 默认使用 Hessian2 序列化；3.x 新增了基于 HTTP/2 的 <strong>Triple</strong> 协议，与 gRPC 兼容，方便跨语言和穿透网关。</li>
+</ul>
+<p><strong>Thrift</strong></p>
+<ul>
+<li>最早由一家社交网络公司开发，后来捐给 Apache 基金会；</li>
+<li>自带 IDL 和代码生成，支持多种语言；</li>
+<li>传输层和编码层都可以替换：编码有二进制（TBinaryProtocol）、紧凑（TCompactProtocol）、JSON 等；传输有普通 Socket、带 4 字节长度前缀的 Framed 传输等。</li>
+</ul>
+<p>选型大致可以这样考虑：多语言、云原生、需要流式调用，选 <strong>gRPC</strong>；纯 Java 技术栈、需要开箱即用的服务治理，选 <strong>Dubbo</strong>；已有 Thrift 体系的，继续用 <strong>Thrift</strong>。</p>
+<h2 id="_20">实践中的坑</h2>
+<ol>
+<li><strong>没有超时，或者超时太长</strong>：下游一慢，上游线程全部挂住，整条链路雪崩。每个调用都要有合理的超时，并且沿调用链递减；</li>
+<li><strong>对非幂等接口自动重试</strong>：超时后重试导致重复下单、重复扣款。写接口要么关闭重试，要么先做幂等；</li>
+<li><strong>在循环里调用 RPC</strong>：查 100 个用户就发 100 次请求，延迟叠加。提供批量接口，一次查完；</li>
+<li><strong>一次传太多数据</strong>：一个响应几十 MB，序列化慢、占内存，还会阻塞同一连接上的其他请求。分页或者改用流式接口；</li>
+<li><strong>接口不兼容的变更</strong>：删字段、改字段类型、改 Protobuf 字段编号、给枚举加新值但老客户端不认识……发布前要考虑新老版本共存的那段时间；</li>
+<li><strong>异常对象跨不过去</strong>：服务端抛出的自定义异常类在客户端不存在，反序列化失败。对外暴露错误码，而不是直接抛内部异常；</li>
+<li><strong>上下文丢失</strong>：<code>ThreadLocal</code> 里的用户信息、TraceId 不会自动跟着请求走，需要通过 attachment / metadata 显式传递；</li>
+<li><strong>把 RPC 当成本地调用来设计接口</strong>：本地调用很便宜，可以设计得很「碎」；远程调用每次都有网络开销，接口粒度要粗一些，一次调用把事情办完。</li>
+</ol>
+<h2 id="_21">高频面试题速答</h2>
+<p><strong>Q：RPC 的核心原理是什么？</strong>
+客户端通过代理（Stub）把方法调用转换成请求对象，经过序列化和协议编码后通过网络发送；服务端解码、反序列化，按接口名和方法签名找到实现并调用，再把结果按原路返回。目标是让远程调用像本地调用一样简单。</p>
+<p><strong>Q：动态代理在 RPC 中起什么作用？</strong>
+调用方只有接口没有实现，框架用动态代理（JDK Proxy、字节码生成）或 IDL 代码生成出一个实现了接口的代理对象，拦截所有方法调用，转成网络请求。</p>
+<p><strong>Q：什么是粘包和拆包，怎么解决？</strong>
+TCP 是字节流，不保留消息边界，一次读可能包含多条消息或半条消息。应用层协议需要自己定义边界：定长、分隔符，或者最常用的长度字段（先读固定长度的帧头，再按长度读满消息体），Netty 中对应 <code>LengthFieldBasedFrameDecoder</code>。</p>
+<p><strong>Q：RPC 协议的帧头一般包含什么？</strong>
+魔数（识别协议）、版本、序列化方式、消息类型（请求、响应、心跳）、状态、请求 ID、消息体长度。</p>
+<p><strong>Q：请求 ID 有什么用？</strong>
+把响应和请求对应起来。有了它，一条连接上可以同时有多个未完成的请求，响应可以乱序返回，客户端按 ID 找到等待中的 Future 并唤醒调用方，从而实现连接复用和异步调用。</p>
+<p><strong>Q：常见的序列化方式怎么选？</strong>
+JSON 可读、跨语言，但体积大、慢；Protobuf 体积小、快、跨语言、兼容性好，需要 IDL；Hessian 二进制自描述，Java 生态常用；Kryo 快但基本只用于 Java。对内高频调用用二进制格式，对外接口用 JSON。不要用 JDK 自带序列化做跨服务通信。</p>
+<p><strong>Q：RPC 和 HTTP REST 有什么区别？</strong>
+RPC 面向方法、多用二进制编码和长连接、有强类型契约和服务治理，适合内部服务间调用；REST 面向资源、基于 HTTP + JSON、通用易调试，适合对外开放。RPC 不等于不用 HTTP，gRPC 就基于 HTTP/2。</p>
+<p><strong>Q：调用超时了，可以直接重试吗？</strong>
+不一定。超时只说明客户端没等到结果，服务端可能已经执行成功。只有幂等的接口才能直接重试，非幂等的写操作要先做幂等处理（如唯一请求号去重），重试还要限制次数并加退避。</p>
+<p><strong>Q：注册中心挂了，服务还能调用吗？</strong>
+一般可以。消费者会在本地缓存地址列表，注册中心不可用时继续使用缓存的地址，只是无法感知新的上下线变化。</p>
+<h2 id="_22">总结</h2>
+<figure><img src="img/f-83.jpg" alt="四个关键点：动态代理、序列化、协议帧、请求 ID" loading="lazy"><figcaption>四个关键点：动态代理、序列化、协议帧、请求 ID</figcaption></figure>
+<ul>
+<li>RPC 的目标是<strong>让远程调用像本地调用一样简单</strong>，但远程调用会慢、会失败、会超时，不能真的当成本地调用；</li>
+<li>完整链路：<strong>代理 Stub → 序列化 → 协议编码 → 网络 → 解码 → 反序列化 → 反射/调度到实现 → 原路返回</strong>；</li>
+<li><strong>动态代理</strong>把方法调用变成请求对象，服务端按「接口名 + 方法名 + 参数类型」找到实现；</li>
+<li><strong>序列化</strong>决定体积、速度和跨语言能力：JSON 可读，Protobuf 小而快，Hessian、Kryo 各有所长；</li>
+<li><strong>协议帧</strong>用长度字段划分消息边界，解决 TCP 的粘包拆包；魔数、版本、序列化方式让协议可识别、可演进；</li>
+<li><strong>请求 ID</strong> 让一条连接上的多个请求并发进行、乱序返回，实现多路复用和异步；</li>
+<li>生产中还需要<strong>服务发现、负载均衡、超时重试、连接管理、熔断限流</strong>；</li>
+<li>对内多用 <strong>RPC</strong>（gRPC、Dubbo、Thrift），对外多用 <strong>REST</strong>，两者常常组合使用。</li>
+</ul>
+<div class="refs">
+<h3 id="_23">参考资料</h3>
+<ul>
+<li>Implementing Remote Procedure Calls. <em>ACM Transactions on Computer Systems</em>, 1984.</li>
+<li>A Note on Distributed Computing. Sun Microsystems Laboratories Technical Report SMLI TR-94-29, 1994.</li>
+<li>RFC 5531：RPC: Remote Procedure Call Protocol Specification Version 2.</li>
+<li>RFC 9113：HTTP/2.</li>
+<li>gRPC 文档：Core concepts, architecture and lifecycle；gRPC over HTTP2（PROTOCOL-HTTP2.md）.</li>
+<li>Protocol Buffers 文档：Encoding；Language Guide (proto3).</li>
+<li>Apache Dubbo 文档：Dubbo 协议；Triple 协议；负载均衡；集群容错.</li>
+<li>Apache Thrift 文档：Thrift Protocol / Transport.</li>
+<li>Netty API 文档：LengthFieldBasedFrameDecoder.</li>
+<li>Java SE 21 API 文档：java.lang.reflect.Proxy；java.lang.reflect.Method.</li>
+</ul>
+</div>
+  </article>
+  <div class="foot"><a href="../index.html">← 拾星首页</a><a href="landscape.html">▶ 看配套视频</a></div>
+</div>
+</body>
+</html>

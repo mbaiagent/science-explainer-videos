@@ -1,0 +1,700 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>幂等性设计：重复请求不出错，钱只扣一次 · 拾星</title>
+<meta name="description" content="重复请求的四个来源、幂等的定义与 HTTP 方法、唯一约束与去重表、防重 Token、乐观锁与状态机、幂等键 Idempotency-Key、分布式锁 + 判重、MQ 消费幂等，以及先查后插、去重过期、返回首次结果三个坑，附五段可运行的演示">
+<link rel="stylesheet" href="../assets/article.css">
+<style>:root{--acc:#bef264}</style>
+</head>
+<body>
+<div class="wrap">
+  <nav class="top"><a href="../index.html">← 拾星 · 全部内容</a><a class="watch" href="landscape.html">▶ 看视频</a></nav>
+  <header class="hero">
+    <div class="tag">拾星 · 计算机与后端</div>
+    <h1>幂等性设计：重复请求不出错，钱只扣一次</h1>
+    <p>重复请求的四个来源、幂等的定义与 HTTP 方法、唯一约束与去重表、防重 Token、乐观锁与状态机、幂等键 Idempotency-Key、分布式锁 + 判重、MQ 消费幂等，以及先查后插、去重过期、返回首次结果三个坑，附五段可运行的演示</p>
+    <div class="meta">约 37 分钟读完 · 配套视频 1:22</div>
+  </header>
+  <nav class="toc">
+<ul>
+<li><a href="#_1">重复请求从哪来</a></li>
+<li><a href="#_2">什么是幂等</a></li>
+<li><a href="#token">方案一：唯一约束；方案二：防重 Token</a></li>
+<li><a href="#_5">方案三：乐观锁；方案四：状态机</a></li>
+<li><a href="#idempotency-key">幂等键 Idempotency-Key</a></li>
+<li><a href="#mq">MQ 消费幂等，以及三个坑</a></li>
+<li><a href="#_14">动手实验</a></li>
+<li><a href="#_16">方案怎么选</a></li>
+<li><a href="#_17">高频面试题速答</a></li>
+<li><a href="#_18">总结</a></li>
+</ul>
+</nav>
+
+  <article>
+<figure><img src="img/f-6.4.jpg" alt="用户连点三次支付，钱被扣了三次" loading="lazy"><figcaption>用户连点三次支付，钱被扣了三次</figcaption></figure>
+<h2 id="_1">重复请求从哪来</h2>
+<figure><img src="img/f-17.4.jpg" alt="超时重试的时序，以及重复请求的四个来源" loading="lazy"><figcaption>超时重试的时序，以及重复请求的四个来源</figcaption></figure>
+<p>支付页面转了几秒圈，用户着急，连点了三次「立即支付」。三个请求都到了服务端，服务端老老实实扣了三次钱。</p>
+<p>这不是极端情况。在分布式系统里，<strong>同一个请求被执行多次是常态</strong>，主要来源有四个：</p>
+<table>
+<thead>
+<tr>
+<th>来源</th>
+<th>怎么发生的</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>用户重复操作</strong></td>
+<td>连点按钮、页面卡顿时刷新、浏览器后退后重新提交表单</td>
+</tr>
+<tr>
+<td><strong>超时重试</strong></td>
+<td>客户端等不到响应就重试，但第一次请求其实已经执行成功了，只是响应丢在了路上</td>
+</tr>
+<tr>
+<td><strong>框架和网关自动重试</strong></td>
+<td>RPC 框架、HTTP 客户端、负载均衡、服务网格对超时或失败的调用自动再发一次</td>
+</tr>
+<tr>
+<td><strong>消息队列「至少一次」投递</strong></td>
+<td>消费者处理完了，但确认（ack）没送达 Broker，同一条消息会被再次投递</td>
+</tr>
+</tbody>
+</table>
+<p>其中最棘手的是<strong>超时</strong>。客户端发出请求后等不到响应，它无法区分三种情况：</p>
+<ol>
+<li>请求根本没到服务端；</li>
+<li>请求到了，服务端执行到一半出错了；</li>
+<li>请求执行成功了，<strong>只是响应丢了</strong>。</li>
+</ol>
+<p>对于前两种，重试是对的；对于第三种，重试就会重复执行。客户端分不清，只能重试——否则一次网络抖动就会导致操作丢失。</p>
+<p>既然重试不可避免，那么只剩一条路：<strong>让服务端扛得住重复</strong>。这就是幂等性设计。</p>
+<blockquote>
+<p>自动重试比很多人以为的更普遍。例如 Nginx 的 <code>proxy_next_upstream</code> 在上游失败时会把请求转给下一台服务器（从 1.9.13 版本开始，默认不再对 POST 这类非幂等请求这样做）；不少 RPC 框架默认就带重试。接入任何带重试的组件之前，先确认被调用的接口是不是幂等的。</p>
+</blockquote>
+<h2 id="_2">什么是幂等</h2>
+<figure><img src="img/f-28.4.jpg" alt="幂等的定义与 HTTP 方法的幂等性" loading="lazy"><figcaption>幂等的定义与 HTTP 方法的幂等性</figcaption></figure>
+<p><strong>幂等</strong>（idempotent）原本是数学概念：一个操作执行一次和执行多次，效果相同，即 <code>f(f(x)) = f(x)</code>。比如取绝对值，<code>abs(abs(-3)) = abs(-3)</code>。</p>
+<p>放到接口上：<strong>同一个请求，执行一次和执行多次，对系统状态产生的影响相同</strong>。</p>
+<table>
+<thead>
+<tr>
+<th>操作</th>
+<th>幂等吗</th>
+<th>原因</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>余额 = 100</code></td>
+<td>✓</td>
+<td>执行几次，余额都是 100</td>
+</tr>
+<tr>
+<td><code>余额 = 余额 + 100</code></td>
+<td>✗</td>
+<td>执行三次，多加了 200</td>
+</tr>
+<tr>
+<td><code>DELETE 订单 A1001</code></td>
+<td>✓</td>
+<td>删一次、删三次，结果都是「不存在」</td>
+</tr>
+<tr>
+<td><code>创建一个订单</code></td>
+<td>✗</td>
+<td>每执行一次就多一个订单</td>
+</tr>
+<tr>
+<td><code>查询订单</code></td>
+<td>✓</td>
+<td>只读，不改变状态</td>
+</tr>
+</tbody>
+</table>
+<h3 id="http">HTTP 方法的幂等性</h3>
+<p>HTTP 规范（RFC 9110）对每个方法的语义做了定义：</p>
+<table>
+<thead>
+<tr>
+<th>方法</th>
+<th>安全（只读）</th>
+<th>幂等</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>GET / HEAD / OPTIONS</td>
+<td>✓</td>
+<td>✓</td>
+<td>只读取，不改变服务器状态</td>
+</tr>
+<tr>
+<td>PUT</td>
+<td>✗</td>
+<td>✓</td>
+<td>把资源<strong>整体替换</strong>成请求里的内容，替换多少次结果都一样</td>
+</tr>
+<tr>
+<td>DELETE</td>
+<td>✗</td>
+<td>✓</td>
+<td>删除后资源就不存在了，再删也还是不存在</td>
+</tr>
+<tr>
+<td>POST</td>
+<td>✗</td>
+<td>✗</td>
+<td>通常用于创建资源或触发处理，每次都可能产生新结果</td>
+</tr>
+<tr>
+<td>PATCH</td>
+<td>✗</td>
+<td>不保证</td>
+<td>取决于补丁内容：<code>设置名字为 X</code> 是幂等的，<code>数量加 1</code> 不是</td>
+</tr>
+</tbody>
+</table>
+<p>几个容易混淆的点：</p>
+<ul>
+<li><strong>幂等看的是服务端状态的「效果」，不是响应</strong>。第一次 DELETE 返回 200，第二次返回 404，状态都是「已删除」，仍然是幂等的；</li>
+<li><strong>规范说幂等，不代表你的实现就幂等</strong>。如果你的 PUT 接口里写了「每次调用积分加 1」，它就不是幂等的；</li>
+<li>RFC 9110 允许客户端在连接中断时<strong>自动重试幂等请求</strong>，这正是规范区分幂等方法的原因之一。</li>
+</ul>
+<h3 id="_3">幂等、防重、并发控制的区别</h3>
+<table>
+<thead>
+<tr>
+<th>概念</th>
+<th>关注点</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>幂等</strong></td>
+<td>同一个请求执行多次，结果和执行一次一样</td>
+</tr>
+<tr>
+<td><strong>防重</strong></td>
+<td>拦住重复的请求，不让它执行第二次（实现幂等的手段之一）</td>
+</tr>
+<tr>
+<td><strong>并发控制</strong></td>
+<td>多个<strong>不同的</strong>请求同时修改同一数据时不出错（如两个用户抢最后一件库存）</td>
+</tr>
+</tbody>
+</table>
+<p>它们经常用到相同的工具（唯一约束、锁、版本号），但目标不同。幂等的关键是先回答一个问题：<strong>怎么判断两个请求是「同一个」？</strong> 答案通常是一个<strong>业务唯一标识</strong>：订单号、支付流水号、消息 ID、客户端生成的请求 ID……后面所有方案，都是围绕这个标识展开的。</p>
+<h2 id="token">方案一：唯一约束；方案二：防重 Token</h2>
+<figure><img src="img/f-40.4.jpg" alt="用唯一索引兜底，用 Token 防止表单重复提交" loading="lazy"><figcaption>用唯一索引兜底，用 Token 防止表单重复提交</figcaption></figure>
+<h3 id="_4">唯一索引 / 去重表</h3>
+<p>最简单也最可靠的方案：<strong>让数据库替你判重</strong>。</p>
+<pre><code class="language-sql">CREATE UNIQUE INDEX uk_order_no ON orders (order_no);
+</code></pre>
+<p>两个请求带着同一个订单号同时插入，数据库保证只有一个成功，另一个收到「Duplicate key」错误。捕获这个错误，查出已有的订单返回给客户端即可。</p>
+<p>如果业务表本身没有合适的唯一字段（比如「扣款」是 UPDATE 而不是 INSERT），可以单独建一张<strong>去重表</strong>：</p>
+<pre><code class="language-sql">CREATE TABLE dedup (
+  biz_key    VARCHAR(64) PRIMARY KEY,   -- 如 &quot;pay:流水号&quot;、&quot;msg:消息ID&quot;
+  created_at DATETIME NOT NULL
+);
+</code></pre>
+<p>在<strong>同一个事务</strong>里先插入去重记录，再执行业务。插入失败就说明处理过了，整个事务回滚。去重记录和业务数据一起提交、一起回滚，不会出现「记录写了但业务没做」或反过来的情况。</p>
+<p>MySQL 中还可以用 <code>INSERT IGNORE</code> 或 <code>INSERT ... ON DUPLICATE KEY UPDATE</code> 简化冲突处理。注意：唯一索引对 <code>NULL</code> 不生效，多行 <code>NULL</code> 不会冲突，用作判重的字段要设为 <code>NOT NULL</code>。</p>
+<p>唯一约束的优点是<strong>由数据库保证，在高并发下也挡得住</strong>，是很多方案最后的兜底。缺点是依赖数据库，分库分表后唯一键要和分片键对齐，否则无法跨分片保证唯一。</p>
+<h3 id="token_1">Token 机制：防表单重复提交</h3>
+<p>针对「用户连点、刷新重复提交」，常用 <strong>Token 机制</strong>：</p>
+<ol>
+<li>用户打开下单页时，服务端生成一个随机 token，存入 Redis（设置过期时间），同时下发给页面；</li>
+<li>用户提交时，请求里带上这个 token；</li>
+<li>服务端<strong>原子地删除</strong>这个 token：删除成功（<code>DEL</code> 返回 1）说明是第一次提交，继续处理；返回 0 说明 token 已经被用过了，是重复提交。</li>
+</ol>
+<p>这里的关键是<strong>原子</strong>。如果写成「先 <code>GET</code> 判断 token 存在，再 <code>DEL</code>」，两个并发请求可能同时 <code>GET</code> 到 token，都认为自己是第一次。直接用 <code>DEL</code> 的返回值判断，Redis 单线程执行命令，只有一个请求能删除成功。（需要同时取出 token 里存的数据时，可以用 <code>GETDEL</code> 命令或 Lua 脚本。）</p>
+<p>Token 机制的局限：</p>
+<ul>
+<li>需要先发一次请求领 token，适合有「页面」的交互场景，不太适合服务间调用；</li>
+<li>它只解决「重复提交」，token 删除后如果业务执行失败，用户需要重新领 token 才能重试。</li>
+</ul>
+<h2 id="_5">方案三：乐观锁；方案四：状态机</h2>
+<figure><img src="img/f-51.4.jpg" alt="带版本号的条件更新，以及只能单向流转的订单状态" loading="lazy"><figcaption>带版本号的条件更新，以及只能单向流转的订单状态</figcaption></figure>
+<p>很多写操作是 UPDATE，没有「插入」可以用来判重。这时可以把<strong>判断条件写进 UPDATE 语句的 WHERE 里</strong>，用<strong>影响行数</strong>区分第一次和重复。</p>
+<h3 id="_6">乐观锁版本号</h3>
+<pre><code class="language-sql">UPDATE account
+   SET balance = balance - 99,
+       version = version + 1
+ WHERE id = 42 AND version = 5;
+</code></pre>
+<p>第一次执行，版本匹配，影响 1 行，版本变成 6；重复请求还带着 <code>version = 5</code>，匹配不上，影响 0 行，不会重复扣款。</p>
+<p>乐观锁的本意是防止并发更新互相覆盖（见本系列《MySQL 的锁》）。把它用于幂等时有一个前提：<strong>重试的请求必须带着第一次读到的版本号</strong>。如果每次重试都重新读一遍最新版本，那它就是一个全新的请求，照样会再扣一次。</p>
+<h3 id="_7">状态机</h3>
+<p>业务数据往往有明确的状态：订单从「待支付」到「已支付」再到「已发货」，或者从「待支付」到「已取消」。状态只能沿着规定的方向流转，不能回退、不能跳跃。</p>
+<pre><code class="language-sql">UPDATE orders SET status = '已支付'
+ WHERE id = 1001 AND status = '待支付';
+</code></pre>
+<ul>
+<li>影响 1 行：状态推进成功，接着执行后续逻辑（发积分、通知仓库）；</li>
+<li>影响 0 行：订单已经是「已支付」（重复回调），或者已经「已取消」（不允许支付），直接返回。</li>
+</ul>
+<p>支付回调是最典型的场景：支付平台为了保证通知送达，会在没收到「成功」应答时<strong>多次重复通知</strong>。用状态机条件更新，重复的回调什么都改不了。注意，<strong>后续逻辑也要以「这一次更新成功了」为前提</strong>，不能每次回调都发一遍积分。</p>
+<p>两种方案的共同点：把「检查」和「修改」放进<strong>同一条原子的 SQL</strong> 里，而不是先 SELECT 判断、再 UPDATE。</p>
+<h2 id="idempotency-key">幂等键 Idempotency-Key</h2>
+<figure><img src="img/f-63.4.jpg" alt="幂等键的四种处理情况，以及分布式锁 + 判重" loading="lazy"><figcaption>幂等键的四种处理情况，以及分布式锁 + 判重</figcaption></figure>
+<p>前面的方案都依赖业务自身的唯一标识。对于开放 API（尤其是支付），更通用的做法是<strong>由客户端为每一次操作生成一个唯一的幂等键</strong>，放在请求头里：</p>
+<pre><code class="language-text">POST /v1/payments
+Idempotency-Key: 7f3a9c1e-5b2d-4c8e-9a01-3e6f2b7d4c10
+Content-Type: application/json
+
+{ &quot;order&quot;: &quot;A1001&quot;, &quot;amount&quot;: 9900 }
+</code></pre>
+<p>客户端发生超时重试时，<strong>原样带上同一个 key</strong>。服务端按 key 判断：</p>
+<table>
+<thead>
+<tr>
+<th>情况</th>
+<th>处理</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>没见过这个 key</td>
+<td>记录 key（状态为「处理中」）→ 执行业务 → 保存响应，状态改为「已完成」</td>
+</tr>
+<tr>
+<td>已完成</td>
+<td><strong>直接返回第一次保存的响应</strong>，不再执行业务</td>
+</tr>
+<tr>
+<td>还在处理中</td>
+<td>返回冲突错误（如 409），让客户端稍后重试</td>
+</tr>
+<tr>
+<td>key 相同但请求内容不同</td>
+<td>报错（如 422），说明客户端用错了 key</td>
+</tr>
+</tbody>
+</table>
+<p>这就是一些支付平台 API 的做法。例如 Stripe 的 API 支持 <code>Idempotency-Key</code> 请求头，服务端会保存首次请求的结果，相同 key 的后续请求直接返回相同的结果，并会比对请求参数；key 在至少 24 小时后才可能被清理。IETF 也有一份正在推进的草案《The Idempotency-Key HTTP Header Field》，对这个请求头的语义做了标准化，其中建议并发重复请求返回 409、同一个 key 用于不同请求内容时返回 422。</p>
+<p>实现要点：</p>
+<ul>
+<li><strong>抢占 key 要原子</strong>：用唯一约束插入，或者 Redis 的 <code>SET key value NX</code>，不能先查后插；</li>
+<li><strong>保存响应和执行业务尽量在同一个事务里</strong>，避免业务做完了、响应没存下来；</li>
+<li><strong>处理中崩溃了怎么办</strong>：key 会一直停在「处理中」。需要给它设一个超时，超时后允许重新执行，或者由后台任务根据业务数据修正；</li>
+<li>key 由客户端生成（通常是 UUID），<strong>一次用户操作对应一个 key</strong>，而不是一次 HTTP 请求一个 key——否则重试时 key 变了，就失去了意义。</li>
+</ul>
+<h3 id="_8">分布式锁 + 判重</h3>
+<p>当判重逻辑比较复杂、无法用一条 SQL 完成时，可以用「<strong>一锁、二判、三更新</strong>」：</p>
+<ol>
+<li>以业务唯一标识为 key 加<strong>分布式锁</strong>（见本系列《分布式锁》）；</li>
+<li>查处理记录：已经处理过 → 直接返回之前的结果；</li>
+<li>没有处理过 → 执行业务，并写入处理记录；</li>
+<li>释放锁。</li>
+</ol>
+<p>锁解决的是<strong>同时到达</strong>的重复请求，判重解决的是<strong>先后到达</strong>的重复请求，两者缺一不可：只加锁不判重，第二个请求等第一个释放锁后照样会执行一遍；只判重不加锁，两个并发请求可能同时判断为「没处理过」。</p>
+<p>由于分布式锁本身可能在极端情况下失效（锁过期、主从切换），关键业务还应该在数据库上加唯一约束做最后的兜底。</p>
+<h2 id="mq">MQ 消费幂等，以及三个坑</h2>
+<figure><img src="img/f-75.4.jpg" alt="MQ 消费端去重，以及三个常见的坑" loading="lazy"><figcaption>MQ 消费端去重，以及三个常见的坑</figcaption></figure>
+<h3 id="_9">消息为什么会重复</h3>
+<p>主流消息队列（Kafka、RocketMQ、RabbitMQ 等）在常规配置下提供的都是「<strong>至少一次</strong>」（at-least-once）投递：</p>
+<ul>
+<li><strong>消费端</strong>：处理完消息，提交位点或发送 ack 之前进程崩溃、网络中断，Broker 认为消息没被消费，会重新投递；消费者组重平衡时也可能重复消费；</li>
+<li><strong>生产端</strong>：发送消息超时后重试，Broker 上可能出现两条内容相同的消息。</li>
+</ul>
+<p>「至多一次」会丢消息，「恰好一次」代价很高且有严格的适用范围（比如 Kafka 的事务只在 Kafka 内部的「读-处理-写」链路上提供恰好一次语义）。所以通用的做法是：<strong>接受至少一次投递，在消费端做幂等</strong>。至少一次投递 + 消费端去重，得到的是效果上的「恰好一次」（见本系列《消息队列》）。</p>
+<h3 id="_10">消费端怎么去重</h3>
+<ul>
+<li><strong>去重表 + 唯一约束</strong>：在消费的业务事务里插入 <code>msg_id</code> 或业务唯一键，冲突就跳过，然后照常 ack；</li>
+<li><strong>Redis <code>SET NX</code></strong>：性能更好，但它和数据库业务不在同一个事务里。如果先写了 Redis 标记，业务却执行失败，消息重投时会被误判为「已处理」而丢失，需要配合「处理中 / 已完成」两种状态和过期时间来处理；</li>
+<li><strong>业务自身的幂等</strong>：比如状态机条件更新，本身就不怕重复。</li>
+</ul>
+<p>用什么做去重 key？<strong>优先用业务唯一键</strong>（订单号、流水号），而不是消息系统生成的消息 ID。因为生产端重试发出的两条消息，消息 ID 可能并不相同，但它们代表的是同一个业务操作。RocketMQ 的官方文档就建议用业务唯一标识来做消费幂等。</p>
+<h3 id="_11">坑一：先查后插的竞态</h3>
+<p>最常见的错误写法：</p>
+<pre><code class="language-text">if (查询去重表，不存在) {
+    执行业务;
+    插入去重记录;
+}
+</code></pre>
+<p>两个重复请求<strong>同时</strong>到达，都查到「不存在」，于是都执行了业务。「查询」和「插入」之间的空档就是竞态窗口，并发越高越容易出现。实验一会复现这个问题：10 个并发请求全部「创建成功」。</p>
+<p>解决：不要「先查后插」，而是<strong>直接插入，让唯一约束或原子操作去判断</strong>；并且把去重记录和业务放在同一个事务里。</p>
+<h3 id="_12">坑二：去重记录留多久</h3>
+<p>去重记录不能永久保存，否则存储会无限膨胀；但也不能太短：</p>
+<ul>
+<li><strong>太短</strong>：重试还没结束，去重记录就被清理了，晚到的重复请求又被执行一次；</li>
+<li><strong>太长</strong>：存储和索引不断变大。</li>
+</ul>
+<p>原则是<strong>至少覆盖最大的重试窗口</strong>：客户端会重试多久、消息队列会重投多久、人工补偿可能在多久之后发起。比如消息重投会持续几个小时、客户端最多会在一天之内重试，那去重记录至少要保留一天以上。对于订单、支付这类业务，唯一约束直接建在业务表上，就没有过期的问题。</p>
+<h3 id="_13">坑三：重复请求应该返回什么</h3>
+<p>很多实现在检测到重复时返回「请勿重复提交」之类的错误。这对表单防重或许够用，但对 API 来说是<strong>错误的</strong>：</p>
+<p>客户端重试是因为它<strong>不知道第一次有没有成功</strong>。如果重试得到的是一个错误，它会以为操作失败了，可能去提示用户「支付失败」，用户再换一种方式支付——反而造成了重复支付。</p>
+<p>正确的做法是：<strong>重复请求返回和第一次相同的结果</strong>。第一次创建了订单 A1001，重复请求也返回「订单 A1001 创建成功」。为此，需要把第一次的结果存下来（幂等键方案），或者能根据唯一键查出来（唯一约束方案）。</p>
+<h2 id="_14">动手实验</h2>
+<p>下面的代码在 Python 3.13（自带 SQLite 3.45）和 Redis 7.0 下实际运行。</p>
+<h3 id="vs">实验一：先查后插 vs 唯一约束</h3>
+<p>用 10 个线程同时提交同一个订单号，模拟用户连点或并发重试：</p>
+<pre><code class="language-python">import os, sqlite3, tempfile, threading, time
+
+DB = os.path.join(tempfile.mkdtemp(), &quot;shop.db&quot;)
+
+def conn():
+    c = sqlite3.connect(DB, timeout=10, isolation_level=None)   # 自动提交，事务手动用 BEGIN 控制
+    return c
+
+with conn() as c:
+    c.executescript(&quot;&quot;&quot;
+    CREATE TABLE orders_naive (id INTEGER PRIMARY KEY, order_no TEXT, amount INT);   -- 没有唯一约束
+    CREATE TABLE orders (id INTEGER PRIMARY KEY, order_no TEXT UNIQUE, amount INT);  -- 有唯一约束
+    &quot;&quot;&quot;)
+
+def run_concurrently(fn, n=10):
+    barrier = threading.Barrier(n)                 # 让 n 个线程尽量同时开跑，模拟用户连点 / 重试
+    results = [None] * n
+    def worker(i):
+        barrier.wait()
+        results[i] = fn()
+    ts = [threading.Thread(target=worker, args=(i,)) for i in range(n)]
+    for t in ts: t.start()
+    for t in ts: t.join()
+    return results
+
+# ---------- 错误示范：先查后插 ----------
+def create_naive():
+    c = conn()
+    if c.execute(&quot;SELECT 1 FROM orders_naive WHERE order_no = 'A1001'&quot;).fetchone():
+        return &quot;已存在&quot;
+    time.sleep(0.05)                               # 查询和插入之间的空档（真实系统里是业务逻辑、网络耗时）
+    c.execute(&quot;INSERT INTO orders_naive (order_no, amount) VALUES ('A1001', 99)&quot;)
+    return &quot;创建成功&quot;
+
+r = run_concurrently(create_naive)
+cnt = conn().execute(&quot;SELECT COUNT(*) FROM orders_naive&quot;).fetchone()[0]
+print(f&quot;先查后插：{r.count('创建成功')} 个请求「创建成功」，表里有 {cnt} 条 A1001&quot;)
+
+# ---------- 正确做法：直接插入，让唯一约束兜底 ----------
+def create_with_unique():
+    c = conn()
+    try:
+        c.execute(&quot;INSERT INTO orders (order_no, amount) VALUES ('A1001', 99)&quot;)
+        return &quot;创建成功&quot;
+    except sqlite3.IntegrityError:                 # 冲突 = 重复请求：查出已有订单，返回同样的结果
+        oid = c.execute(&quot;SELECT id FROM orders WHERE order_no = 'A1001'&quot;).fetchone()[0]
+        return f&quot;重复请求，返回已有订单 id={oid}&quot;
+
+r = run_concurrently(create_with_unique)
+cnt = conn().execute(&quot;SELECT COUNT(*) FROM orders&quot;).fetchone()[0]
+print(f&quot;唯一约束：{r.count('创建成功')} 个请求创建成功，表里有 {cnt} 条 A1001&quot;)
+print(&quot;其余请求收到:&quot;, sorted(set(x for x in r if x != &quot;创建成功&quot;)))
+</code></pre>
+<p>输出：</p>
+<pre><code class="language-text">先查后插：10 个请求「创建成功」，表里有 10 条 A1001
+唯一约束：1 个请求创建成功，表里有 1 条 A1001
+其余请求收到: ['重复请求，返回已有订单 id=1']
+</code></pre>
+<p>「先查后插」里的 <code>sleep</code> 只是把竞态窗口放大，让问题稳定复现；真实系统中这个窗口是业务逻辑和网络的耗时，并发量一大照样会出现。唯一约束版本没有任何「查询」，判重完全交给数据库，所以 10 个并发请求只有 1 个插入成功，其余 9 个都拿到了同一个订单。</p>
+<h3 id="redis-token">实验二：Redis 原子删除 Token</h3>
+<p>启动一个本地 Redis（7.0），用 <code>redis-cli</code> 模拟 5 个同时到达的重复提交：</p>
+<pre><code class="language-bash">#!/bin/bash
+R=&quot;redis-cli -p 6399&quot;
+
+# ① 打开下单页：服务端生成一个 token，存 10 分钟，并下发给页面
+TOKEN=$(python3 -c &quot;import secrets; print(secrets.token_hex(8))&quot;)
+echo &quot;发放 token: $TOKEN -&gt; $($R SET idem:token:$TOKEN 1 EX 600)&quot;
+
+# ② 用户连点 5 次：5 个请求同时带着同一个 token 到达，服务端各自执行一次原子 DEL
+for i in 1 2 3 4 5; do
+  ( n=$($R DEL idem:token:$TOKEN)
+    if [ &quot;$n&quot; = &quot;1&quot; ]; then echo &quot;请求 $i: DEL 返回 $n -&gt; 第一次提交，创建订单&quot;
+    else                    echo &quot;请求 $i: DEL 返回 $n -&gt; 重复提交，拒绝&quot;; fi ) &amp;
+done
+wait
+</code></pre>
+<p>输出（token 随机，哪个请求先到每次不同）：</p>
+<pre><code class="language-text">发放 token: 224889587b422fec -&gt; OK
+请求 1: DEL 返回 0 -&gt; 重复提交，拒绝
+请求 3: DEL 返回 1 -&gt; 第一次提交，创建订单
+请求 2: DEL 返回 0 -&gt; 重复提交，拒绝
+请求 5: DEL 返回 0 -&gt; 重复提交，拒绝
+请求 4: DEL 返回 0 -&gt; 重复提交，拒绝
+</code></pre>
+<p>5 个并发请求，恰好一个 <code>DEL</code> 返回 1。</p>
+<h3 id="_15">实验三：状态机与乐观锁</h3>
+<pre><code class="language-python">import os, sqlite3, tempfile, threading
+
+DB = os.path.join(tempfile.mkdtemp(), &quot;shop.db&quot;)
+conn = lambda: sqlite3.connect(DB, timeout=10, isolation_level=None)
+
+with conn() as c:
+    c.executescript(&quot;&quot;&quot;
+    CREATE TABLE orders  (id INTEGER PRIMARY KEY, status TEXT NOT NULL, amount INT);
+    CREATE TABLE account (id INTEGER PRIMARY KEY, balance INT NOT NULL, version INT NOT NULL);
+    CREATE TABLE points_log (order_id INT, points INT);
+    INSERT INTO orders  VALUES (1001, '待支付', 99), (1002, '待支付', 50);
+    INSERT INTO account VALUES (42, 1000, 5);
+    &quot;&quot;&quot;)
+
+# ---------- 状态机：只允许 待支付 → 已支付 ----------
+def on_pay_callback(order_id):
+    c = conn()
+    c.execute(&quot;BEGIN IMMEDIATE&quot;)
+    n = c.execute(&quot;UPDATE orders SET status = '已支付' WHERE id = ? AND status = '待支付'&quot;, (order_id,)).rowcount
+    if n == 1:                                     # 只有第一次推进成功的请求，才执行后续业务
+        c.execute(&quot;INSERT INTO points_log VALUES (?, 99)&quot;, (order_id,))
+    c.execute(&quot;COMMIT&quot;)
+    return n
+
+def run_concurrently(fn, n=10):
+    b = threading.Barrier(n); out = [None] * n
+    def w(i): b.wait(); out[i] = fn()
+    ts = [threading.Thread(target=w, args=(i,)) for i in range(n)]
+    [t.start() for t in ts]; [t.join() for t in ts]
+    return out
+
+r = run_concurrently(lambda: on_pay_callback(1001))
+c = conn()
+print(&quot;10 个支付回调同时到达，各自影响行数:&quot;, r)
+print(&quot;订单状态:&quot;, c.execute(&quot;SELECT status FROM orders WHERE id = 1001&quot;).fetchone()[0],
+      &quot;| 积分发放次数:&quot;, c.execute(&quot;SELECT COUNT(*) FROM points_log&quot;).fetchone()[0])
+
+n = c.execute(&quot;UPDATE orders SET status = '已取消' WHERE id = 1001 AND status = '待支付'&quot;).rowcount
+print(&quot;已支付的订单再取消，影响行数:&quot;, n, &quot;(状态不允许，什么也没改)&quot;)
+
+# ---------- 乐观锁：带上读到的版本号 ----------
+def deduct(expected_version):
+    return conn().execute(
+        &quot;UPDATE account SET balance = balance - 99, version = version + 1 WHERE id = 42 AND version = ?&quot;,
+        (expected_version,)).rowcount
+
+balance, version = c.execute(&quot;SELECT balance, version FROM account WHERE id = 42&quot;).fetchone()
+print(f&quot;\n扣款前: balance={balance}, version={version}&quot;)
+print(&quot;第 1 次扣款（version=5）影响行数:&quot;, deduct(version))
+print(&quot;重复请求（仍带 version=5）影响行数:&quot;, deduct(version))
+print(&quot;扣款后:&quot;, dict(zip((&quot;balance&quot;, &quot;version&quot;), c.execute(&quot;SELECT balance, version FROM account WHERE id = 42&quot;).fetchone())))
+</code></pre>
+<p>输出（第一行中哪个线程得到 1 每次不同）：</p>
+<pre><code class="language-text">10 个支付回调同时到达，各自影响行数: [0, 0, 0, 0, 0, 0, 0, 0, 0, 1]
+订单状态: 已支付 | 积分发放次数: 1
+已支付的订单再取消，影响行数: 0 (状态不允许，什么也没改)
+
+扣款前: balance=1000, version=5
+第 1 次扣款（version=5）影响行数: 1
+重复请求（仍带 version=5）影响行数: 0
+扣款后: {'balance': 901, 'version': 6}
+</code></pre>
+<p>10 个并发回调只有一个把状态从「待支付」推进到「已支付」，积分也只发了一次。</p>
+<h3 id="idempotency-key_1">实验四：Idempotency-Key 的完整实现</h3>
+<pre><code class="language-python">import hashlib, json, os, sqlite3, tempfile, threading, time, uuid
+
+DB = os.path.join(tempfile.mkdtemp(), &quot;pay.db&quot;)
+conn = lambda: sqlite3.connect(DB, timeout=10, isolation_level=None)
+with conn() as c:
+    c.executescript(&quot;&quot;&quot;
+    CREATE TABLE account (id INTEGER PRIMARY KEY, balance INT);
+    INSERT INTO account VALUES (42, 1000);
+    CREATE TABLE idempotency_keys (
+        key          TEXT PRIMARY KEY,      -- 唯一约束：同一个 key 只能「抢占」一次
+        request_hash TEXT NOT NULL,         -- 防止同一个 key 被用于不同的请求
+        status       TEXT NOT NULL,         -- processing / done
+        response     TEXT,                  -- 第一次的响应，重复请求原样返回
+        created_at   REAL NOT NULL          -- 过期清理用（例如保留 24 小时）
+    );
+    &quot;&quot;&quot;)
+
+def pay(key, body):
+    c = conn()
+    req_hash = hashlib.sha256(json.dumps(body, sort_keys=True).encode()).hexdigest()
+    try:   # 1. 抢占 key：插入成功说明是第一次
+        c.execute(&quot;INSERT INTO idempotency_keys VALUES (?, ?, 'processing', NULL, ?)&quot;, (key, req_hash, time.time()))
+    except sqlite3.IntegrityError:
+        h, status, resp = c.execute(&quot;SELECT request_hash, status, response FROM idempotency_keys WHERE key = ?&quot;, (key,)).fetchone()
+        if h != req_hash:
+            return 422, {&quot;error&quot;: &quot;同一个 Idempotency-Key 不能用于不同的请求&quot;}
+        if status == &quot;processing&quot;:
+            return 409, {&quot;error&quot;: &quot;请求正在处理中，请稍后重试&quot;}
+        return 200, json.loads(resp) | {&quot;replayed&quot;: True}           # 返回第一次的结果
+    # 2. 执行业务，并在同一个事务里保存响应
+    time.sleep(0.1)                                                  # 模拟调用下游、业务处理耗时
+    c.execute(&quot;BEGIN IMMEDIATE&quot;)
+    c.execute(&quot;UPDATE account SET balance = balance - ? WHERE id = 42&quot;, (body[&quot;amount&quot;],))
+    resp = {&quot;payment_id&quot;: &quot;pay_&quot; + key[:8], &quot;amount&quot;: body[&quot;amount&quot;]}
+    c.execute(&quot;UPDATE idempotency_keys SET status = 'done', response = ? WHERE key = ?&quot;, (json.dumps(resp), key))
+    c.execute(&quot;COMMIT&quot;)
+    return 200, resp
+
+key = str(uuid.uuid4())                       # 客户端为「这一次支付」生成的 key
+body = {&quot;order&quot;: &quot;A1001&quot;, &quot;amount&quot;: 99}
+
+# 用户连点：3 个请求几乎同时到达
+out = []
+ts = [threading.Thread(target=lambda: out.append(pay(key, body))) for _ in range(3)]
+[t.start() for t in ts]; [t.join() for t in ts]
+for code, r in sorted(out, key=lambda x: x[0]): print(&quot;并发:&quot;, code, r)
+
+# 超时重试：稍后带同一个 key 再来一次
+print(&quot;重试:&quot;, *pay(key, body))
+# 同一个 key，金额却变了
+print(&quot;换参数:&quot;, *pay(key, {&quot;order&quot;: &quot;A1001&quot;, &quot;amount&quot;: 999}))
+print(&quot;余额:&quot;, conn().execute(&quot;SELECT balance FROM account WHERE id = 42&quot;).fetchone()[0], &quot;（只扣了一次 99）&quot;)
+</code></pre>
+<p>输出（key 是随机生成的）：</p>
+<pre><code class="language-text">并发: 200 {'payment_id': 'pay_14dcc00e', 'amount': 99}
+并发: 409 {'error': '请求正在处理中，请稍后重试'}
+并发: 409 {'error': '请求正在处理中，请稍后重试'}
+重试: 200 {'payment_id': 'pay_14dcc00e', 'amount': 99, 'replayed': True}
+换参数: 422 {'error': '同一个 Idempotency-Key 不能用于不同的请求'}
+余额: 901 （只扣了一次 99）
+</code></pre>
+<p>四种情况都覆盖到了：并发的重复请求拿到 409，稍后的重试拿到<strong>和第一次完全相同的支付单号</strong>，换了参数的请求被拒绝，钱只扣了一次。这里为了简洁，「扣款」和「保存响应」放在一个事务里，但「抢占 key」是单独提交的，这正是上文说的「处理中崩溃」需要超时机制兜底的原因。</p>
+<h3 id="mq_1">实验五：MQ 消费端去重</h3>
+<pre><code class="language-python">import sqlite3
+
+db = sqlite3.connect(&quot;:memory:&quot;, isolation_level=None)
+db.executescript(&quot;&quot;&quot;
+CREATE TABLE account (id INTEGER PRIMARY KEY, points INT);
+INSERT INTO account VALUES (42, 0);
+CREATE TABLE consumed_msg (msg_id TEXT PRIMARY KEY, consumed_at TEXT DEFAULT CURRENT_TIMESTAMP);
+&quot;&quot;&quot;)
+
+class Crash(Exception):
+    pass
+
+def consume(msg, crash=False):
+    db.execute(&quot;BEGIN&quot;)
+    try:
+        db.execute(&quot;INSERT INTO consumed_msg (msg_id) VALUES (?)&quot;, (msg[&quot;id&quot;],))   # 去重记录
+        db.execute(&quot;UPDATE account SET points = points + ? WHERE id = 42&quot;, (msg[&quot;points&quot;],))
+        if crash:
+            raise Crash()                                                            # 模拟提交前进程崩溃
+        db.execute(&quot;COMMIT&quot;)                                                         # 去重记录和业务一起提交
+        return &quot;处理完成，ack&quot;
+    except sqlite3.IntegrityError:
+        db.execute(&quot;ROLLBACK&quot;)
+        return &quot;重复消息，跳过业务，直接 ack&quot;
+    except Crash:
+        db.execute(&quot;ROLLBACK&quot;)                                                       # 事务回滚，去重记录也没留下
+        return &quot;崩溃：没有 ack，稍后会重新投递&quot;
+
+# 「至少一次」投递：m-1、m-2 因为 ack 丢失被重复投递，m-3 第一次消费时进程崩溃
+deliveries = [(&quot;m-1&quot;, False), (&quot;m-2&quot;, False), (&quot;m-1&quot;, False), (&quot;m-3&quot;, True), (&quot;m-2&quot;, False), (&quot;m-3&quot;, False)]
+points = {&quot;m-1&quot;: 10, &quot;m-2&quot;: 20, &quot;m-3&quot;: 30}
+for mid, crash in deliveries:
+    print(f&quot;{mid}: {consume({'id': mid, 'points': points[mid]}, crash)}&quot;)
+print(&quot;最终积分:&quot;, db.execute(&quot;SELECT points FROM account&quot;).fetchone()[0], &quot;（期望 10 + 20 + 30 = 60）&quot;)
+</code></pre>
+<p>输出：</p>
+<pre><code class="language-text">m-1: 处理完成，ack
+m-2: 处理完成，ack
+m-1: 重复消息，跳过业务，直接 ack
+m-3: 崩溃：没有 ack，稍后会重新投递
+m-2: 重复消息，跳过业务，直接 ack
+m-3: 处理完成，ack
+最终积分: 60 （期望 10 + 20 + 30 = 60）
+</code></pre>
+<p>注意 m-3：第一次消费时崩溃，<strong>去重记录随事务一起回滚了</strong>，所以重投时能被正常处理。如果去重标记写在事务之外（比如先在 Redis 里 <code>SET NX</code>），这条消息就会被误判为「已处理」而永远丢失。</p>
+<h2 id="_16">方案怎么选</h2>
+<table>
+<thead>
+<tr>
+<th>方案</th>
+<th>适合场景</th>
+<th>优点</th>
+<th>注意</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>唯一约束 / 去重表</td>
+<td>创建类操作、消息消费</td>
+<td>数据库保证，最可靠</td>
+<td>分库分表时唯一键要与分片键对齐</td>
+</tr>
+<tr>
+<td>Token</td>
+<td>页面表单防重复提交</td>
+<td>实现简单</td>
+<td>要先领 token；只防重复提交</td>
+</tr>
+<tr>
+<td>乐观锁版本号</td>
+<td>更新类操作</td>
+<td>无需额外存储</td>
+<td>重试必须携带首次读到的版本</td>
+</tr>
+<tr>
+<td>状态机</td>
+<td>有明确状态流转的业务（订单、支付回调）</td>
+<td>天然契合业务</td>
+<td>后续动作要以状态推进成功为前提</td>
+</tr>
+<tr>
+<td>幂等键</td>
+<td>对外开放的 API、支付</td>
+<td>通用，能返回首次结果</td>
+<td>要存响应、处理「处理中」和过期</td>
+</tr>
+<tr>
+<td>分布式锁 + 判重</td>
+<td>判重逻辑复杂的场景</td>
+<td>灵活</td>
+<td>锁可能失效，需唯一约束兜底</td>
+</tr>
+</tbody>
+</table>
+<p>实际系统往往<strong>组合使用</strong>：前端按钮防抖、页面用 Token 防重复提交、接口用幂等键、数据库用唯一约束兜底、下游回调用状态机。前端防抖只是改善体验，<strong>不能代替服务端的幂等</strong>，因为重复请求的来源远不止用户连点。</p>
+<p>几条通用的建议：</p>
+<ol>
+<li><strong>先找到业务唯一标识</strong>：说不清「两个请求什么时候算同一个」，就没法做幂等；</li>
+<li><strong>判断和修改要原子</strong>：唯一约束、条件更新、<code>SET NX</code>、<code>DEL</code> 返回值，而不是先查后改；</li>
+<li><strong>去重记录和业务放在同一个事务里</strong>，做不到时要想清楚中间崩溃的后果；</li>
+<li><strong>重复请求返回首次结果</strong>，让调用方可以放心重试；</li>
+<li><strong>重试要有上限和退避</strong>：幂等让重试变得安全，但无限制的重试依然会把系统压垮（见本系列《限流算法》）。</li>
+</ol>
+<h2 id="_17">高频面试题速答</h2>
+<p><strong>Q：什么是幂等？为什么需要幂等？</strong>
+同一个操作执行一次和执行多次，对系统状态的影响相同。因为用户重复操作、超时重试、框架自动重试、消息队列至少一次投递都会产生重复请求，而客户端无法区分「没执行」和「执行了但响应丢了」。</p>
+<p><strong>Q：哪些 HTTP 方法是幂等的？</strong>
+GET、HEAD、OPTIONS、PUT、DELETE 是幂等的；POST 不是；PATCH 不保证。幂等指的是服务器状态的效果，响应可以不同。</p>
+<p><strong>Q：如何防止接口重复提交？</strong>
+前端防抖改善体验；服务端用 Token 机制（先领 token，提交时原子删除，删除成功才处理）；数据库用唯一约束兜底。</p>
+<p><strong>Q：常见的幂等方案有哪些？</strong>
+唯一索引 / 去重表、Token、乐观锁版本号、状态机条件更新、幂等键（Idempotency-Key）、分布式锁 + 判重。核心都是找到业务唯一标识，并原子地完成「判断 + 修改」。</p>
+<p><strong>Q：支付回调重复通知怎么处理？</strong>
+用状态机条件更新：<code>UPDATE ... SET status='已支付' WHERE id=? AND status='待支付'</code>，影响 1 行才执行后续逻辑；影响 0 行说明已处理，直接返回成功应答。</p>
+<p><strong>Q：MQ 如何保证消息不被重复消费？</strong>
+消息队列通常只保证至少一次投递，需要消费端幂等：在业务事务中插入消息的业务唯一键到去重表（唯一约束），冲突则跳过并 ack；也可以依赖业务本身的状态机。</p>
+<p><strong>Q：「先查询是否存在，不存在再插入」有什么问题？</strong>
+查询和插入之间存在竞态窗口，并发的重复请求可能都查到「不存在」而都执行。应直接插入，依靠唯一约束判断。</p>
+<p><strong>Q：检测到重复请求时应该返回什么？</strong>
+应返回与第一次相同的结果，而不是报错。否则客户端会误以为操作失败，可能引发新的重复操作。</p>
+<h2 id="_18">总结</h2>
+<figure><img src="img/f-81.jpg" alt="四个关键方案" loading="lazy"><figcaption>四个关键方案</figcaption></figure>
+<ul>
+<li>重复请求是常态：用户连点、超时重试、框架重试、MQ 至少一次投递；客户端分不清「没执行」和「响应丢了」，只能重试；</li>
+<li><strong>幂等</strong>：执行一次和多次效果相同。GET、PUT、DELETE 幂等，POST 不幂等；</li>
+<li>一切方案的起点是<strong>业务唯一标识</strong>，关键是<strong>原子地判断 + 修改</strong>；</li>
+<li>方案：<strong>唯一约束</strong>兜底、<strong>Token</strong> 防重复提交、<strong>乐观锁 / 状态机</strong>条件更新、<strong>幂等键</strong>返回首次结果、<strong>分布式锁 + 判重</strong>；</li>
+<li>MQ：接受至少一次投递，<strong>消费端用业务唯一键去重</strong>，去重记录与业务同一事务；</li>
+<li>三个坑：<strong>先查后插</strong>的竞态、去重记录的<strong>过期时间</strong>要覆盖重试窗口、重复请求要<strong>返回第一次的结果</strong>。</li>
+</ul>
+<div class="refs">
+<h3 id="_19">参考资料</h3>
+<ul>
+<li>RFC 9110：HTTP Semantics（9.2.1 Safe Methods、9.2.2 Idempotent Methods）.</li>
+<li>RFC 5789：PATCH Method for HTTP.</li>
+<li>IETF HTTPAPI 工作组草案：The Idempotency-Key HTTP Header Field（draft-ietf-httpapi-idempotency-key-header）.</li>
+<li>Stripe API 文档：Idempotent requests.</li>
+<li>Nginx 文档：ngx_http_proxy_module — proxy_next_upstream.</li>
+<li>MySQL 8.0 参考手册：INSERT ... ON DUPLICATE KEY UPDATE；Unique Indexes.</li>
+<li>Redis 文档：SET（NX、EX 选项）、DEL、GETDEL.</li>
+<li>Apache RocketMQ 文档：消费幂等.</li>
+<li>Apache Kafka 文档：Message Delivery Semantics；Idempotent Producer.</li>
+<li>SQLite 文档：UNIQUE constraints；BEGIN IMMEDIATE.</li>
+<li>Python 文档：sqlite3、threading.</li>
+</ul>
+</div>
+  </article>
+  <div class="foot"><a href="../index.html">← 拾星首页</a><a href="landscape.html">▶ 看配套视频</a></div>
+</div>
+</body>
+</html>
