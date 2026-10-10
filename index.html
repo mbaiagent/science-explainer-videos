@@ -86,7 +86,8 @@ const VIDEOS = [
   {cat:'cs', title:"进程、线程与协程", desc:"隔离的进程、共享的线程、上下文切换、用户态协程", path:'process-thread-coroutine/landscape.html', dur:80, color:'#60a5fa'},
   {cat:'ai', title:"评估（Evals）", desc:"测试集、三种打分方式、看细分指标、评估驱动迭代", path:'evals/landscape.html', dur:80, color:'#a3e635'},
   {cat:'cs', title:"分布式锁", desc:"SET NX PX、Lua 释放、看门狗、Redlock 与 Fencing", path:'distributed-lock/landscape.html', dur:80, color:'#f59e0b'},
-  {cat:'ai', title:"Transformer 详解", desc:"Q·K·V 自注意力、因果掩码、多头、FFN 与残差", path:'transformer/landscape.html', dur:84, color:'#f9a8d4'}
+  {cat:'ai', title:"Transformer 详解", desc:"Q·K·V 自注意力、因果掩码、多头、FFN 与残差", path:'transformer/landscape.html', dur:84, color:'#f9a8d4'},
+  {cat:'ai', title:"微调与 LoRA", desc:"什么时候该微调？全量微调为什么贵？LoRA 冻结原权重、只训练两个小矩阵，参数不到 1%", path:'fine-tuning-lora/landscape.html', dur:82, color:'#fcd34d'}
 ];
 const fmt = s => `${Math.floor(s/60)}:${String(s%60).padStart(2,'0')}`;
 const esc = s => s.replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));

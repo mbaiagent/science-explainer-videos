@@ -1,0 +1,315 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>微调与 LoRA · 拾星</title>
+<style>
+  :root{--bg:#07080f;--fg:#f4ede4;--muted:#9a93a8;--acc:#fcd34d}
+  html,body{margin:0;height:100%;background:var(--bg);color:var(--fg);
+    font-family:-apple-system,"PingFang SC","Noto Sans SC","Noto Sans CJK SC","Microsoft YaHei",sans-serif}
+  body{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;overflow:hidden}
+  #stage{display:block;background:#07080f;border-radius:12px;box-shadow:0 20px 60px rgba(0,0,0,.55);cursor:pointer}
+  #bar{display:flex;align-items:center;gap:12px;width:min(calc(100vw - 32px),640px)}
+  #btn{width:40px;height:40px;border-radius:50%;border:1px solid rgba(252,211,77,.5);background:transparent;
+    color:var(--acc);font-size:16px;cursor:pointer;flex:none}
+  #seek{flex:1;accent-color:var(--acc)}
+  #time{font-variant-numeric:tabular-nums;font-size:13px;color:var(--muted);min-width:84px;text-align:right}
+  body.render{display:block}
+  body.render #bar{display:none}
+  body.render #stage{border-radius:0;box-shadow:none}
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="bar">
+  <button id="btn" aria-label="播放/暂停">❚❚</button>
+  <input id="seek" type="range" min="0" max="82" step="0.01" value="0">
+  <span id="time">0:00 / 1:22</span>
+</div>
+<script>
+/* ============ 基础设置（横屏 1920×1080） ============ */
+const W = 1920, H = 1080, DUR = 82;
+const cv = document.getElementById('stage'), ctx = cv.getContext('2d');
+cv.width = W; cv.height = H;
+const FONT = '"PingFang SC","Noto Sans SC","Noto Sans CJK SC","Source Han Sans SC","Microsoft YaHei",sans-serif';
+const MONO = '"JetBrains Mono","SF Mono",Menlo,Consolas,"DejaVu Sans Mono","Noto Sans Mono CJK SC","PingFang SC","Microsoft YaHei",monospace';
+const C = {acc:'#fcd34d', mint:'#6ee7c8', gold:'#ffd38a', coral:'#ff9e7a', rose:'#ff8a8a', blue:'#9cc3ff', text:'#f4ede4', muted:'#9a93a8', dim:'#4a4558', panel:'#0f0e1f'};
+
+const clamp = (x,a=0,b=1) => Math.max(a, Math.min(b, x));
+const lerp = (a,b,t) => a + (b-a)*t;
+const p = (t,a,b) => clamp((t-a)/(b-a));
+const eo = x => 1 - Math.pow(1-x, 3);
+const eio = x => x < .5 ? 4*x*x*x : 1 - Math.pow(-2*x+2, 3)/2;
+const eback = x => { const c1=1.70158, c3=c1+1; return 1 + c3*Math.pow(x-1,3) + c1*Math.pow(x-1,2); };
+function rnd(seed){ let s = seed>>>0; return () => { s = (s*1664525 + 1013904223)>>>0; return s/4294967296; }; }
+
+let SA = 1;
+const al = a => { ctx.globalAlpha = clamp(SA*a); };
+const sceneA = (t,a,b,f=.5) => Math.min(p(t,a,a+f), 1 - p(t,b-f,b));
+
+function txt(s, x, y, o = {}){
+  const {size=64, weight=700, color=C.text, alpha=1, align='center', glow=0, scale=1, font=FONT} = o;
+  if (alpha <= 0) return;
+  ctx.save(); al(alpha);
+  ctx.font = `${weight} ${size}px ${font}`;
+  ctx.textAlign = align; ctx.textBaseline = 'middle'; ctx.fillStyle = color;
+  if (glow){ ctx.shadowColor = color; ctx.shadowBlur = glow; }
+  if (scale !== 1){ ctx.translate(x, y); ctx.scale(scale, scale); ctx.fillText(s, 0, 0); }
+  else ctx.fillText(s, x, y);
+  ctx.restore();
+}
+function rise(s, x, y, t, t0, o = {}, d = .7){
+  const e = eo(p(t, t0, t0+d));
+  if (e <= 0) return;
+  txt(s, x, y + (1-e)*36, {...o, alpha:(o.alpha ?? 1)*e});
+}
+function rr(x,y,w,h,r){ ctx.beginPath(); ctx.roundRect(x,y,w,h,r); }
+function box(x, y, w, h, a, o = {}){
+  const {fill='rgba(255,255,255,.05)', stroke='rgba(252,211,77,.35)', lw=2, glow=0, r=18, dash=null} = o;
+  if (a <= 0) return;
+  ctx.save(); al(a); rr(x, y, w, h, r); ctx.fillStyle = fill; ctx.fill();
+  if (dash) ctx.setLineDash(dash);
+  ctx.strokeStyle = stroke; ctx.lineWidth = lw; if (glow){ ctx.shadowColor = stroke; ctx.shadowBlur = glow; } ctx.stroke(); ctx.restore();
+}
+function arrow(x1, y1, x2, y2, e, a, color = C.acc, lw = 3){
+  if (e <= 0 || a <= 0) return;
+  const x = lerp(x1, x2, e), y = lerp(y1, y2, e), ang = Math.atan2(y2 - y1, x2 - x1);
+  ctx.save(); al(a); ctx.strokeStyle = color; ctx.fillStyle = color; ctx.lineWidth = lw; ctx.lineCap = 'round';
+  ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x, y); ctx.stroke();
+  if (e > .85){ ctx.translate(x, y); ctx.rotate(ang); ctx.beginPath(); ctx.moveTo(4, 0); ctx.lineTo(-14, -9); ctx.lineTo(-14, 9); ctx.closePath(); ctx.fill(); }
+  ctx.restore();
+}
+function panel(x, y, w, h, title, a){
+  box(x, y, w, h, a, {fill:C.panel, stroke:'rgba(255,255,255,.1)', r:20});
+  if (a <= 0) return;
+  ctx.save(); al(a); ctx.strokeStyle = 'rgba(255,255,255,.07)'; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(x, y + 52); ctx.lineTo(x + w, y + 52); ctx.stroke();
+  ['#ff6b6b','#ffd166','#6ee7a0'].forEach((c, i) => { ctx.fillStyle = c; ctx.globalAlpha = clamp(SA*a*.8); ctx.beginPath(); ctx.arc(x + 30 + i*24, y + 26, 7, 0, 6.283); ctx.fill(); });
+  ctx.restore();
+  txt(title, x + w/2, y + 27, {size:22, weight:500, color:C.muted, font:MONO, alpha:a});
+}
+
+/* ============ 背景 ============ */
+const PARTS = (() => { const r = rnd(223); return Array.from({length:100}, () => ({
+  x:r()*W, y:r()*H, s:r()*2.2+.5, v:r()*12+4, ph:r()*6.283, c:r()<.25})); })();
+function background(t){
+  const g = ctx.createLinearGradient(0,0,W,H);
+  g.addColorStop(0,'#0a0916'); g.addColorStop(.55,'#110f24'); g.addColorStop(1,'#18122c');
+  ctx.globalAlpha = 1; ctx.fillStyle = g; ctx.fillRect(0,0,W,H);
+  const gx = W*.5 + Math.sin(t*.27)*140;
+  const rg = ctx.createRadialGradient(gx, H*.45, 0, gx, H*.45, 950);
+  rg.addColorStop(0,'rgba(252,211,77,0.09)'); rg.addColorStop(1,'rgba(252,211,77,0)');
+  ctx.fillStyle = rg; ctx.fillRect(0,0,W,H);
+  ctx.fillStyle = C.acc;
+  for (let x = 40; x < W; x += 80) for (let y = 40; y < H; y += 80){ ctx.globalAlpha = .06; ctx.fillRect(x, y, 2, 2); }
+  for (const q of PARTS){
+    const y = ((q.y - t*q.v) % H + H) % H, x = q.x + Math.sin(t*.35 + q.ph)*12;
+    ctx.globalAlpha = .2 + .3*(.5 + .5*Math.sin(t*1.2 + q.ph));
+    ctx.fillStyle = q.c ? C.acc : '#d8d0ff';
+    ctx.beginPath(); ctx.arc(x, y, q.s, 0, 6.283); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+}
+function vignette(){
+  const v = ctx.createRadialGradient(W/2, H/2, W*.28, W/2, H/2, W*.62);
+  v.addColorStop(0,'rgba(0,0,0,0)'); v.addColorStop(1,'rgba(0,0,0,.55)');
+  ctx.globalAlpha = 1; ctx.fillStyle = v; ctx.fillRect(0,0,W,H);
+}
+function codeLine(s, x, y, size, a, kw = /\b(public|class|static|void|new|return)\b/){
+  const parts = s.split(/("[^"]*"|\b(?:public|class|static|void|new|return|getstatic|ldc|invokevirtual)\b)/g);
+  ctx.save(); al(a); ctx.font = `500 ${size}px ${MONO}`; ctx.textBaseline = 'middle'; ctx.textAlign = 'left';
+  let xx = x;
+  for (const seg of parts){ if (!seg) continue;
+    ctx.fillStyle = seg.startsWith('"') ? C.mint : /^(public|class|static|void|new|return|getstatic|ldc|invokevirtual)$/.test(seg) ? C.acc : C.text;
+    ctx.fillText(seg, xx, y); xx += ctx.measureText(seg).width; }
+  ctx.restore();
+}
+
+function pill(s, x, y, a, o = {}){
+  const {size=30, color=C.text, stroke='rgba(255,255,255,.2)', fill='rgba(255,255,255,.05)', font=FONT, weight=700} = o;
+  if (a <= 0) return;
+  ctx.save(); ctx.font = `${weight} ${size}px ${font}`; const w = ctx.measureText(s).width + 52; ctx.restore();
+  box(x - w/2, y - size*.9, w, size*1.8, a, {fill, stroke, r:size*.9});
+  txt(s, x, y, {size, weight, color, font, alpha:a});
+}
+function lock(x, y, s, a, color = C.muted){
+  if (a <= 0) return;
+  ctx.save(); al(a); ctx.translate(x, y); ctx.scale(s, s); ctx.strokeStyle = color; ctx.fillStyle = color; ctx.lineWidth = 6;
+  ctx.beginPath(); ctx.arc(0, -14, 15, Math.PI, 0); ctx.stroke(); rr(-22, -14, 44, 36, 7); ctx.fill(); ctx.restore();
+}
+function grid(x, y, cols, rows, cell, a, color, o = {}){
+  const {seed=1, live=false, t=0} = o; const r = rnd(seed);
+  for (let i = 0; i < rows; i++) for (let j = 0; j < cols; j++){ const v = r(); ctx.save(); al(a*(live ? .35 + .5*(.5 + .5*Math.sin(t*3 + v*9)) : .25 + v*.35)); ctx.fillStyle = color; ctx.fillRect(x + j*cell + 1, y + i*cell + 1, cell - 2, cell - 2); ctx.restore(); }
+}
+function card(h, lines, x, y, w, hh, a, c = C.acc){ box(x, y, w, hh, a, {fill:'rgba(252,211,77,.05)', stroke:c === C.acc ? 'rgba(252,211,77,.5)' : c, r:20}); txt(h, x + 30, y + 44, {size:30, weight:900, color:c, align:'left', alpha:a}); lines.forEach((s, i) => txt(s, x + 30, y + 96 + i*40, {size:22, weight:600, color:'#d9d2e4', align:'left', alpha:a})); }
+
+/* ============ 场景 1 · 钩子 (0–7s) ============ */
+function s1(t){
+  rise('通用大模型什么都会一点', W/2, 140, t, .2, {size:50, weight:900});
+  rise('但要它固定输出医院的病历格式、用你们公司的客服语气……', W/2, 230, t, 1.0, {size:36, weight:700, color:C.muted});
+  const a = eo(p(t, 1.8, 2.3));
+  panel(260, 320, 640, 330, '提示词', a);
+  ['你是专业的客服……', '请严格按照以下格式……', '语气要像我们公司……', '再补充 20 条规则……'].forEach((s, i) => txt(s, 300, 410 + i*52, {size:24, weight:600, align:'left', alpha:eo(p(t, 2.2 + i*.3, 2.6 + i*.3))}));
+  txt('越写越长，效果还是不稳定', 580, 700, {size:28, weight:800, color:C.rose, alpha:eo(p(t, 3.6, 4))});
+  arrow(940, 485, 1060, 485, eo(p(t, 4.2, 4.6)), 1, C.acc, 4);
+  const k = p(t, 4.6, 5.2);
+  if (k > 0){ txt('微调', 1380, 440, {size:110, weight:900, color:C.acc, glow:40, alpha:clamp(k*2), scale:eback(k)}); }
+  rise('用你的数据，把模型再训练一下', 1380, 570, t, 5.2, {size:32, weight:800, color:C.gold});
+}
+
+/* ============ 场景 2 · 什么时候该微调 (7–19s) ============ */
+function s2(t){
+  rise('先问：真的需要微调吗？', W/2, 100, t, 7.2, {size:56, weight:900});
+  [['① 提示词', '最快、最便宜，先把它用到极致', 300, 8.0], ['② RAG', '缺知识？给它查资料', 520, 8.8], ['③ 微调', '要改变模型的「行为习惯」', 740, 9.6]].forEach(([h, d, y, ts], i) => { const e = eo(p(t, ts, ts + .5)), x = 160 + i*70;
+    box(x, y - 60, 720, 120, e, {fill:'rgba(252,211,77,' + (.05 + i*.05) + ')', stroke:C.acc, r:18});
+    txt(h, x + 30, y - 14, {size:34, weight:900, color:C.acc, align:'left', alpha:e}); txt(d, x + 30, y + 30, {size:24, weight:600, color:'#d9d2e4', align:'left', alpha:e}); });
+  txt('成本与难度 ↓', 160, 850, {size:24, weight:700, color:C.muted, align:'left', alpha:eo(p(t, 10, 10.4))});
+  card('适合微调', ['固定的输出格式、写作风格、语气', '特定的分类、抽取等任务，要求稳定', '让小模型学会大模型的能力（降成本）', '提示词太长：把规则「训练进去」'], 1080, 200, 740, 300, eo(p(t, 11, 11.5)), C.mint);
+  card('不适合微调', ['注入经常变化的知识 → 用 RAG', '数据很少、质量很差', '提示词还没认真优化过'], 1080, 540, 740, 260, eo(p(t, 12.6, 13.1)), C.rose);
+  rise('一句话：RAG 让模型「知道」，微调让模型「学会」', W/2, 940, t, 14.8, {size:38, weight:900, color:C.gold});
+}
+
+/* ============ 场景 3 · 全量微调 (19–31s) ============ */
+function s3(t){
+  rise('最直接：全量微调', W/2, 100, t, 19.2, {size:56, weight:900});
+  const a = eo(p(t, 19.6, 20.1));
+  txt('用你的数据继续训练，模型的所有参数都参与更新', W/2, 175, {size:28, weight:700, color:C.muted, alpha:a});
+  grid(160, 230, 26, 16, 26, a, C.acc, {seed:3, live:t > 20.4, t});
+  txt('70 亿个参数，全部要改', 498, 680, {size:26, weight:800, color:C.acc, alpha:a});
+  const b = eo(p(t, 21.4, 21.9));
+  txt('7B 模型全量微调，显存大致需要（混合精度 + Adam）：', 1000, 240, {size:24, weight:800, align:'left', alpha:b});
+  const bars = [['模型参数', 14, '#fcd34d'], ['梯度', 14, '#fdba74'], ['优化器状态（含主权重）', 84, '#fb7185']];
+  let acc = 0; bars.forEach(([s, v, c], i) => { const e = eo(p(t, 22 + i*.6, 22.6 + i*.6)), y = 320 + i*90;
+    txt(s, 1000, y, {size:24, weight:700, align:'left', alpha:e});
+    ctx.save(); al(e); ctx.fillStyle = c; rr(1310, y - 18, 4.5*v*e, 36, 8); ctx.fill(); ctx.restore();
+    txt(v + ' GB', 1320 + 4.5*v*e, y, {size:22, weight:800, font:MONO, color:c, align:'left', alpha:e}); acc += v; });
+  txt('合计 ≈ 112 GB，还不算训练时的激活值', 1000, 600, {size:30, weight:900, color:C.rose, align:'left', alpha:eo(p(t, 24, 24.4))});
+  txt('（按每个参数约 16 字节粗略估算）', 1000, 645, {size:22, weight:600, color:C.muted, align:'left', alpha:eo(p(t, 24.2, 24.6))});
+  card('另外两个问题', ['每个任务都要保存一整份 14 GB 的模型', '训练数据少时，容易「忘掉」原有的通用能力'], 1000, 700, 820, 200, eo(p(t, 25.6, 26.1)), C.gold);
+  rise('有没有只改一小部分参数的办法？', 498, 760, t, 27.4, {size:32, weight:900, color:C.gold});
+}
+
+/* ============ 场景 4 · LoRA 原理 (31–46s) ============ */
+function s4(t){
+  rise('LoRA：冻住原模型，旁边加两个「小矩阵」', W/2, 90, t, 31.2, {size:52, weight:900});
+  const a = eo(p(t, 31.6, 32.1)), cell = 22, n = 16, wx = 280, wy = 220;
+  grid(wx, wy, n, n, cell, a, 'rgba(255,255,255,.7)', {seed:5});
+  ctx.save(); al(a); ctx.strokeStyle = 'rgba(255,255,255,.4)'; ctx.lineWidth = 2; ctx.strokeRect(wx, wy, n*cell, n*cell); ctx.restore();
+  txt('W（原始权重）', wx + n*cell/2, wy + n*cell + 40, {size:28, weight:900, alpha:a}); txt('4096 × 4096', wx + n*cell/2, wy + n*cell + 80, {size:22, weight:700, font:MONO, color:C.muted, alpha:a});
+  lock(wx + n*cell/2, wy + n*cell/2, 1.6, eo(p(t, 32.6, 33)), 'rgba(255,255,255,.85)');
+  txt('冻结，不更新', wx + n*cell/2, wy - 30, {size:24, weight:800, color:C.muted, alpha:eo(p(t, 32.8, 33.2))});
+  txt('+', 760, wy + n*cell/2, {size:80, weight:300, color:C.acc, alpha:eo(p(t, 33.6, 34))});
+  const e = eo(p(t, 34.0, 34.6)), bx = 870, ax = 1000;
+  grid(bx, wy, 2, n, cell, e, C.acc, {seed:7, live:t > 35, t}); ctx.save(); al(e); ctx.strokeStyle = C.acc; ctx.lineWidth = 2; ctx.strokeRect(bx, wy, 2*cell, n*cell); ctx.restore();
+  txt('B', bx + cell, wy + n*cell + 40, {size:30, weight:900, color:C.acc, alpha:e}); txt('4096 × 8', bx + cell, wy + n*cell + 80, {size:20, weight:700, font:MONO, color:C.muted, alpha:e});
+  txt('×', 960, wy + n*cell/2, {size:44, weight:700, color:C.acc, alpha:e});
+  grid(ax, wy + n*cell/2 - cell, n, 2, cell, e, C.acc, {seed:9, live:t > 35, t}); ctx.save(); al(e); ctx.strokeStyle = C.acc; ctx.lineWidth = 2; ctx.strokeRect(ax, wy + n*cell/2 - cell, n*cell, 2*cell); ctx.restore();
+  txt('A', ax + n*cell/2, wy + n*cell/2 + 60, {size:30, weight:900, color:C.acc, alpha:e}); txt('8 × 4096', ax + n*cell/2, wy + n*cell/2 + 98, {size:20, weight:700, font:MONO, color:C.muted, alpha:e});
+  txt('只训练这两个', 1176, wy - 30, {size:24, weight:800, color:C.acc, alpha:eo(p(t, 35, 35.4))});
+  txt('W′ = W + B · A', W/2, 760, {size:48, weight:900, font:MONO, color:C.gold, glow:16, alpha:eo(p(t, 36.4, 36.8))});
+  [['原矩阵', '4096 × 4096 ≈ 1678 万', 'rgba(255,255,255,.8)'], ['LoRA（r = 8）', '2 × 4096 × 8 ≈ 6.6 万', C.acc]].forEach(([h, v, c], i) => {
+    const ee = eo(p(t, 38 + i*.8, 38.4 + i*.8)); txt(h, 1650, 280 + i*110, {size:28, weight:900, color:c, alpha:ee}); txt(v, 1650, 325 + i*110, {size:26, weight:700, font:FONT, color:c, alpha:ee}); });
+  txt('只有约 0.4%', 1650, 520, {size:40, weight:900, color:C.mint, glow:14, alpha:eo(p(t, 40, 40.4))});
+  rise('r 叫「秩」，常用 4～64。直觉：微调需要的改动，本身就很「简单」，用低秩矩阵就能表达', W/2, 860, t, 41.6, {size:30, weight:800});
+  rise('LoRA = Low-Rank Adaptation，低秩适配（2021 年由微软研究人员提出）', W/2, 930, t, 43.2, {size:26, weight:600, color:C.muted});
+}
+
+/* ============ 场景 5 · 好处 (46–58s) ============ */
+function s5(t){
+  rise('LoRA 带来的好处', W/2, 100, t, 46.2, {size:56, weight:900});
+  [['显存大幅下降', '冻结的参数不需要梯度和优化器状态'], ['适配器很小', '只需保存 A、B，往往只有几 MB 到几百 MB'], ['推理不变慢', '训练完可以把 B·A 合并回 W'], ['一个底座，多个插件', '客服、写作、代码……按需切换不同的适配器']].forEach(([h, d], i) => {
+    const e = eo(p(t, 46.8 + i*.6, 47.2 + i*.6)), x = 140 + (i % 2)*840, y = 200 + Math.floor(i/2)*190;
+    card(h, [d], x, y, 800, 160, e); });
+  const a = eo(p(t, 50, 50.5));
+  box(760, 620, 400, 130, a, {fill:'rgba(255,255,255,.06)', stroke:'rgba(255,255,255,.4)', r:20}); txt('底座模型', 960, 685, {size:34, weight:900, alpha:a});
+  ['客服 LoRA', '病历 LoRA', '代码 LoRA'].forEach((s, i) => { const x = 400 + i*560, on = Math.floor((t - 50.5)/1.2) % 3 === i && t > 50.5;
+    box(x - 150, 830, 300, 90, a, {fill:on ? 'rgba(252,211,77,.22)' : 'rgba(252,211,77,.05)', stroke:C.acc, lw:on ? 3 : 2, glow:on ? 16 : 0, r:18}); txt(s, x, 875, {size:26, weight:900, color:C.acc, alpha:a});
+    if (on){ ctx.save(); al(1); ctx.strokeStyle = C.acc; ctx.lineWidth = 3; ctx.beginPath(); ctx.moveTo(x, 828); ctx.lineTo(960, 752); ctx.stroke(); ctx.restore(); } });
+  txt('QLoRA：把底座量化成 4 bit 再做 LoRA，单张消费级显卡就能微调几十亿参数的模型', W/2, 990, {size:26, weight:800, color:C.gold, alpha:eo(p(t, 53.4, 53.8))});
+}
+
+/* ============ 场景 6 · 数据 (58–70s) ============ */
+function s6(t){
+  rise('真正决定效果的：数据', W/2, 100, t, 58.2, {size:56, weight:900});
+  panel(110, 180, 900, 470, 'train.jsonl（示例）', eo(p(t, 58.6, 59.1)));
+  [['{"messages": [', C.muted], ['  {"role": "system", "content": "你是某某公司的客服"},', C.text], ['  {"role": "user", "content": "快递三天没动了"},', C.text], ['  {"role": "assistant", "content":', C.text], ['     "非常抱歉让您久等！我马上帮您', C.acc], ['      联系物流，今天之内给您回复。"}', C.acc], [']}', C.muted]].forEach(([s, c], i) =>
+    txt(s, 140, 270 + i*50, {size:21, weight:600, font:MONO, color:c, align:'left', alpha:eo(p(t, 59 + i*.15, 59.4 + i*.15))}));
+  [['质量 > 数量', '几百到几千条高质量样本，常常好过几万条粗糙数据'], ['风格要统一', '回答就是你希望模型学会的样子'], ['留出评估集', '训练数据之外，单独留一部分用来评估'], ['小心「遗忘」', '训练过头，模型可能丢掉原有的通用能力']].forEach(([h, d], i) => {
+    const e = eo(p(t, 61 + i*.7, 61.4 + i*.7)), y = 240 + i*150;
+    box(1060, y - 58, 760, 122, e, {fill:'rgba(252,211,77,.05)', stroke:'rgba(252,211,77,.45)', r:18});
+    txt(h, 1090, y - 16, {size:30, weight:900, color:C.acc, align:'left', alpha:e}); txt(d, 1090, y + 30, {size:21, weight:600, color:'#d9d2e4', align:'left', alpha:e}); });
+  rise('模型会学到数据里的一切，包括数据里的错误', 560, 730, t, 65.4, {size:30, weight:900, color:C.gold});
+}
+
+/* ============ 场景 7 · 流程与工具 (70–76s) ============ */
+function s7(t){
+  rise('一次微调的完整流程', W/2, 100, t, 70.2, {size:56, weight:900});
+  ['准备数据', '选底座模型', 'LoRA 训练', '评估', '部署'].forEach((s, i) => { const x = 230 + i*365, e = eback(p(t, 70.6 + i*.35, 71.1 + i*.35));
+    if (e > 0){ ctx.save(); ctx.translate(x, 290); ctx.scale(e, e); ctx.translate(-x, -290); box(x - 145, 240, 290, 100, clamp(e), {fill:'rgba(252,211,77,.10)', stroke:C.acc, r:20}); ctx.restore(); }
+    txt(s, x, 290, {size:30, weight:900, alpha:clamp(e)}); if (i) arrow(x - 215, 290, x - 152, 290, e, clamp(e), C.acc, 3); });
+  txt('关键超参数：秩 r、缩放系数 alpha、学习率、训练轮数', W/2, 410, {size:28, weight:800, color:C.gold, alpha:eo(p(t, 72.4, 72.8))});
+  [['开源模型', 'Hugging Face PEFT、LLaMA-Factory、Unsloth'], ['闭源模型', '部分模型厂商提供微调接口，上传数据即可']].forEach(([h, d], i) => card(h, [d], 160 + i*820, 500, 780, 160, eo(p(t, 73 + i*.5, 73.4 + i*.5))));
+}
+
+/* ============ 场景 8 · 收尾 (76–80s) ============ */
+function s8(t){
+  [['先提示词', '再 RAG，最后微调'], ['冻结 W', '只训练 B · A'], ['0.4% 参数', '显存与存储大降'], ['数据为王', '质量 > 数量']].forEach(([a, b], i) => {
+    const st = 76.2 + i*.25, e = eback(p(t, st, st + .5)); if (e <= 0) return;
+    const x = 330 + i*420, y = 330;
+    ctx.save(); ctx.translate(x, y); ctx.scale(e, e); ctx.translate(-x, -y);
+    box(x - 185, y - 90, 370, 180, clamp(e), {fill:'rgba(252,211,77,.08)', stroke:'rgba(252,211,77,.5)', r:26}); ctx.restore();
+    txt(a, x, y - 22, {size:40, weight:900, color:C.acc, alpha:clamp(e)}); txt(b, x, y + 40, {size:24, weight:600, color:C.muted, alpha:clamp(e)});
+  });
+  rise('让模型「学会」你想要的样子', W/2, 600, t, 77.0, {size:64, weight:900, glow:22});
+  rise('关注拾星，一起看懂 AI', W/2, 760, t, 77.6, {size:36, weight:500, color:C.muted});
+}
+
+/* ============ 总调度 ============ */
+const SCENES = [[s1,-1,7],[s2,7,19],[s3,19,31],[s4,31,46],[s5,46,58],[s6,58,70],[s7,70,76],[s8,76,82]];
+function draw(t){
+  t = clamp(t, 0, DUR);
+  ctx.save(); ctx.globalAlpha = 1; ctx.clearRect(0,0,W,H); background(t);
+  for (const [fn,a,b] of SCENES){
+    if (t < a || t > b) continue;
+    SA = sceneA(t, a, b, b === DUR ? .8 : .5);
+    if (SA > 0){ ctx.save(); fn(t); ctx.restore(); }
+  }
+  SA = 1; vignette();
+  const fo = p(t, DUR - .8, DUR);
+  if (fo > 0){ ctx.globalAlpha = fo; ctx.fillStyle = '#000'; ctx.fillRect(0,0,W,H); }
+  ctx.restore();
+}
+
+/* ============ 播放器 / 逐帧渲染接口 ============ */
+const isRender = new URLSearchParams(location.search).has('render');
+window.DURATION = DUR;
+window.renderFrame = t => draw(t);
+const btn = document.getElementById('btn'), seek = document.getElementById('seek'), timeEl = document.getElementById('time');
+const fmt = s => `${Math.floor(s/60)}:${String(Math.floor(s%60)).padStart(2,'0')}`;
+function fit(){
+  if (isRender){ cv.style.width = W+'px'; cv.style.height = H+'px'; return; }
+  const w = Math.min(innerWidth - 32, (innerHeight - 84)*16/9);
+  cv.style.width = w + 'px'; cv.style.height = w*9/16 + 'px';
+}
+addEventListener('resize', fit); fit();
+
+let cur = 0, playing = !isRender, last = null;
+function toggle(){ if (cur >= DUR) cur = 0; playing = !playing; }
+btn.onclick = toggle; cv.onclick = toggle;
+addEventListener('keydown', e => { if (e.code === 'Space'){ e.preventDefault(); toggle(); } });
+seek.oninput = () => { cur = +seek.value; draw(cur); };
+function loop(ts){
+  if (playing && last != null){ cur += (ts - last)/1000; if (cur >= DUR){ cur = DUR; playing = false; } }
+  last = ts; draw(cur);
+  seek.value = cur; timeEl.textContent = `${fmt(cur)} / ${fmt(DUR)}`;
+  btn.textContent = playing ? '❚❚' : (cur >= DUR ? '↺' : '▶');
+  requestAnimationFrame(loop);
+}
+document.fonts.ready.then(() => {
+  window.ready = true;
+  if (isRender) draw(0); else requestAnimationFrame(loop);
+});
+</script>
+</body>
+</html>
