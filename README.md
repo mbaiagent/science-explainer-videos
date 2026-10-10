@@ -36,6 +36,7 @@
 | 分布式锁 | `distributed-lock/landscape.html` | 横屏 1920×1080 | 80s |
 | Transformer 详解 | `transformer/landscape.html` | 横屏 1920×1080 | 84s |
 | 微调与 LoRA | `fine-tuning-lora/landscape.html` | 横屏 1920×1080 | 82s |
+| HTTPS 加密全过程 | `https-tls/landscape.html` | 横屏 1920×1080 | 84s |
 
 ### 幸福的科学
 钩子 → 享乐适应（快乐曲线 + 跑步机）→ 哈佛成人发展研究（关系网络）→ 心流（挑战 × 技能坐标图）→ 今晚就能做的 3 件事 → 收尾
@@ -120,6 +121,9 @@ CPU 轮流切换 → 进程与隔离 → 线程与竞态条件 → 上下文切�
 
 ### 微调与 LoRA
 钩子（提示词越写越长）→ 提示词 / RAG / 微调怎么选 → 全量微调的显存账 → LoRA：W + B·A，只训 0.4% 参数 → 好处与 QLoRA → 数据为王 → 完整流程与工具 → 收尾
+
+### HTTPS 加密全过程
+钩子（HTTP 明文的三大风险）→ 对称 vs 非对称，混合使用 → 证书与信任链 → TLS 1.3 一个来回的握手 → ECDHE 调颜料与前向保密 → AEAD 加密防篡改 → 实践：免费证书、HSTS、会话恢复 → 收尾
 
 ## 预览
 
