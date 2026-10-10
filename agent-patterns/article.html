@@ -1,0 +1,300 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Agent 设计模式：从提示词链到自主智能体 · 拾星</title>
+<meta name="description" content="工作流和智能体的区别，五种常用工作流模式与代码骨架，自主 Agent 的循环、规划、记忆和停止条件，以及做好 Agent 的五条原则">
+<link rel="stylesheet" href="../assets/article.css">
+<style>:root{--acc:#2dd4bf}</style>
+</head>
+<body>
+<div class="wrap">
+  <nav class="top"><a href="../index.html">← 拾星 · 全部内容</a><a class="watch" href="landscape.html">▶ 看视频</a></nav>
+  <header class="hero">
+    <div class="tag">拾星 · AI 与大模型</div>
+    <h1>Agent 设计模式：从提示词链到自主智能体</h1>
+    <p>工作流和智能体的区别，五种常用工作流模式与代码骨架，自主 Agent 的循环、规划、记忆和停止条件，以及做好 Agent 的五条原则</p>
+    <div class="meta">约 10 分钟读完 · 配套视频 1:20</div>
+  </header>
+  <nav class="toc">
+<ul>
+<li><a href="#agent">先回答一个问题：真的需要 Agent 吗</a></li>
+<li><a href="#vs">工作流 vs 智能体</a></li>
+<li><a href="#1">① 提示词链</a></li>
+<li><a href="#2">② 路由</a></li>
+<li><a href="#3">③ 并行化</a></li>
+<li><a href="#4-">④ 编排者-工作者</a></li>
+<li><a href="#5-">⑤ 评估者-优化者</a></li>
+<li><a href="#agent_1">自主 Agent</a></li>
+<li><a href="#agent_3">做好 Agent 的五条原则</a></li>
+<li><a href="#_4">怎么选</a></li>
+<li><a href="#_5">总结</a></li>
+</ul>
+</nav>
+
+  <article>
+<figure><img src="img/f-6.jpg" alt="从单次调用到自主 Agent" loading="lazy"><figcaption>从单次调用到自主 Agent</figcaption></figure>
+<h2 id="agent">先回答一个问题：真的需要 Agent 吗</h2>
+<p>「Agent」（智能体）是近两年最热的词之一，但它常常被用来指代很多不同的东西。把基于大模型的系统按「自主程度」排成一条光谱，会清楚很多：</p>
+<table>
+<thead>
+<tr>
+<th>形态</th>
+<th>做法</th>
+<th>特点</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>单次调用</strong></td>
+<td>问一次，答一次；配合检索、示例</td>
+<td>最简单、最便宜、最可控</td>
+</tr>
+<tr>
+<td><strong>工作流</strong></td>
+<td>用代码把多次模型调用和工具编排成固定路径</td>
+<td>可预测、好调试</td>
+</tr>
+<tr>
+<td><strong>自主 Agent</strong></td>
+<td>模型在循环中自己决定下一步做什么、用哪个工具</td>
+<td>最灵活，也最贵、最难预测</td>
+</tr>
+</tbody>
+</table>
+<p>越往右，能处理的任务越开放，但成本、延迟和出错的可能性也越高。所以设计 AI 应用的第一原则是：<strong>从最简单的方案开始，效果不够时再升级。</strong>很多场景，一次精心设计的调用，加上检索和好的示例，就已经足够了。</p>
+<p>本文的分类主要参考了 Anthropic 在 2024 年发布的《Building effective agents》一文。</p>
+<h2 id="vs">工作流 vs 智能体</h2>
+<figure><img src="img/f-15.jpg" alt="工作流与智能体" loading="lazy"><figcaption>工作流与智能体</figcaption></figure>
+<ul>
+<li><strong>工作流</strong>（Workflow）：模型和工具的调用路径，由<strong>代码预先定义</strong>。模型负责每一步的具体内容，但「下一步做什么」是写死的。</li>
+<li><strong>智能体</strong>（Agent）：由<strong>模型自己动态决定</strong>下一步做什么、调用哪个工具、什么时候结束。</li>
+</ul>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>工作流</th>
+<th>智能体</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>控制权</td>
+<td>在代码</td>
+<td>在模型</td>
+</tr>
+<tr>
+<td>适合</td>
+<td>步骤明确、可以拆分的任务</td>
+<td>开放式、无法预知步骤的任务</td>
+</tr>
+<tr>
+<td>优点</td>
+<td>可预测、成本可控、易于调试</td>
+<td>灵活，能处理新情况</td>
+</tr>
+<tr>
+<td>风险</td>
+<td>遇到预料之外的情况就处理不了</td>
+<td>成本高、延迟大，错误可能累积</td>
+</tr>
+</tbody>
+</table>
+<p>下面先看五种常用的工作流模式，再看自主 Agent。</p>
+<h2 id="1">① 提示词链</h2>
+<figure><img src="img/f-23.5.jpg" alt="提示词链" loading="lazy"><figcaption>提示词链</figcaption></figure>
+<p><strong>做法</strong>：把一个任务拆成几个固定的步骤，每一步一次模型调用，前一步的输出作为后一步的输入。步骤之间可以插入<strong>代码检查</strong>（gate），不合格就提前停止或重试。</p>
+<p><strong>例子</strong>：写文章 → 先生成大纲 → 检查大纲是否符合要求 → 根据大纲写正文 → 翻译成英文。</p>
+<p><strong>适合</strong>：任务可以清楚地拆成固定子任务。每次调用只专注一件事，准确率更高，代价是总耗时更长。</p>
+<pre><code class="language-python">def write_article(topic):
+    outline = llm(f&quot;为《{topic}》写一份文章大纲，3～5 个小节。&quot;)
+    if not check_outline(outline):                  # 代码检查：结构、长度是否合格
+        outline = llm(f&quot;大纲不合格，请修改：\n{outline}&quot;)
+    draft = llm(f&quot;根据大纲写正文：\n{outline}&quot;)
+    return llm(f&quot;把下面的文章翻译成英文：\n{draft}&quot;)
+</code></pre>
+<h2 id="2">② 路由</h2>
+<figure><img src="img/f-29.jpg" alt="路由：先分类，再分流" loading="lazy"><figcaption>路由：先分类，再分流</figcaption></figure>
+<p><strong>做法</strong>：先用一次调用（或传统分类模型）判断输入属于哪一类，再交给专门的处理流程。</p>
+<p><strong>例子</strong>：客服系统先判断用户问题是退款、技术故障还是一般咨询，再进入不同的处理流程，每个流程有自己专门的提示词和工具。</p>
+<p><strong>适合</strong>：输入的类型差异很大，分开处理效果更好。路由还有一个实际好处：<strong>把简单问题交给便宜、快速的小模型，复杂问题再交给强模型</strong>，能显著降低成本。</p>
+<pre><code class="language-python">def handle(question):
+    category = llm(f&quot;把问题分类为 refund / tech / general，只输出类别：\n{question}&quot;).strip()
+    handler = {&quot;refund&quot;: refund_flow, &quot;tech&quot;: tech_flow}.get(category, general_flow)
+    return handler(question)
+</code></pre>
+<h2 id="3">③ 并行化</h2>
+<figure><img src="img/f-41.jpg" alt="并行化与编排者-工作者" loading="lazy"><figcaption>并行化与编排者-工作者</figcaption></figure>
+<p><strong>做法</strong>：同时发起多次调用，再用代码汇总结果。有两种形式：</p>
+<ul>
+<li><strong>分段</strong>（sectioning）：把任务拆成<strong>互相独立</strong>的子任务并行处理。例如代码审查时，分别让三个调用检查安全、性能、代码风格；</li>
+<li><strong>投票</strong>（voting）：把<strong>同一个任务</strong>执行多次，综合多个结果。例如判断一段内容是否违规，多数结果认为违规才判定违规。</li>
+</ul>
+<p><strong>适合</strong>：子任务互不依赖，可以提速；或者需要多个视角、多次尝试来提高可靠性。</p>
+<pre><code class="language-python">import asyncio
+
+async def review(code):
+    aspects = [&quot;安全漏洞&quot;, &quot;性能问题&quot;, &quot;代码风格&quot;]
+    results = await asyncio.gather(*[allm(f&quot;只从「{a}」角度审查这段代码：\n{code}&quot;) for a in aspects])
+    return &quot;\n\n&quot;.join(results)
+</code></pre>
+<h2 id="4-">④ 编排者-工作者</h2>
+<p><strong>做法</strong>：由一个「编排者」模型分析任务，<strong>动态地</strong>决定拆成哪些子任务，分派给多个「工作者」执行，最后汇总。</p>
+<p>和并行化的区别在于：并行化的子任务是事先写死的，而这里的子任务<strong>由模型根据具体情况决定</strong>。</p>
+<p><strong>例子</strong>：修改代码时，事先并不知道需要改哪几个文件；做调研时，事先不知道需要搜索哪些方向。</p>
+<pre><code class="language-python">def orchestrate(task):
+    plan = llm_json(f&quot;把任务拆成若干独立子任务，输出 JSON 列表：\n{task}&quot;)
+    results = [llm(f&quot;完成子任务：{sub}\n总任务背景：{task}&quot;) for sub in plan]
+    return llm(f&quot;综合以下结果，完成总任务「{task}」：\n&quot; + &quot;\n---\n&quot;.join(results))
+</code></pre>
+<h2 id="5-">⑤ 评估者-优化者</h2>
+<figure><img src="img/f-50.8.jpg" alt="评估者-优化者：写完再改，直到合格" loading="lazy"><figcaption>评估者-优化者：写完再改，直到合格</figcaption></figure>
+<p><strong>做法</strong>：一个调用负责生成，另一个调用负责按标准评估并给出修改意见，两者循环，直到评估通过或达到最大轮数。</p>
+<p><strong>例子</strong>：文学翻译（评估者检查信达雅）、写作润色、代码生成后的审查。</p>
+<p><strong>适合</strong>：有明确的评价标准，而且「多改几轮确实会变好」的任务。就像人写东西：先写初稿，再根据反馈修改。</p>
+<pre><code class="language-python">def refine(task, max_rounds=3):
+    draft = llm(f&quot;完成任务：{task}&quot;)
+    for _ in range(max_rounds):                       # 一定要设上限
+        review = llm_json(f&quot;按以下标准评估，输出 {{\&quot;pass\&quot;: bool, \&quot;feedback\&quot;: str}}：\n标准：……\n内容：{draft}&quot;)
+        if review[&quot;pass&quot;]:
+            break
+        draft = llm(f&quot;根据意见修改。\n意见：{review['feedback']}\n原稿：{draft}&quot;)
+    return draft
+</code></pre>
+<h2 id="agent_1">自主 Agent</h2>
+<figure><img src="img/f-64.jpg" alt="自主 Agent 的循环" loading="lazy"><figcaption>自主 Agent 的循环</figcaption></figure>
+<h3 id="_1">核心：一个循环</h3>
+<p>自主 Agent 的核心是一个循环，常被称为 <strong>ReAct</strong>（Reasoning + Acting）：</p>
+<ol>
+<li><strong>思考</strong>：根据目标和目前掌握的信息，决定下一步做什么；</li>
+<li><strong>行动</strong>：调用一个工具（搜索、读文件、执行代码、调用接口……）；</li>
+<li><strong>观察</strong>：拿到工具返回的结果，加入上下文；</li>
+<li>回到第 1 步，直到任务完成。</li>
+</ol>
+<p>关键在于，每一步的决策都基于<strong>真实环境返回的结果</strong>，所以它能根据实际情况调整方向。编程助手、深度研究、自动化操作电脑，都是这类 Agent 的典型应用。一个完整的最小实现，可以参考本系列《从零做一个 Claude Code》。</p>
+<h3 id="_2">四个关键组件</h3>
+<table>
+<thead>
+<tr>
+<th>组件</th>
+<th>作用</th>
+<th>常见做法</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>规划</strong></td>
+<td>复杂任务先想清楚步骤</td>
+<td>先让模型列出计划，执行中根据结果调整；用待办清单跟踪进度</td>
+</tr>
+<tr>
+<td><strong>记忆</strong></td>
+<td>让 Agent 记得做过什么、知道什么</td>
+<td>短期：对话上下文；长期：写入文件、数据库或向量库，按需检索</td>
+</tr>
+<tr>
+<td><strong>停止条件</strong></td>
+<td>防止无休止地运行</td>
+<td>任务完成；或达到最大步数、时间、花费上限</td>
+</tr>
+<tr>
+<td><strong>人工检查点</strong></td>
+<td>控制风险</td>
+<td>删除、付款、发送消息、上线等不可逆操作前请人确认</td>
+</tr>
+</tbody>
+</table>
+<h3 id="_3">上下文管理</h3>
+<p>Agent 运行的步数越多，上下文越长，成本越高，模型也越容易「迷失」。常见的应对方法：</p>
+<ul>
+<li>截断或摘要过长的工具输出；</li>
+<li>对话接近上限时，把前面的过程压缩成摘要；</li>
+<li>把子任务交给独立上下文的<strong>子 Agent</strong>，只把结论带回来；</li>
+<li>把中间结果写入文件，需要时再读取。</li>
+</ul>
+<h3 id="agent_2">多 Agent 协作</h3>
+<p>多个 Agent 分工协作（比如一个负责研究、一个负责写作、一个负责审核）能处理更复杂的任务，但也带来更高的成本、更多的通信开销和更难的调试。建议<strong>先把单个 Agent 做扎实</strong>，确有需要时再引入多 Agent。</p>
+<h2 id="agent_3">做好 Agent 的五条原则</h2>
+<figure><img src="img/f-72.jpg" alt="五条原则" loading="lazy"><figcaption>五条原则</figcaption></figure>
+<h3 id="1_1">1. 从最简单的方案开始</h3>
+<p>一次调用 → 工作流 → Agent。只有当简单方案确实不够用、并且用评估数据证明更复杂的方案效果更好时，才升级。</p>
+<h3 id="2_1">2. 让过程看得见</h3>
+<p>记录每一步的思考、工具调用和结果。出了问题，才能知道是哪一步走偏了。这也是用户建立信任的基础。</p>
+<h3 id="3_1">3. 认真设计工具</h3>
+<p>工具是 Agent 和世界交互的接口，工具的名字、描述、参数、返回值和报错信息，都是写给模型看的。花在打磨工具上的时间，往往比打磨提示词更值得（见本系列《Function Calling 与 MCP》）。</p>
+<h3 id="4">4. 设好护栏</h3>
+<ul>
+<li>最大步数、最大花费、超时时间；</li>
+<li>最小权限：只给完成任务所需的工具和权限；</li>
+<li>在沙箱中执行代码；</li>
+<li>关键操作需要人工确认；</li>
+<li>警惕提示词注入：Agent 读取的网页、文档中可能藏有恶意指令。</li>
+</ul>
+<h3 id="5">5. 用评估驱动迭代</h3>
+<p>准备一组有代表性的测试任务，每次修改提示词、工具或流程后都完整跑一遍，比较成功率、步数、耗时和成本，而不是凭几个例子的感觉做判断。</p>
+<h2 id="_4">怎么选</h2>
+<table>
+<thead>
+<tr>
+<th>你的任务</th>
+<th>建议</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>一问一答，信息都在提示词里或可以检索到</td>
+<td>单次调用 + RAG</td>
+</tr>
+<tr>
+<td>步骤固定，可以拆成几步</td>
+<td>提示词链</td>
+</tr>
+<tr>
+<td>输入类型多，需要不同处理方式</td>
+<td>路由</td>
+</tr>
+<tr>
+<td>子任务互相独立，或需要多个视角</td>
+<td>并行化</td>
+</tr>
+<tr>
+<td>子任务无法事先确定</td>
+<td>编排者-工作者</td>
+</tr>
+<tr>
+<td>有明确标准，需要反复打磨</td>
+<td>评估者-优化者</td>
+</tr>
+<tr>
+<td>开放式任务，需要根据环境反馈不断调整</td>
+<td>自主 Agent</td>
+</tr>
+</tbody>
+</table>
+<p>这些模式也可以<strong>组合使用</strong>：比如先路由，某个分支内部是提示词链，链中的某一步又是一个评估者-优化者循环。</p>
+<h2 id="_5">总结</h2>
+<figure><img src="img/f-79.jpg" alt="选够用的那一种" loading="lazy"><figcaption>选够用的那一种</figcaption></figure>
+<ul>
+<li><strong>工作流</strong>由代码决定路径，<strong>Agent</strong> 由模型决定下一步；</li>
+<li>五种工作流模式：<strong>提示词链、路由、并行化、编排者-工作者、评估者-优化者</strong>；</li>
+<li>自主 Agent 的核心是<strong>思考 → 行动 → 观察</strong>的循环，配合规划、记忆、停止条件和人工检查点；</li>
+<li>原则：<strong>从简单开始、过程可见、认真设计工具、设好护栏、用评估驱动迭代</strong>；</li>
+<li>选够用的那一种，而不是最复杂的那一种。</li>
+</ul>
+<div class="refs">
+<h3 id="_6">参考资料</h3>
+<ul>
+<li>Anthropic (2024). Building effective agents. anthropic.com/research</li>
+<li>Yao, S., et al. (2022). ReAct: Synergizing Reasoning and Acting in Language Models. <em>arXiv:2210.03629</em>.</li>
+<li>Madaan, A., et al. (2023). Self-Refine: Iterative Refinement with Self-Feedback. <em>NeurIPS</em>.</li>
+<li>Wang, X., et al. (2022). Self-Consistency Improves Chain of Thought Reasoning in Language Models. <em>arXiv:2203.11171</em>.</li>
+<li>Anthropic (2025). How we built our multi-agent research system.</li>
+</ul>
+</div>
+  </article>
+  <div class="foot"><a href="../index.html">← 拾星首页</a><a href="landscape.html">▶ 看配套视频</a></div>
+</div>
+</body>
+</html>
