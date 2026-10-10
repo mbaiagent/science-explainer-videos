@@ -33,6 +33,7 @@
 | Agent 设计模式 | `agent-patterns/landscape.html` | 横屏 1920×1080 | 80s |
 | 进程、线程与协程 | `process-thread-coroutine/landscape.html` | 横屏 1920×1080 | 80s |
 | 评估（Evals） | `evals/landscape.html` | 横屏 1920×1080 | 80s |
+| 分布式锁 | `distributed-lock/landscape.html` | 横屏 1920×1080 | 80s |
 
 ### 幸福的科学
 钩子 → 享乐适应（快乐曲线 + 跑步机）→ 哈佛成人发展研究（关系网络）→ 心流（挑战 × 技能坐标图）→ 今晚就能做的 3 件事 → 收尾
@@ -108,6 +109,9 @@ CPU 轮流切换 → 进程与隔离 → 线程与竞态条件 → 上下文切�
 
 ### 评估（Evals）
 凭感觉改的陷阱 → 什么是 Eval → 建测试集 → 三种打分方式 → 看细分指标 → 评估驱动的开发循环 → 线上评估与常见坑 → 收尾
+
+### 分布式锁
+单机锁失效 → 分布式锁的要求 → Redis 原子加锁 → 误删与 Lua 释放 → 看门狗续期 → 主从切换丢锁、Redlock 与 Fencing → ZooKeeper 方案与对比 → 收尾
 
 ## 预览
 

@@ -1,0 +1,323 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>分布式锁 · 拾星</title>
+<style>
+  :root{--bg:#07080f;--fg:#f4ede4;--muted:#9a93a8;--acc:#f59e0b}
+  html,body{margin:0;height:100%;background:var(--bg);color:var(--fg);
+    font-family:-apple-system,"PingFang SC","Noto Sans SC","Noto Sans CJK SC","Microsoft YaHei",sans-serif}
+  body{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;overflow:hidden}
+  #stage{display:block;background:#07080f;border-radius:12px;box-shadow:0 20px 60px rgba(0,0,0,.55);cursor:pointer}
+  #bar{display:flex;align-items:center;gap:12px;width:min(calc(100vw - 32px),640px)}
+  #btn{width:40px;height:40px;border-radius:50%;border:1px solid rgba(245,158,11,.5);background:transparent;
+    color:var(--acc);font-size:16px;cursor:pointer;flex:none}
+  #seek{flex:1;accent-color:var(--acc)}
+  #time{font-variant-numeric:tabular-nums;font-size:13px;color:var(--muted);min-width:84px;text-align:right}
+  body.render{display:block}
+  body.render #bar{display:none}
+  body.render #stage{border-radius:0;box-shadow:none}
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="bar">
+  <button id="btn" aria-label="播放/暂停">❚❚</button>
+  <input id="seek" type="range" min="0" max="80" step="0.01" value="0">
+  <span id="time">0:00 / 1:20</span>
+</div>
+<script>
+/* ============ 基础设置（横屏 1920×1080） ============ */
+const W = 1920, H = 1080, DUR = 80;
+const cv = document.getElementById('stage'), ctx = cv.getContext('2d');
+cv.width = W; cv.height = H;
+const FONT = '"PingFang SC","Noto Sans SC","Noto Sans CJK SC","Source Han Sans SC","Microsoft YaHei",sans-serif';
+const MONO = '"JetBrains Mono","SF Mono",Menlo,Consolas,"DejaVu Sans Mono","Noto Sans Mono CJK SC","PingFang SC","Microsoft YaHei",monospace';
+const C = {acc:'#f59e0b', mint:'#6ee7c8', gold:'#ffd38a', coral:'#ff9e7a', rose:'#ff8a8a', blue:'#9cc3ff', text:'#f4ede4', muted:'#9a93a8', dim:'#4a4558', panel:'#0f0e1f'};
+
+const clamp = (x,a=0,b=1) => Math.max(a, Math.min(b, x));
+const lerp = (a,b,t) => a + (b-a)*t;
+const p = (t,a,b) => clamp((t-a)/(b-a));
+const eo = x => 1 - Math.pow(1-x, 3);
+const eio = x => x < .5 ? 4*x*x*x : 1 - Math.pow(-2*x+2, 3)/2;
+const eback = x => { const c1=1.70158, c3=c1+1; return 1 + c3*Math.pow(x-1,3) + c1*Math.pow(x-1,2); };
+function rnd(seed){ let s = seed>>>0; return () => { s = (s*1664525 + 1013904223)>>>0; return s/4294967296; }; }
+
+let SA = 1;
+const al = a => { ctx.globalAlpha = clamp(SA*a); };
+const sceneA = (t,a,b,f=.5) => Math.min(p(t,a,a+f), 1 - p(t,b-f,b));
+
+function txt(s, x, y, o = {}){
+  const {size=64, weight=700, color=C.text, alpha=1, align='center', glow=0, scale=1, font=FONT} = o;
+  if (alpha <= 0) return;
+  ctx.save(); al(alpha);
+  ctx.font = `${weight} ${size}px ${font}`;
+  ctx.textAlign = align; ctx.textBaseline = 'middle'; ctx.fillStyle = color;
+  if (glow){ ctx.shadowColor = color; ctx.shadowBlur = glow; }
+  if (scale !== 1){ ctx.translate(x, y); ctx.scale(scale, scale); ctx.fillText(s, 0, 0); }
+  else ctx.fillText(s, x, y);
+  ctx.restore();
+}
+function rise(s, x, y, t, t0, o = {}, d = .7){
+  const e = eo(p(t, t0, t0+d));
+  if (e <= 0) return;
+  txt(s, x, y + (1-e)*36, {...o, alpha:(o.alpha ?? 1)*e});
+}
+function rr(x,y,w,h,r){ ctx.beginPath(); ctx.roundRect(x,y,w,h,r); }
+function box(x, y, w, h, a, o = {}){
+  const {fill='rgba(255,255,255,.05)', stroke='rgba(245,158,11,.35)', lw=2, glow=0, r=18, dash=null} = o;
+  if (a <= 0) return;
+  ctx.save(); al(a); rr(x, y, w, h, r); ctx.fillStyle = fill; ctx.fill();
+  if (dash) ctx.setLineDash(dash);
+  ctx.strokeStyle = stroke; ctx.lineWidth = lw; if (glow){ ctx.shadowColor = stroke; ctx.shadowBlur = glow; } ctx.stroke(); ctx.restore();
+}
+function arrow(x1, y1, x2, y2, e, a, color = C.acc, lw = 3){
+  if (e <= 0 || a <= 0) return;
+  const x = lerp(x1, x2, e), y = lerp(y1, y2, e), ang = Math.atan2(y2 - y1, x2 - x1);
+  ctx.save(); al(a); ctx.strokeStyle = color; ctx.fillStyle = color; ctx.lineWidth = lw; ctx.lineCap = 'round';
+  ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x, y); ctx.stroke();
+  if (e > .85){ ctx.translate(x, y); ctx.rotate(ang); ctx.beginPath(); ctx.moveTo(4, 0); ctx.lineTo(-14, -9); ctx.lineTo(-14, 9); ctx.closePath(); ctx.fill(); }
+  ctx.restore();
+}
+function panel(x, y, w, h, title, a){
+  box(x, y, w, h, a, {fill:C.panel, stroke:'rgba(255,255,255,.1)', r:20});
+  if (a <= 0) return;
+  ctx.save(); al(a); ctx.strokeStyle = 'rgba(255,255,255,.07)'; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(x, y + 52); ctx.lineTo(x + w, y + 52); ctx.stroke();
+  ['#ff6b6b','#ffd166','#6ee7a0'].forEach((c, i) => { ctx.fillStyle = c; ctx.globalAlpha = clamp(SA*a*.8); ctx.beginPath(); ctx.arc(x + 30 + i*24, y + 26, 7, 0, 6.283); ctx.fill(); });
+  ctx.restore();
+  txt(title, x + w/2, y + 27, {size:22, weight:500, color:C.muted, font:MONO, alpha:a});
+}
+
+/* ============ 背景 ============ */
+const PARTS = (() => { const r = rnd(199); return Array.from({length:100}, () => ({
+  x:r()*W, y:r()*H, s:r()*2.2+.5, v:r()*12+4, ph:r()*6.283, c:r()<.25})); })();
+function background(t){
+  const g = ctx.createLinearGradient(0,0,W,H);
+  g.addColorStop(0,'#0a0916'); g.addColorStop(.55,'#110f24'); g.addColorStop(1,'#18122c');
+  ctx.globalAlpha = 1; ctx.fillStyle = g; ctx.fillRect(0,0,W,H);
+  const gx = W*.5 + Math.sin(t*.27)*140;
+  const rg = ctx.createRadialGradient(gx, H*.45, 0, gx, H*.45, 950);
+  rg.addColorStop(0,'rgba(245,158,11,0.09)'); rg.addColorStop(1,'rgba(245,158,11,0)');
+  ctx.fillStyle = rg; ctx.fillRect(0,0,W,H);
+  ctx.fillStyle = C.acc;
+  for (let x = 40; x < W; x += 80) for (let y = 40; y < H; y += 80){ ctx.globalAlpha = .06; ctx.fillRect(x, y, 2, 2); }
+  for (const q of PARTS){
+    const y = ((q.y - t*q.v) % H + H) % H, x = q.x + Math.sin(t*.35 + q.ph)*12;
+    ctx.globalAlpha = .2 + .3*(.5 + .5*Math.sin(t*1.2 + q.ph));
+    ctx.fillStyle = q.c ? C.acc : '#d8d0ff';
+    ctx.beginPath(); ctx.arc(x, y, q.s, 0, 6.283); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+}
+function vignette(){
+  const v = ctx.createRadialGradient(W/2, H/2, W*.28, W/2, H/2, W*.62);
+  v.addColorStop(0,'rgba(0,0,0,0)'); v.addColorStop(1,'rgba(0,0,0,.55)');
+  ctx.globalAlpha = 1; ctx.fillStyle = v; ctx.fillRect(0,0,W,H);
+}
+function codeLine(s, x, y, size, a, kw = /\b(public|class|static|void|new|return)\b/){
+  const parts = s.split(/("[^"]*"|\b(?:public|class|static|void|new|return|getstatic|ldc|invokevirtual)\b)/g);
+  ctx.save(); al(a); ctx.font = `500 ${size}px ${MONO}`; ctx.textBaseline = 'middle'; ctx.textAlign = 'left';
+  let xx = x;
+  for (const seg of parts){ if (!seg) continue;
+    ctx.fillStyle = seg.startsWith('"') ? C.mint : /^(public|class|static|void|new|return|getstatic|ldc|invokevirtual)$/.test(seg) ? C.acc : C.text;
+    ctx.fillText(seg, xx, y); xx += ctx.measureText(seg).width; }
+  ctx.restore();
+}
+
+function pill(s, x, y, a, o = {}){
+  const {size=30, color=C.text, stroke='rgba(255,255,255,.2)', fill='rgba(255,255,255,.05)', font=FONT, weight=700} = o;
+  if (a <= 0) return;
+  ctx.save(); ctx.font = `${weight} ${size}px ${font}`; const w = ctx.measureText(s).width + 52; ctx.restore();
+  box(x - w/2, y - size*.9, w, size*1.8, a, {fill, stroke, r:size*.9});
+  txt(s, x, y, {size, weight, color, font, alpha:a});
+}
+function lock(x, y, s, a, color = C.acc){
+  if (a <= 0) return;
+  ctx.save(); al(a); ctx.translate(x, y); ctx.scale(s, s); ctx.strokeStyle = color; ctx.fillStyle = color; ctx.lineWidth = 6;
+  ctx.beginPath(); ctx.arc(0, -14, 15, Math.PI, 0); ctx.stroke(); rr(-22, -14, 44, 36, 7); ctx.fill();
+  ctx.fillStyle = '#1a140a'; ctx.beginPath(); ctx.arc(0, 2, 5, 0, 6.283); ctx.fill(); ctx.restore();
+}
+function srv(name, x, y, a, c = 'rgba(255,255,255,.35)', w = 260, h = 110){ box(x - w/2, y - h/2, w, h, a, {fill:'rgba(255,255,255,.04)', stroke:c, r:18}); txt(name, x, y, {size:28, weight:900, alpha:a}); }
+function tl(x0, x1, y, a, label){ ctx.save(); al(a*.6); ctx.strokeStyle = 'rgba(255,255,255,.4)'; ctx.lineWidth = 3; ctx.beginPath(); ctx.moveTo(x0, y); ctx.lineTo(x1, y); ctx.stroke(); ctx.restore(); txt(label, x0 - 20, y, {size:26, weight:900, align:'right', alpha:a}); }
+function seg(x0, x1, y, a, c, label = '', h = 44){ if (a <= 0 || x1 <= x0) return; ctx.save(); al(a); ctx.fillStyle = c; rr(x0, y - h/2, x1 - x0, h, 8); ctx.fill(); ctx.restore(); if (label) txt(label, (x0 + x1)/2, y, {size:20, weight:800, color:'#1a140a', alpha:a}); }
+
+/* ============ 场景 1 · 钩子 (0–7s) ============ */
+function s1(t){
+  rise('单机时，一把 synchronized 就能保证同一时刻只有一个线程扣库存', W/2, 140, t, .2, {size:38, weight:900});
+  const a = eo(p(t, 1.2, 1.7));
+  [0, 1, 2].forEach(i => { const x = 460 + i*500; srv('服务器 ' + (i + 1), x, 340, a); lock(x + 100, 300, .7, a, C.mint); txt('本机锁', x, 410, {size:20, weight:700, color:C.mint, alpha:a}); });
+  box(760, 560, 400, 120, a, {fill:'rgba(255,255,255,.05)', stroke:'rgba(255,255,255,.35)', r:18}); txt('库存 = 1', 960, 620, {size:32, weight:900, font:FONT, alpha:a});
+  [0, 1, 2].forEach(i => { const e = eo(p(t, 2.2 + i*.15, 2.8 + i*.15)); arrow(460 + i*500, 400, 960 + (i - 1)*100, 550, e, e, C.rose, 3); });
+  txt('三台机器各自加锁，互相看不见：同时扣减，超卖了 ✗', W/2, 750, {size:34, weight:900, color:C.rose, alpha:eo(p(t, 3.2, 3.6))});
+  const k = p(t, 4.4, 5);
+  if (k > 0) txt('分布式锁', W/2, 900, {size:110, weight:900, color:C.acc, glow:40, alpha:clamp(k*2), scale:eback(k)});
+  rise('一把所有机器都认的锁', W/2, 1010, t, 5.2, {size:32, weight:700, color:C.muted});
+}
+
+/* ============ 场景 2 · 要求 (7–18s) ============ */
+function s2(t){
+  rise('一把合格的分布式锁，要满足', W/2, 100, t, 7.2, {size:56, weight:900});
+  [['互斥', '同一时刻，只有一个客户端能持有'], ['不会死锁', '持有者崩溃了，锁也能自动释放'], ['谁加谁解', '只能释放自己加的锁，不能误删别人的'], ['高可用', '锁服务本身不能成为单点'], ['（可选）可重入、可等待', '同一线程可重复获取；拿不到时能排队等待']].forEach(([h, d], i) => {
+    const e = eo(p(t, 7.8 + i*.6, 8.2 + i*.6)), y = 230 + i*140;
+    box(160, y - 55, 1600, 115, e, {fill:'rgba(245,158,11,.06)', stroke:i === 4 ? 'rgba(255,255,255,.25)' : 'rgba(245,158,11,.5)', r:20});
+    txt(String(i + 1).padStart(2, '0'), 220, y + 2, {size:44, weight:900, font:MONO, color:C.acc, alpha:e, glow:12});
+    txt(h, 300, y + 2, {size:34, weight:900, align:'left', alpha:e}); txt(d, 1720, y + 2, {size:26, weight:600, color:'#d9d2e4', align:'right', alpha:e}); });
+}
+
+/* ============ 场景 3 · Redis 加锁 (18–32s) ============ */
+function s3(t){
+  rise('最常用：基于 Redis 实现', W/2, 100, t, 18.2, {size:56, weight:900});
+  const a = eo(p(t, 18.6, 19.1));
+  box(760, 400, 400, 170, a, {fill:'rgba(239,83,80,.08)', stroke:'#ef5350', lw:3, r:22}); txt('Redis', 960, 450, {size:40, weight:900, color:'#ef5350', alpha:a});
+  const won = t > 21.2;
+  txt(won ? 'lock:order:1 = "uuid-A"' : '（空）', 960, 515, {size:22, weight:700, font:MONO, color:won ? C.acc : C.muted, alpha:a});
+  [['客户端 A', 300, 260, true], ['客户端 B', 300, 480, false], ['客户端 C', 300, 700, false]].forEach(([n, x, y, ok], i) => {
+    srv(n, x, y, a, ok && won ? C.acc : 'rgba(255,255,255,.35)', 240, 100);
+    const e = eo(p(t, 19.6 + i*.1, 20.6 + i*.1)); arrow(x + 125, y, 750, 485, e, e*.8, C.gold, 3);
+    if (t > 21.2) txt(ok ? 'OK ✓ 拿到锁' : 'nil ✗ 没抢到', x, y + 75, {size:24, weight:900, color:ok ? C.mint : C.rose, alpha:eo(p(t, 21.2 + i*.15, 21.6 + i*.15))});
+    if (ok && won) lock(x + 150, y - 50, .7, 1); });
+  panel(1240, 230, 600, 300, '加锁命令', eo(p(t, 22.2, 22.7)));
+  [['SET lock:order:1 <唯一值>', C.text], ['    NX', C.acc], ['    PX 30000', C.gold]].forEach(([s, c], i) => txt(s, 1270, 320 + i*52, {size:26, weight:700, font:MONO, color:c, align:'left', alpha:eo(p(t, 22.6 + i*.3, 23 + i*.3))}));
+  txt('NX：键不存在时才设置 → 互斥', 1270, 470, {size:22, weight:700, color:C.acc, align:'left', alpha:eo(p(t, 23.6, 24))});
+  txt('PX：30 秒后自动过期 → 不会死锁', 1270, 505, {size:22, weight:700, color:C.gold, align:'left', alpha:eo(p(t, 24.2, 24.6))});
+  const w = eo(p(t, 25.6, 26.1));
+  box(1240, 580, 600, 220, w, {fill:'rgba(255,138,138,.05)', stroke:'rgba(255,138,138,.45)', r:18});
+  txt('✗ 不要分两步写', 1270, 620, {size:28, weight:900, color:C.rose, align:'left', alpha:w});
+  txt('SETNX lock 1', 1270, 670, {size:22, weight:600, font:MONO, align:'left', alpha:w});
+  txt('EXPIRE lock 30   ← 中间崩溃，锁永不过期', 1270, 710, {size:22, weight:600, font:MONO, color:C.gold, align:'left', alpha:w});
+  txt('一条命令，原子完成', 1270, 760, {size:24, weight:800, color:C.mint, align:'left', alpha:eo(p(t, 27, 27.4))});
+  rise('值为什么要用唯一值（如 UUID）？下一页揭晓', W/2, 930, t, 28.6, {size:34, weight:800, color:C.gold});
+}
+
+/* ============ 场景 4 · 误删 (32–45s) ============ */
+function s4(t){
+  rise('坑一：删掉了别人的锁', W/2, 100, t, 32.2, {size:56, weight:900});
+  const a = eo(p(t, 32.6, 33.1)), X = s => 400 + s*36;
+  tl(400, 1760, 260, a, '客户端 A'); tl(400, 1760, 400, a, '客户端 B');
+  txt('时间（秒）→', 1760, 510, {size:22, weight:600, color:C.muted, align:'right', alpha:a});
+  [0, 10, 20, 30].forEach(s => txt(String(s), X(s), 470, {size:20, weight:700, font:MONO, color:C.muted, alpha:a}));
+  const pr = clamp((t - 33.2)/6)*37;
+  seg(X(0), X(Math.min(pr, 3)), 260, 1, C.acc, '加锁');
+  seg(X(3), X(Math.min(pr, 34)), 260, 1, 'rgba(255,211,138,.35)', pr > 12 ? 'GC 停顿 / 网络卡住……' : '');
+  if (pr > 30){ ctx.save(); al(1); ctx.strokeStyle = C.rose; ctx.setLineDash([6, 6]); ctx.lineWidth = 3; ctx.beginPath(); ctx.moveTo(X(30), 200); ctx.lineTo(X(30), 440); ctx.stroke(); ctx.restore(); txt('30 秒，锁过期', X(30), 190, {size:22, weight:800, color:C.rose}); }
+  seg(X(31), X(Math.min(pr, 37)), 400, 1, '#7cc7ff', pr > 33 ? 'B 加锁成功' : '');
+  if (pr > 34) seg(X(34), X(Math.min(pr, 36)), 260, 1, C.rose, 'DEL');
+  txt('A 醒来，执行 DEL：把 B 的锁删了 ✗', W/2, 560, {size:32, weight:900, color:C.rose, alpha:eo(p(t, 38.6, 39))});
+  const f = eo(p(t, 39.6, 40.1));
+  panel(380, 620, 1160, 270, '释放锁：先比对，再删除（Lua 脚本，原子执行）', f);
+  [['if redis.call("GET", KEYS[1]) == ARGV[1] then', C.text], ['    return redis.call("DEL", KEYS[1])   -- 值是我的 UUID，才删', C.mint], ['end', C.text], ['return 0', C.text]].forEach(([s, c], i) =>
+    txt(s, 420, 700 + i*44, {size:23, weight:600, font:MONO, color:c, align:'left', alpha:eo(p(t, 40.2 + i*.2, 40.6 + i*.2))}));
+}
+
+/* ============ 场景 5 · 续期 (45–57s) ============ */
+function s5(t){
+  rise('坑二：业务还没做完，锁就过期了', W/2, 100, t, 45.2, {size:56, weight:900});
+  const a = eo(p(t, 45.6, 46.1)), X = s => 400 + s*24;
+  tl(400, 1760, 330, a, '业务执行'); tl(400, 1760, 470, a, '锁的有效期');
+  const pr = clamp((t - 46.4)/7)*55;
+  seg(X(0), X(Math.min(pr, 52)), 330, 1, C.acc, pr > 10 ? '执行中……（耗时不确定）' : '');
+  // 锁的有效期：每 10 秒续到 30 秒
+  let exp = 30; for (let s = 10; s <= Math.min(pr, 52); s += 10) exp = s + 30;
+  seg(X(0), X(Math.min(exp, pr > 52 ? 52 : 55)), 470, 1, 'rgba(245,158,11,.35)');
+  for (let s = 10; s <= Math.min(pr, 50); s += 10){ ctx.save(); al(1); ctx.fillStyle = C.gold; ctx.beginPath(); ctx.arc(X(s), 470, 10, 0, 6.283); ctx.fill(); ctx.restore(); txt('续期', X(s), 515, {size:20, weight:800, color:C.gold}); }
+  txt(pr > 52 ? '锁已释放' : `锁到期时间：第 ${exp} 秒`, 1760, 410, {size:22, weight:800, font:FONT, color:C.gold, align:'right', alpha:a});
+  if (pr > 52) txt('业务完成，主动释放锁 ✓', X(52), 260, {size:24, weight:900, color:C.mint, align:'right', alpha:eo(p(t, 53, 53.4))});
+  card2('看门狗（watchdog）', ['后台线程定期检查：业务还在执行，就把锁的过期时间续上', '持有者进程挂了，续期也停止，锁会按时过期'], 380, 600, 1160, 210, eo(p(t, 49, 49.5)));
+  rise('Redisson 默认：锁 30 秒，每 10 秒续一次', W/2, 900, t, 54.0, {size:32, weight:800, color:C.gold});
+}
+function card2(h, lines, x, y, w, hh, a){ box(x, y, w, hh, a, {fill:'rgba(245,158,11,.06)', stroke:'rgba(245,158,11,.5)', r:20}); txt(h, x + 30, y + 45, {size:30, weight:900, color:C.acc, align:'left', alpha:a}); lines.forEach((s, i) => txt(s, x + 30, y + 100 + i*44, {size:24, weight:600, color:'#d9d2e4', align:'left', alpha:a})); }
+
+/* ============ 场景 6 · 主从切换与 fencing (57–69s) ============ */
+function s6(t){
+  rise('坑三：Redis 主节点宕机，锁丢了', W/2, 100, t, 57.2, {size:56, weight:900});
+  const a = eo(p(t, 57.6, 58.1)), crash = t > 59.6, promo = t > 60.6;
+  box(560, 200, 300, 130, a, {fill:'rgba(255,255,255,.04)', stroke:crash ? C.rose : '#ef5350', r:18}); txt(crash ? '主节点 💥' : '主节点', 710, 250, {size:30, weight:900, color:crash ? C.rose : C.text, alpha:a}); txt('锁：A', 710, 295, {size:22, weight:700, color:C.acc, alpha:a*(crash ? .3 : 1)});
+  box(1060, 200, 300, 130, a, {fill:'rgba(255,255,255,.04)', stroke:promo ? C.acc : 'rgba(255,255,255,.3)', r:18}); txt(promo ? '从节点 → 新主' : '从节点', 1210, 250, {size:28, weight:900, alpha:a}); txt('锁：（还没同步过来）', 1210, 295, {size:20, weight:700, color:C.muted, alpha:a});
+  arrow(865, 265, 1055, 265, a, crash ? .2 : .6, C.muted, 2); txt('异步复制', 960, 235, {size:18, weight:700, color:C.muted, alpha:a});
+  if (t > 61.2){ txt('客户端 B 在新主上加锁成功 → A、B 同时持有锁 ✗', W/2, 400, {size:28, weight:900, color:C.rose, alpha:eo(p(t, 61.2, 61.6))}); }
+  card2('方案一：Redlock', ['向 5 个独立的 Redis 节点加锁，多数（≥3）成功才算拿到', '提高了可用性，但依赖时钟和时间假设，学界有争议'], 140, 470, 800, 230, eo(p(t, 62.4, 62.9)));
+  card2('方案二：Fencing Token', ['每次加锁返回一个递增编号；写数据时带上编号', '存储端拒绝比已见过的编号更小的请求'], 980, 470, 800, 230, eo(p(t, 63.6, 64.1)));
+  rise('锁只能「尽量」保证互斥；对正确性要求极高的场景，存储端也要校验（fencing）或用 CP 系统', W/2, 800, t, 65.4, {size:30, weight:900, color:C.gold});
+}
+
+/* ============ 场景 7 · ZooKeeper 与对比 (69–76s) ============ */
+function s7(t){
+  rise('另一条路：ZooKeeper / etcd', W/2, 100, t, 69.2, {size:56, weight:900});
+  const a = eo(p(t, 69.6, 70.1));
+  box(110, 180, 740, 470, a, {fill:'rgba(255,255,255,.03)', stroke:'rgba(156,195,255,.5)', r:22});
+  txt('/locks/order-1', 480, 225, {size:26, weight:800, font:MONO, color:C.blue, alpha:a});
+  [['lock-0001', 'A：序号最小，拿到锁'], ['lock-0002', 'B：监听 0001'], ['lock-0003', 'C：监听 0002']].forEach(([n, d], i) => { const e = eo(p(t, 70 + i*.3, 70.4 + i*.3)), y = 310 + i*110;
+    box(170, y - 40, 620, 80, e, {fill:i === 0 ? 'rgba(245,158,11,.15)' : 'rgba(255,255,255,.04)', stroke:i === 0 ? C.acc : 'rgba(255,255,255,.2)', r:14});
+    txt(n, 200, y, {size:24, weight:800, font:MONO, align:'left', alpha:e}); txt(d, 760, y, {size:22, weight:700, color:i === 0 ? C.acc : C.muted, align:'right', alpha:e}); if (i === 0) lock(150, y - 40, .5, e); });
+  txt('临时顺序节点：客户端断开，节点自动删除', 480, 615, {size:22, weight:700, color:C.mint, alpha:eo(p(t, 71, 71.4))});
+  const cols = ['', 'Redis', 'ZooKeeper / etcd', '数据库'], cx = [1000, 1230, 1480, 1720];
+  cols.forEach((c, i) => txt(c, cx[i], 220, {size:26, weight:900, color:i ? C.acc : C.text, alpha:eo(p(t, 71.4, 71.8))}));
+  [['性能', '高', '中', '低'], ['可靠性', '主从切换可能丢锁', '强一致（CP）', '依赖数据库'], ['实现', '简单 / Redisson', '稍复杂 / Curator', '最简单']].forEach((r, i) => { const e = eo(p(t, 71.8 + i*.4, 72.2 + i*.4)), y = 310 + i*110;
+    box(890, y - 40, 920, 80, e, {fill:'rgba(255,255,255,.03)', stroke:'rgba(245,158,11,.3)', r:12});
+    r.forEach((c, k) => txt(c, cx[k], y, {size:k ? 20 : 24, weight:k ? 700 : 900, alpha:e})); });
+  rise('大多数业务用 Redis 就够了；需要更强保证时，选 ZooKeeper / etcd', W/2, 760, t, 73.4, {size:32, weight:900, color:C.gold});
+}
+
+/* ============ 场景 8 · 收尾 (76–80s) ============ */
+function s8(t){
+  [['SET NX PX', '原子加锁 + 过期'], ['唯一值 + Lua', '只删自己的锁'], ['看门狗', '自动续期'], ['Fencing', '存储端兜底']].forEach(([a, b], i) => {
+    const st = 76.2 + i*.25, e = eback(p(t, st, st + .5)); if (e <= 0) return;
+    const x = 330 + i*420, y = 330;
+    ctx.save(); ctx.translate(x, y); ctx.scale(e, e); ctx.translate(-x, -y);
+    box(x - 185, y - 90, 370, 180, clamp(e), {fill:'rgba(245,158,11,.08)', stroke:'rgba(245,158,11,.5)', r:26}); ctx.restore();
+    txt(a, x, y - 22, {size:36, weight:900, font:i === 0 ? MONO : FONT, color:C.acc, alpha:clamp(e)}); txt(b, x, y + 40, {size:24, weight:600, color:C.muted, alpha:clamp(e)});
+  });
+  rise('这就是分布式锁', W/2, 600, t, 77.0, {size:84, weight:900, glow:22});
+  rise('关注拾星，一起搞懂后端', W/2, 760, t, 77.6, {size:36, weight:500, color:C.muted});
+}
+
+/* ============ 总调度 ============ */
+const SCENES = [[s1,-1,7],[s2,7,18],[s3,18,32],[s4,32,45],[s5,45,57],[s6,57,69],[s7,69,76],[s8,76,80]];
+function draw(t){
+  t = clamp(t, 0, DUR);
+  ctx.save(); ctx.globalAlpha = 1; ctx.clearRect(0,0,W,H); background(t);
+  for (const [fn,a,b] of SCENES){
+    if (t < a || t > b) continue;
+    SA = sceneA(t, a, b, b === DUR ? .8 : .5);
+    if (SA > 0){ ctx.save(); fn(t); ctx.restore(); }
+  }
+  SA = 1; vignette();
+  const fo = p(t, DUR - .8, DUR);
+  if (fo > 0){ ctx.globalAlpha = fo; ctx.fillStyle = '#000'; ctx.fillRect(0,0,W,H); }
+  ctx.restore();
+}
+
+/* ============ 播放器 / 逐帧渲染接口 ============ */
+const isRender = new URLSearchParams(location.search).has('render');
+window.DURATION = DUR;
+window.renderFrame = t => draw(t);
+const btn = document.getElementById('btn'), seek = document.getElementById('seek'), timeEl = document.getElementById('time');
+const fmt = s => `${Math.floor(s/60)}:${String(Math.floor(s%60)).padStart(2,'0')}`;
+function fit(){
+  if (isRender){ cv.style.width = W+'px'; cv.style.height = H+'px'; return; }
+  const w = Math.min(innerWidth - 32, (innerHeight - 84)*16/9);
+  cv.style.width = w + 'px'; cv.style.height = w*9/16 + 'px';
+}
+addEventListener('resize', fit); fit();
+
+let cur = 0, playing = !isRender, last = null;
+function toggle(){ if (cur >= DUR) cur = 0; playing = !playing; }
+btn.onclick = toggle; cv.onclick = toggle;
+addEventListener('keydown', e => { if (e.code === 'Space'){ e.preventDefault(); toggle(); } });
+seek.oninput = () => { cur = +seek.value; draw(cur); };
+function loop(ts){
+  if (playing && last != null){ cur += (ts - last)/1000; if (cur >= DUR){ cur = DUR; playing = false; } }
+  last = ts; draw(cur);
+  seek.value = cur; timeEl.textContent = `${fmt(cur)} / ${fmt(DUR)}`;
+  btn.textContent = playing ? '❚❚' : (cur >= DUR ? '↺' : '▶');
+  requestAnimationFrame(loop);
+}
+document.fonts.ready.then(() => {
+  window.ready = true;
+  if (isRender) draw(0); else requestAnimationFrame(loop);
+});
+</script>
+</body>
+</html>
