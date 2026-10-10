@@ -1,0 +1,635 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Git 原理：一个内容寻址的文件系统 · 拾星</title>
+<meta name="description" content="Git 存的是快照而不是差异，blob、tree、commit 三种对象与内容寻址，分支和 HEAD 只是指针，工作区、暂存区与仓库，merge、rebase、reset、revert 与 reflog，附一步步打开 .git 目录的实验和 Python 手动解析对象">
+<link rel="stylesheet" href="../assets/article.css">
+<style>:root{--acc:#ff9f80}</style>
+</head>
+<body>
+<div class="wrap">
+  <nav class="top"><a href="../index.html">← 拾星 · 全部内容</a><a class="watch" href="landscape.html">▶ 看视频</a></nav>
+  <header class="hero">
+    <div class="tag">拾星 · 计算机与后端</div>
+    <h1>Git 原理：一个内容寻址的文件系统</h1>
+    <p>Git 存的是快照而不是差异，blob、tree、commit 三种对象与内容寻址，分支和 HEAD 只是指针，工作区、暂存区与仓库，merge、rebase、reset、revert 与 reflog，附一步步打开 .git 目录的实验和 Python 手动解析对象</p>
+    <div class="meta">约 27 分钟读完 · 配套视频 1:24</div>
+  </header>
+  <nav class="toc">
+<ul>
+<li><a href="#commitgit">每次 commit，Git 到底存了什么？</a></li>
+<li><a href="#_1">内容寻址：用内容的哈希当名字</a></li>
+<li><a href="#blobtreecommit">三种对象：blob、tree、commit</a></li>
+<li><a href="#git">动手：打开 .git 看一看</a></li>
+<li><a href="#_3">快照，而不是差异</a></li>
+<li><a href="#head">分支和 HEAD：只是指针</a></li>
+<li><a href="#_4">三个区域：工作区、暂存区、仓库</a></li>
+<li><a href="#mergerebase-reflog">merge、rebase 与 reflog</a></li>
+<li><a href="#_6">常用命令背后的对象操作</a></li>
+<li><a href="#_7">高频面试题速答</a></li>
+<li><a href="#_8">总结</a></li>
+</ul>
+</nav>
+
+  <article>
+<figure><img src="img/f-6.jpg" alt="每次 git commit，Git 到底存了什么" loading="lazy"><figcaption>每次 git commit，Git 到底存了什么</figcaption></figure>
+<h2 id="commitgit">每次 commit，Git 到底存了什么？</h2>
+<p>很多人对 Git 的印象是：每次提交，Git 记录下「改了哪几行」。这其实不对。Git 记录的是每个版本的<strong>完整快照</strong>，而且用了一种非常巧妙的方式，让快照几乎不占额外空间。</p>
+<p>理解了 Git 的内部模型，很多原本「玄学」的操作都会变得清楚：为什么建分支几乎不花时间？为什么 rebase 之后提交的哈希全变了？<code>reset --hard</code> 之后真的找不回来了吗？</p>
+<p>Git 的作者在早期的说明里这样描述它：Git 的核心是一个<strong>内容寻址的文件系统</strong>（content-addressable filesystem），版本控制的功能是在它上面搭建起来的。本文就从 <code>.git</code> 目录开始，一层层看下去。</p>
+<h2 id="_1">内容寻址：用内容的哈希当名字</h2>
+<figure><img src="img/f-18.5.jpg" alt="内容寻址：从文件内容到对象文件" loading="lazy"><figcaption>内容寻址：从文件内容到对象文件</figcaption></figure>
+<p>新建一个仓库，<code>.git</code> 目录里有这些东西：</p>
+<pre><code class="language-text">HEAD  branches  config  description  hooks  info  objects  refs
+</code></pre>
+<p>其中最核心的是两个：</p>
+<ul>
+<li><strong><code>objects/</code></strong>：对象库，存放所有的文件内容、目录结构和提交；</li>
+<li><strong><code>refs/</code></strong>：引用，也就是分支和标签，指向某个提交。</li>
+</ul>
+<h3 id="_2">一个对象是怎么存进去的</h3>
+<p>以内容为 <code>hello</code> 的文件为例：</p>
+<ol>
+<li>取文件内容：<code>hello\n</code>（6 个字节）；</li>
+<li>在前面加上对象头「类型 + 空格 + 长度 + 空字节」：<code>blob 6\0hello\n</code>；</li>
+<li>对整段内容计算 <strong>SHA-1</strong> 哈希，得到 <code>ce013625030ba8dba906f756967f9e9ca394464a</code>；</li>
+<li>用 zlib 压缩后，存到 <code>.git/objects/ce/013625030ba8dba906f756967f9e9ca394464a</code>：哈希的前 2 位作为目录名，剩下 38 位作为文件名。</li>
+</ol>
+<p>这就是<strong>内容寻址</strong>：对象的名字由内容唯一决定。带来的好处：</p>
+<ul>
+<li><strong>自动去重</strong>：两个文件内容相同，哈希就相同，只存一份；</li>
+<li><strong>完整性校验</strong>：内容只要被改动一个字节，哈希就完全不同，数据损坏或篡改立刻能发现；</li>
+<li><strong>不需要额外的索引</strong>：知道哈希，就知道去哪个文件里找内容。</li>
+</ul>
+<blockquote>
+<p>SHA-1 已被证明可以人为构造碰撞。Git 采用了带碰撞检测的 SHA-1 实现，并且已经支持使用 <strong>SHA-256</strong> 的仓库格式（<code>git init --object-format=sha256</code>），整个生态正在逐步迁移。原理完全一样，只是哈希更长。</p>
+</blockquote>
+<h2 id="blobtreecommit">三种对象：blob、tree、commit</h2>
+<figure><img src="img/f-31.5.jpg" alt="三种对象组成的一次提交" loading="lazy"><figcaption>三种对象组成的一次提交</figcaption></figure>
+<table>
+<thead>
+<tr>
+<th>对象</th>
+<th>代表</th>
+<th>内容</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>blob</strong></td>
+<td>文件内容</td>
+<td>只有文件的字节内容，<strong>没有文件名</strong></td>
+</tr>
+<tr>
+<td><strong>tree</strong></td>
+<td>目录</td>
+<td>一条条记录：权限、类型、哈希、名字。可以指向 blob（文件）或另一个 tree（子目录）</td>
+</tr>
+<tr>
+<td><strong>commit</strong></td>
+<td>一次提交</td>
+<td>根目录的 tree、父提交（可能没有，也可能有多个）、作者、提交者、时间、提交说明</td>
+</tr>
+<tr>
+<td>tag</td>
+<td>附注标签</td>
+<td>指向某个对象，并带有标签说明、签名等（轻量标签不会创建对象）</td>
+</tr>
+</tbody>
+</table>
+<p>一次提交，就是一棵由这些对象组成的树：commit 指向根 tree，根 tree 指向文件的 blob 和子目录的 tree，以此类推。</p>
+<p>几个值得注意的点：</p>
+<ul>
+<li><strong>文件名存在 tree 里，不在 blob 里</strong>。所以重命名一个文件，不会产生新的 blob，只有 tree 变了；</li>
+<li><strong>commit 的哈希由它的全部内容决定</strong>，其中包括父提交的哈希。改动历史上任何一个提交，它之后所有提交的哈希都会跟着变。这和区块链的原理很像，也是 Git 历史难以被悄悄篡改的原因；</li>
+<li>同样的内容、同样的作者和时间、同样的父提交，在任何机器上算出的提交哈希都一样。</li>
+</ul>
+<h2 id="git">动手：打开 .git 看一看</h2>
+<p>下面的脚本从零创建一个仓库，一步步观察对象库的变化。为了让结果可以复现，固定了提交时间，并关闭了提交签名：</p>
+<pre><code class="language-bash">export GIT_AUTHOR_DATE=&quot;2026-10-10T12:00:00+08:00&quot; GIT_COMMITTER_DATE=&quot;2026-10-10T12:00:00+08:00&quot;
+G=&quot;git -c user.name=demo -c user.email=demo@example.com -c init.defaultBranch=main -c commit.gpgsign=false&quot;
+
+$G init -q demo &amp;&amp; cd demo
+echo &quot;== 1. 空仓库的 .git 目录&quot;
+ls .git
+
+echo &quot;== 2. 计算一段内容的哈希（不写入）&quot;
+echo &quot;hello&quot; | git hash-object --stdin
+
+echo &quot;== 3. 创建文件并 add 之后，对象库里多了一个 blob&quot;
+echo &quot;hello&quot; &gt; a.txt
+$G add a.txt
+find .git/objects -type f
+git cat-file -t ce013625030ba8dba906f756967f9e9ca394464a
+git cat-file -p ce013625030ba8dba906f756967f9e9ca394464a
+
+echo &quot;== 4. 再加一个内容相同的文件：不会多出新的 blob&quot;
+cp a.txt b.txt
+$G add b.txt
+find .git/objects -type f | wc -l
+git ls-files --stage
+
+echo &quot;== 5. 第一次提交&quot;
+mkdir src &amp;&amp; echo 'print(&quot;hi&quot;)' &gt; src/main.py
+$G add . &amp;&amp; $G commit -q -m &quot;first commit&quot;
+cat .git/HEAD
+cat .git/refs/heads/main
+git cat-file -p HEAD
+echo &quot;-- 根目录 tree:&quot;
+git cat-file -p 'HEAD^{tree}'
+echo &quot;-- src 子目录 tree:&quot;
+git cat-file -p HEAD:src
+
+echo &quot;== 6. 第二次提交：只改了 a.txt&quot;
+echo &quot;hello git&quot; &gt; a.txt
+$G commit -q -am &quot;update a.txt&quot;
+git cat-file -p HEAD
+echo &quot;-- 新的根 tree:&quot;
+git cat-file -p 'HEAD^{tree}'
+
+echo &quot;== 7. 分支就是一个存着提交哈希的文件&quot;
+$G branch feature
+cat .git/refs/heads/feature
+$G switch -q feature
+cat .git/HEAD
+
+echo &quot;== 8. 对象总数&quot;
+git count-objects -v | head -2
+</code></pre>
+<p>输出（Git 2.43）：</p>
+<pre><code class="language-text">== 1. 空仓库的 .git 目录
+HEAD
+branches
+config
+description
+hooks
+info
+objects
+refs
+== 2. 计算一段内容的哈希（不写入）
+ce013625030ba8dba906f756967f9e9ca394464a
+== 3. 创建文件并 add 之后，对象库里多了一个 blob
+.git/objects/ce/013625030ba8dba906f756967f9e9ca394464a
+blob
+hello
+== 4. 再加一个内容相同的文件：不会多出新的 blob
+1
+100644 ce013625030ba8dba906f756967f9e9ca394464a 0   a.txt
+100644 ce013625030ba8dba906f756967f9e9ca394464a 0   b.txt
+== 5. 第一次提交
+ref: refs/heads/main
+a57e960e1d2b26ae97a9ed09c51917a83c6140c4
+tree a5a7d839469dcdee79cdc2e5723631f633a99424
+author demo &lt;demo@example.com&gt; 1791604800 +0800
+committer demo &lt;demo@example.com&gt; 1791604800 +0800
+
+first commit
+-- 根目录 tree:
+100644 blob ce013625030ba8dba906f756967f9e9ca394464a    a.txt
+100644 blob ce013625030ba8dba906f756967f9e9ca394464a    b.txt
+040000 tree 37a4b05693857e190d1ecbe45b4451bc36078274    src
+-- src 子目录 tree:
+100644 blob b80e3222ab264bd7cafb376749bd18814fd66776    main.py
+== 6. 第二次提交：只改了 a.txt
+tree 3ed6bb60bffc88e7a2c35e89fea8503c7e011703
+parent a57e960e1d2b26ae97a9ed09c51917a83c6140c4
+author demo &lt;demo@example.com&gt; 1791604800 +0800
+committer demo &lt;demo@example.com&gt; 1791604800 +0800
+
+update a.txt
+-- 新的根 tree:
+100644 blob 8d0e41234f24b6da002d962a26c2495ea16a425f    a.txt
+100644 blob ce013625030ba8dba906f756967f9e9ca394464a    b.txt
+040000 tree 37a4b05693857e190d1ecbe45b4451bc36078274    src
+== 7. 分支就是一个存着提交哈希的文件
+9443839ee2a02d7637f5b43ce39b8042bd7e163e
+ref: refs/heads/feature
+== 8. 对象总数
+count: 8
+size: 32
+</code></pre>
+<p>逐条解读：</p>
+<ul>
+<li><strong>第 2、3 步</strong>：<code>hash-object</code> 算出的哈希就是对象文件的路径。<code>git add</code> 时就已经把内容写成了 blob，并不是等到 commit 才写；</li>
+<li><strong>第 4 步</strong>：<code>a.txt</code> 和 <code>b.txt</code> 内容相同，指向同一个 blob，对象库里仍然只有 1 个文件；</li>
+<li><strong>第 5 步</strong>：第一次提交没有 <code>parent</code> 行。根 tree 里两个文件指向同一个 blob，<code>src</code> 是一个子 tree；</li>
+<li><strong>第 6 步</strong>：第二次提交有了 <code>parent</code>。新的根 tree 里，<code>a.txt</code> 指向新 blob <code>8d0e412</code>，而 <code>b.txt</code> 和 <code>src</code> 的哈希与上一次<strong>完全相同</strong>，直接复用；</li>
+<li><strong>第 7 步</strong>：新建分支只是写了一个文件，内容是 41 个字节（40 位哈希加换行）；切换分支只是改了 <code>HEAD</code> 文件；</li>
+<li><strong>第 8 步</strong>：两次提交一共 8 个对象：3 个 blob（hello、main.py、hello git）、3 个 tree（两个根目录和 src）、2 个 commit。</li>
+</ul>
+<h3 id="python-git">用 Python 验证：Git 对象没有魔法</h3>
+<pre><code class="language-python">import hashlib, zlib, pathlib
+
+repo = pathlib.Path(&quot;demo/.git&quot;)
+
+# 1. 自己算 blob 的哈希：sha1(&quot;blob &lt;字节数&gt;\0&quot; + 内容)
+content = b&quot;hello\n&quot;
+store = b&quot;blob %d\0&quot; % len(content) + content
+print(&quot;自己算的哈希:&quot;, hashlib.sha1(store).hexdigest())
+
+# 2. 读出 git 存的对象文件：前 2 位是目录名，后 38 位是文件名，内容用 zlib 压缩
+oid = &quot;ce013625030ba8dba906f756967f9e9ca394464a&quot;
+raw = zlib.decompress((repo / &quot;objects&quot; / oid[:2] / oid[2:]).read_bytes())
+print(&quot;解压后的原始字节:&quot;, raw)
+print(&quot;和自己拼的一致:&quot;, raw == store)
+
+# 3. 读当前分支指向的提交对象
+ref = (repo / &quot;HEAD&quot;).read_text().split()[1]          # ref: refs/heads/feature
+commit = (repo / ref).read_text().strip()
+raw = zlib.decompress((repo / &quot;objects&quot; / commit[:2] / commit[2:]).read_bytes())
+header, body = raw.split(b&quot;\0&quot;, 1)
+print(&quot;\n当前分支:&quot;, ref, &quot;-&gt;&quot;, commit)
+print(&quot;对象头:&quot;, header)
+print(body.decode())
+print(&quot;重新计算哈希:&quot;, hashlib.sha1(raw).hexdigest())
+
+# 4. tree 对象是二进制格式：&lt;模式&gt; &lt;文件名&gt;\0&lt;20 字节哈希&gt;，一条接一条
+tree = body.split()[1].decode()
+raw = zlib.decompress((repo / &quot;objects&quot; / tree[:2] / tree[2:]).read_bytes())
+data = raw.split(b&quot;\0&quot;, 1)[1]
+print(&quot;根 tree&quot;, tree[:7], &quot;的条目:&quot;)
+while data:
+    meta, data = data.split(b&quot;\0&quot;, 1)
+    sha, data = data[:20].hex(), data[20:]
+    mode, name = meta.decode().split(&quot; &quot;, 1)
+    print(f&quot;  {mode:&gt;6} {sha}  {name}&quot;)
+</code></pre>
+<p>输出：</p>
+<pre><code class="language-text">自己算的哈希: ce013625030ba8dba906f756967f9e9ca394464a
+解压后的原始字节: b'blob 6\x00hello\n'
+和自己拼的一致: True
+
+当前分支: refs/heads/feature -&gt; 9443839ee2a02d7637f5b43ce39b8042bd7e163e
+对象头: b'commit 207'
+tree 3ed6bb60bffc88e7a2c35e89fea8503c7e011703
+parent a57e960e1d2b26ae97a9ed09c51917a83c6140c4
+author demo &lt;demo@example.com&gt; 1791604800 +0800
+committer demo &lt;demo@example.com&gt; 1791604800 +0800
+
+update a.txt
+
+重新计算哈希: 9443839ee2a02d7637f5b43ce39b8042bd7e163e
+根 tree 3ed6bb6 的条目:
+  100644 8d0e41234f24b6da002d962a26c2495ea16a425f  a.txt
+  100644 ce013625030ba8dba906f756967f9e9ca394464a  b.txt
+   40000 37a4b05693857e190d1ecbe45b4451bc36078274  src
+</code></pre>
+<p>只用标准库的 <code>hashlib</code> 和 <code>zlib</code>，就能算出和 Git 完全一致的哈希，并读出提交和目录的内容。注意 tree 对象中目录的模式在二进制里写作 <code>40000</code>，<code>git cat-file -p</code> 显示时补成了 <code>040000</code>。</p>
+<h2 id="_3">快照，而不是差异</h2>
+<figure><img src="img/f-43.5.jpg" alt="第二次提交复用了没变的对象" loading="lazy"><figcaption>第二次提交复用了没变的对象</figcaption></figure>
+<p>从上面的实验可以看出：每个提交都指向一棵<strong>完整的目录树</strong>，是项目在那一刻的完整快照。但没有改动的文件和目录，新的 tree 直接指向已有的对象，所以每次提交真正新增的，只有「改动的文件 + 从它到根目录路径上的那些 tree + commit 本身」。</p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>存差异（如早期的 SVN、CVS 的思路）</th>
+<th>存快照（Git）</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>查看某个历史版本</td>
+<td>从基准版本开始依次应用差异</td>
+<td>直接读那个提交的 tree</td>
+</tr>
+<tr>
+<td>比较两个版本</td>
+<td>需要计算</td>
+<td>对比两棵树，哈希相同的子树直接跳过，非常快</td>
+</tr>
+<tr>
+<td>切换分支</td>
+<td>较慢</td>
+<td>按两棵树的差别更新工作区</td>
+</tr>
+</tbody>
+</table>
+<p>那么，一个大文件改了一行，难道要再存一份完整的 blob？在松散对象（loose object）阶段确实如此。但 Git 会在合适的时候（比如 <code>git gc</code>、推送和拉取时）把对象打包成 <strong>packfile</strong>：把相似的对象放在一起，只存一个完整版本和其他版本的<strong>增量</strong>（delta），再整体压缩。所以，<strong>差异压缩是存储层的优化，而不是 Git 的数据模型</strong>。</p>
+<h2 id="head">分支和 HEAD：只是指针</h2>
+<figure><img src="img/f-55.5.jpg" alt="分支是指向提交的指针" loading="lazy"><figcaption>分支是指向提交的指针</figcaption></figure>
+<ul>
+<li><strong>分支</strong>：<code>.git/refs/heads/&lt;分支名&gt;</code> 文件，内容是一个提交的哈希。提交时，当前分支自动指向新提交；</li>
+<li><strong>HEAD</strong>：<code>.git/HEAD</code> 文件，通常的内容是 <code>ref: refs/heads/main</code>，表示「当前在 main 分支上」；</li>
+<li><strong>分离 HEAD</strong>（detached HEAD）：<code>git switch --detach &lt;提交&gt;</code> 或 <code>git checkout &lt;提交哈希&gt;</code> 后，HEAD 直接存一个提交哈希，不在任何分支上。此时新建的提交没有分支指向它，切走之后容易「丢失」，需要的话要及时建一个分支；</li>
+<li><strong>标签</strong>：<code>.git/refs/tags/&lt;标签名&gt;</code>，也指向一个提交（或附注标签对象），但不会随着新提交移动；</li>
+<li><strong>远程跟踪分支</strong>：<code>refs/remotes/origin/main</code>，记录上次和远程同步时远程分支的位置，<code>git fetch</code> 会更新它。</li>
+</ul>
+<blockquote>
+<p>引用多了以后，Git 可能会把它们合并存到 <code>.git/packed-refs</code> 文件中，所以有时在 <code>refs/heads/</code> 下找不到某个分支文件，这是正常的。</p>
+</blockquote>
+<p>这就是 Git 分支「便宜」的原因：创建分支是写一个小文件，切换分支是改 HEAD 再更新工作区。相比之下，一些集中式版本控制系统的分支要复制整个目录。</p>
+<h2 id="_4">三个区域：工作区、暂存区、仓库</h2>
+<figure><img src="img/f-66.5.jpg" alt="工作区、暂存区与仓库" loading="lazy"><figcaption>工作区、暂存区与仓库</figcaption></figure>
+<table>
+<thead>
+<tr>
+<th>区域</th>
+<th>位置</th>
+<th>内容</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>工作区</strong></td>
+<td>项目目录</td>
+<td>你看到和编辑的文件</td>
+</tr>
+<tr>
+<td><strong>暂存区</strong>（index）</td>
+<td><code>.git/index</code> 文件</td>
+<td>下一次提交的「草稿」：每个路径对应哪个 blob</td>
+</tr>
+<tr>
+<td><strong>仓库</strong></td>
+<td><code>.git/objects</code> 和 <code>.git/refs</code></td>
+<td>所有对象和提交历史</td>
+</tr>
+</tbody>
+</table>
+<ul>
+<li><strong><code>git add</code></strong>：把文件内容写成 blob，并在 index 中记录「路径 → blob 哈希」；</li>
+<li><strong><code>git commit</code></strong>：按 index 生成 tree 对象，写 commit 对象，把当前分支移到新提交；</li>
+<li><strong><code>git status</code></strong>：比较三者：工作区 vs index 是「未暂存的修改」，index vs HEAD 是「已暂存、待提交的修改」。</li>
+</ul>
+<h3 id="_5">撤销操作分别动了哪里</h3>
+<table>
+<thead>
+<tr>
+<th>命令</th>
+<th>移动当前分支</th>
+<th>暂存区</th>
+<th>工作区</th>
+<th>改写历史</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>git restore &lt;文件&gt;</code></td>
+<td>否</td>
+<td>不变</td>
+<td>用暂存区覆盖</td>
+<td>否</td>
+</tr>
+<tr>
+<td><code>git restore --staged &lt;文件&gt;</code></td>
+<td>否</td>
+<td>用 HEAD 覆盖</td>
+<td>不变</td>
+<td>否</td>
+</tr>
+<tr>
+<td><code>git reset --soft &lt;提交&gt;</code></td>
+<td>是</td>
+<td>不变</td>
+<td>不变</td>
+<td>是</td>
+</tr>
+<tr>
+<td><code>git reset --mixed &lt;提交&gt;</code>（默认）</td>
+<td>是</td>
+<td>重置</td>
+<td>不变</td>
+<td>是</td>
+</tr>
+<tr>
+<td><code>git reset --hard &lt;提交&gt;</code></td>
+<td>是</td>
+<td>重置</td>
+<td><strong>重置，未提交的修改会丢失</strong></td>
+<td>是</td>
+</tr>
+<tr>
+<td><code>git revert &lt;提交&gt;</code></td>
+<td>新增一个反向提交</td>
+<td>—</td>
+<td>—</td>
+<td>否</td>
+</tr>
+</tbody>
+</table>
+<p>经验：<strong>在自己的本地分支上，可以随意 reset；对已经推送、别人也在用的分支，用 revert</strong>。</p>
+<blockquote>
+<p><code>git checkout</code> 历史上身兼数职（切换分支、恢复文件），容易误用。Git 2.23 起引入了 <code>git switch</code>（切换分支）和 <code>git restore</code>（恢复文件），把这两件事分开。</p>
+</blockquote>
+<h2 id="mergerebase-reflog">merge、rebase 与 reflog</h2>
+<figure><img src="img/f-77.5.jpg" alt="merge 与 rebase 的区别，以及 reflog" loading="lazy"><figcaption>merge 与 rebase 的区别，以及 reflog</figcaption></figure>
+<h3 id="merge-rebase">实验：同一段历史，分别 merge 和 rebase</h3>
+<pre><code class="language-bash">export GIT_AUTHOR_DATE=&quot;2026-10-10T12:00:00+08:00&quot; GIT_COMMITTER_DATE=&quot;2026-10-10T12:00:00+08:00&quot;
+G=&quot;git -c user.name=demo -c user.email=demo@example.com -c init.defaultBranch=main -c commit.gpgsign=false&quot;
+rm -rf br &amp;&amp; $G init -q br &amp;&amp; cd br
+c() { echo &quot;$1&quot; &gt; &quot;$1.txt&quot;; $G add &quot;$1.txt&quot;; $G commit -q -m &quot;$1&quot;; }
+
+c A; c B
+$G switch -q -c feature; c F1; c F2
+$G switch -q main; c C
+echo &quot;== 分叉后的历史&quot;
+git log --oneline --graph --all
+
+echo &quot;== merge：产生一个有两个父提交的合并提交&quot;
+$G merge -q --no-edit feature
+git log --oneline --graph
+git cat-file -p HEAD | grep -E &quot;^(tree|parent)&quot;
+
+echo &quot;== 撤销合并，改用 rebase&quot;
+$G reset -q --hard HEAD~1
+F2_OLD=$(git rev-parse feature)
+$G switch -q feature
+$G rebase -q main
+git log --oneline --graph
+echo &quot;F2 rebase 前: ${F2_OLD:0:7}  rebase 后: $(git rev-parse --short HEAD)&quot;
+echo &quot;旧的 F2 提交还在吗: $(git cat-file -t $F2_OLD)&quot;
+
+echo &quot;== 误操作：reset 丢掉了两个提交&quot;
+$G reset -q --hard HEAD~2
+git log --oneline
+echo &quot;-- reflog 记得 HEAD 去过哪里:&quot;
+git reflog -5
+$G reset -q --hard HEAD@{1}
+echo &quot;-- 找回之后:&quot;
+git log --oneline
+</code></pre>
+<p>输出：</p>
+<pre><code class="language-text">== 分叉后的历史
+* 62618b5 F2
+* a5253f1 F1
+| * 778d4a7 C
+|/  
+* 0b41d81 B
+* b05116e A
+== merge：产生一个有两个父提交的合并提交
+*   9213000 Merge branch 'feature'
+|\  
+| * 62618b5 F2
+| * a5253f1 F1
+* | 778d4a7 C
+|/  
+* 0b41d81 B
+* b05116e A
+tree 93b4e665af7efd60ca7d235ba1abe1badd172af5
+parent 778d4a7b8527756c66dfc032423b2937ff37adc2
+parent 62618b5059764c1888da48795c7b70715ddf8c59
+== 撤销合并，改用 rebase
+* 11b8024 F2
+* 1aa95c3 F1
+* 778d4a7 C
+* 0b41d81 B
+* b05116e A
+F2 rebase 前: 62618b5  rebase 后: 11b8024
+旧的 F2 提交还在吗: commit
+== 误操作：reset 丢掉了两个提交
+778d4a7 C
+0b41d81 B
+b05116e A
+-- reflog 记得 HEAD 去过哪里:
+778d4a7 HEAD@{0}: reset: moving to HEAD~2
+11b8024 HEAD@{1}: rebase (finish): returning to refs/heads/feature
+11b8024 HEAD@{2}: rebase (pick): F2
+1aa95c3 HEAD@{3}: rebase (pick): F1
+778d4a7 HEAD@{4}: rebase (start): checkout main
+-- 找回之后:
+11b8024 F2
+1aa95c3 F1
+778d4a7 C
+0b41d81 B
+b05116e A
+</code></pre>
+<h3 id="merge">merge</h3>
+<p><code>git merge feature</code> 做的是<strong>三方合并</strong>：找到两个分支的<strong>共同祖先</strong>（这里是 B），分别比较「B → C」和「B → F2」的改动，把两边的改动合到一起。如果两边改了同一个文件的同一处，就产生冲突，需要手动解决。</p>
+<p>合并的结果是一个<strong>合并提交</strong>，它有<strong>两个 parent</strong>（实验中可以看到两行 <code>parent</code>）。如果当前分支是目标分支的祖先（没有分叉），Git 默认直接把分支指针往前移，这叫<strong>快进合并</strong>（fast-forward），不产生合并提交。</p>
+<h3 id="rebase">rebase</h3>
+<p><code>git rebase main</code> 做的是：找出 feature 上有、main 上没有的提交（F1、F2），把它们的改动<strong>依次在 main 的最新提交后面重新应用一遍</strong>，生成新的提交 F1'、F2'，再把 feature 分支指向 F2'。</p>
+<p>实验中，F2 的哈希从 <code>62618b5</code> 变成了 <code>11b8024</code>：提交说明和改动都一样，但 <strong>parent 变了</strong>，所以哈希一定会变。rebase 并没有「移动」提交，而是<strong>创建了新的提交</strong>，旧提交仍然留在对象库中（实验中 <code>cat-file -t</code> 依然能查到它）。</p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>merge</th>
+<th>rebase</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>历史</td>
+<td>保留真实的分叉与合并</td>
+<td>一条直线</td>
+</tr>
+<tr>
+<td>已有提交</td>
+<td>不变</td>
+<td>生成新提交，原提交被替换</td>
+</tr>
+<tr>
+<td>冲突</td>
+<td>一次性解决</td>
+<td>可能每重放一个提交就要解决一次</td>
+</tr>
+<tr>
+<td>适合</td>
+<td>合并公共分支、保留完整记录</td>
+<td>整理自己本地、尚未分享的提交</td>
+</tr>
+</tbody>
+</table>
+<p><strong>黄金法则：不要对已经推送、别人在其上工作的分支执行 rebase</strong>。否则别人手里的旧提交和你的新提交是两套历史，再合并时会出现重复提交和大量冲突。如果确实需要强制推送自己的分支，使用 <code>git push --force-with-lease</code>，它会在远程分支被别人更新过时拒绝推送，比 <code>--force</code> 安全。</p>
+<p><code>git rebase -i</code>（交互式变基）还能合并、拆分、修改、重排提交，常用于提交 PR 之前整理历史。<code>git cherry-pick</code> 则是把指定的某个提交「重放」到当前分支，原理和 rebase 相同。</p>
+<h3 id="reflog">reflog：后悔药</h3>
+<p><strong>reflog</strong> 记录了 HEAD 和每个分支在本地<strong>指向过的每一个提交</strong>。只要提交曾经被 HEAD 指向过，即使后来被 reset、rebase 丢掉了，也能从 reflog 里找到它的哈希，再用 <code>git reset --hard &lt;哈希&gt;</code> 或 <code>git branch &lt;新分支&gt; &lt;哈希&gt;</code> 恢复。</p>
+<p>几个限制：</p>
+<ul>
+<li>reflog 只在<strong>本地</strong>，不会推送到远程；</li>
+<li>记录会过期，默认保留 90 天（不可达的提交为 30 天），之后在 <code>git gc</code> 时被清理；</li>
+<li><strong>从未提交过的修改</strong>（只存在于工作区）被 <code>reset --hard</code> 清掉后，Git 帮不了你。如果已经 <code>git add</code> 过，blob 还在对象库里，可以用 <code>git fsck --lost-found</code> 碰碰运气。</li>
+</ul>
+<p>所以在 Git 里，<strong>一旦提交，就很难真正丢失</strong>。</p>
+<h2 id="_6">常用命令背后的对象操作</h2>
+<table>
+<thead>
+<tr>
+<th>命令</th>
+<th>背后发生了什么</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>git add</code></td>
+<td>写 blob，更新 index</td>
+</tr>
+<tr>
+<td><code>git commit</code></td>
+<td>写 tree 和 commit，移动当前分支</td>
+</tr>
+<tr>
+<td><code>git branch x</code></td>
+<td>新建 <code>refs/heads/x</code>，写入当前提交的哈希</td>
+</tr>
+<tr>
+<td><code>git switch x</code></td>
+<td>改 HEAD，按目标提交的 tree 更新 index 和工作区</td>
+</tr>
+<tr>
+<td><code>git merge</code></td>
+<td>三方合并，写合并提交（或快进）</td>
+</tr>
+<tr>
+<td><code>git rebase</code></td>
+<td>逐个重放提交，生成新提交，移动分支</td>
+</tr>
+<tr>
+<td><code>git fetch</code></td>
+<td>下载对方有、自己没有的对象，更新远程跟踪分支</td>
+</tr>
+<tr>
+<td><code>git pull</code></td>
+<td><code>fetch</code> + <code>merge</code>（或配置为 <code>rebase</code>）</td>
+</tr>
+<tr>
+<td><code>git push</code></td>
+<td>上传对象，请求远程更新分支指针</td>
+</tr>
+<tr>
+<td><code>git gc</code></td>
+<td>打包对象、清理过期的不可达对象</td>
+</tr>
+</tbody>
+</table>
+<p><code>fetch</code> 和 <code>push</code> 时，双方先交换「我有哪些提交」，再只传输对方缺少的对象，打包成 packfile 发送。这也是内容寻址的好处：用哈希就能判断对方有没有某个对象。</p>
+<h2 id="_7">高频面试题速答</h2>
+<p><strong>Q：Git 存储的是差异还是快照？</strong>
+快照。每个提交指向一棵完整的目录树，未改动的文件和目录复用已有对象。打包时的增量压缩只是存储优化。</p>
+<p><strong>Q：Git 有哪几种对象？</strong>
+blob（文件内容）、tree（目录）、commit（提交）、tag（附注标签）。对象用内容的 SHA-1（或 SHA-256）哈希命名。</p>
+<p><strong>Q：分支是什么？为什么创建分支很快？</strong>
+分支是 <code>refs/heads/</code> 下的一个文件，内容是一个提交的哈希。创建分支只是写一个几十字节的文件。</p>
+<p><strong>Q：merge 和 rebase 有什么区别？</strong>
+merge 通过三方合并生成一个有两个父提交的合并提交，保留分叉历史；rebase 把提交重放到目标分支之后，生成新提交，历史变成直线，但会改写历史。不要 rebase 已经推送的公共分支。</p>
+<p><strong>Q：reset 和 revert 有什么区别？</strong>
+reset 移动分支指针，可以丢弃后面的提交，会改写历史；revert 新增一个撤销指定提交改动的提交，不改写历史，适合已推送的分支。</p>
+<p><strong>Q：误用 reset --hard 之后还能恢复吗？</strong>
+已经提交过的内容可以通过 <code>git reflog</code> 找到提交哈希后恢复；从未提交、也从未 add 过的修改无法恢复。</p>
+<h2 id="_8">总结</h2>
+<figure><img src="img/f-83.jpg" alt="四个关键点" loading="lazy"><figcaption>四个关键点</figcaption></figure>
+<ul>
+<li>Git 的核心是<strong>内容寻址的文件系统</strong>：对象以内容的哈希命名，自动去重、自带校验；</li>
+<li><strong>blob</strong> 存文件内容，<strong>tree</strong> 存目录，<strong>commit</strong> 存快照的根 tree、父提交和元信息；</li>
+<li>每次提交都是<strong>完整快照</strong>，没变的部分直接复用对象，packfile 再做增量压缩；</li>
+<li><strong>分支和 HEAD 都只是指针</strong>，所以分支又快又便宜；</li>
+<li><strong>工作区 → 暂存区 → 仓库</strong>：add 写 blob、更新 index，commit 写 tree 和 commit；</li>
+<li><strong>merge</strong> 保留历史，<strong>rebase</strong> 改写历史；提交过的内容几乎不会丢，<strong>reflog</strong> 是后悔药。</li>
+</ul>
+<div class="refs">
+<h3 id="_9">参考资料</h3>
+<ul>
+<li>Pro Git（第 2 版），第 10 章 Git Internals：Git Objects、Git References、Packfiles. git-scm.com/book</li>
+<li>Git 官方文档：git-hash-object、git-cat-file、git-rebase、git-reflog、git-reset、gitglossary.</li>
+<li>Git 官方文档：hash-function-transition（SHA-1 向 SHA-256 迁移的设计）.</li>
+<li>Git 源码仓库中的 README（早期版本对「内容寻址文件系统」的描述）.</li>
+<li>Git 2.23 Release Notes（引入 git switch 与 git restore）.</li>
+</ul>
+</div>
+  </article>
+  <div class="foot"><a href="../index.html">← 拾星首页</a><a href="landscape.html">▶ 看配套视频</a></div>
+</div>
+</body>
+</html>

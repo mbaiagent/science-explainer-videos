@@ -1,0 +1,369 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Git 原理 · 拾星</title>
+<style>
+  :root{--bg:#07080f;--fg:#f4ede4;--muted:#9a93a8;--acc:#ff9f80}
+  html,body{margin:0;height:100%;background:var(--bg);color:var(--fg);
+    font-family:-apple-system,"PingFang SC","Noto Sans SC","Noto Sans CJK SC","Microsoft YaHei",sans-serif}
+  body{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;overflow:hidden}
+  #stage{display:block;background:#07080f;border-radius:12px;box-shadow:0 20px 60px rgba(0,0,0,.55);cursor:pointer}
+  #bar{display:flex;align-items:center;gap:12px;width:min(calc(100vw - 32px),640px)}
+  #btn{width:40px;height:40px;border-radius:50%;border:1px solid rgba(255,159,128,.5);background:transparent;
+    color:var(--acc);font-size:16px;cursor:pointer;flex:none}
+  #seek{flex:1;accent-color:var(--acc)}
+  #time{font-variant-numeric:tabular-nums;font-size:13px;color:var(--muted);min-width:84px;text-align:right}
+  body.render{display:block}
+  body.render #bar{display:none}
+  body.render #stage{border-radius:0;box-shadow:none}
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="bar">
+  <button id="btn" aria-label="播放/暂停">❚❚</button>
+  <input id="seek" type="range" min="0" max="84" step="0.01" value="0">
+  <span id="time">0:00 / 1:24</span>
+</div>
+<script>
+/* ============ 基础设置（横屏 1920×1080） ============ */
+const W = 1920, H = 1080, DUR = 84;
+const cv = document.getElementById('stage'), ctx = cv.getContext('2d');
+cv.width = W; cv.height = H;
+const FONT = '"PingFang SC","Noto Sans SC","Noto Sans CJK SC","Source Han Sans SC","Microsoft YaHei",sans-serif';
+const MONO = '"JetBrains Mono","SF Mono",Menlo,Consolas,"DejaVu Sans Mono","Noto Sans Mono CJK SC","PingFang SC","Microsoft YaHei",monospace';
+const C = {acc:'#ff9f80', mint:'#6ee7c8', gold:'#ffd38a', coral:'#ff9e7a', rose:'#ff8a8a', blue:'#9cc3ff', text:'#f4ede4', muted:'#9a93a8', dim:'#4a4558', panel:'#0f0e1f'};
+
+const clamp = (x,a=0,b=1) => Math.max(a, Math.min(b, x));
+const lerp = (a,b,t) => a + (b-a)*t;
+const p = (t,a,b) => clamp((t-a)/(b-a));
+const eo = x => 1 - Math.pow(1-x, 3);
+const eio = x => x < .5 ? 4*x*x*x : 1 - Math.pow(-2*x+2, 3)/2;
+const eback = x => { const c1=1.70158, c3=c1+1; return 1 + c3*Math.pow(x-1,3) + c1*Math.pow(x-1,2); };
+function rnd(seed){ let s = seed>>>0; return () => { s = (s*1664525 + 1013904223)>>>0; return s/4294967296; }; }
+
+let SA = 1;
+const al = a => { ctx.globalAlpha = clamp(SA*a); };
+const sceneA = (t,a,b,f=.5) => Math.min(p(t,a,a+f), 1 - p(t,b-f,b));
+
+function txt(s, x, y, o = {}){
+  const {size=64, weight=700, color=C.text, alpha=1, align='center', glow=0, scale=1, font=FONT} = o;
+  if (alpha <= 0) return;
+  ctx.save(); al(alpha);
+  ctx.font = `${weight} ${size}px ${font}`;
+  ctx.textAlign = align; ctx.textBaseline = 'middle'; ctx.fillStyle = color;
+  if (glow){ ctx.shadowColor = color; ctx.shadowBlur = glow; }
+  if (scale !== 1){ ctx.translate(x, y); ctx.scale(scale, scale); ctx.fillText(s, 0, 0); }
+  else ctx.fillText(s, x, y);
+  ctx.restore();
+}
+function rise(s, x, y, t, t0, o = {}, d = .7){
+  const e = eo(p(t, t0, t0+d));
+  if (e <= 0) return;
+  txt(s, x, y + (1-e)*36, {...o, alpha:(o.alpha ?? 1)*e});
+}
+function rr(x,y,w,h,r){ ctx.beginPath(); ctx.roundRect(x,y,w,h,r); }
+function box(x, y, w, h, a, o = {}){
+  const {fill='rgba(255,255,255,.05)', stroke='rgba(255,159,128,.35)', lw=2, glow=0, r=18, dash=null} = o;
+  if (a <= 0) return;
+  ctx.save(); al(a); rr(x, y, w, h, r); ctx.fillStyle = fill; ctx.fill();
+  if (dash) ctx.setLineDash(dash);
+  ctx.strokeStyle = stroke; ctx.lineWidth = lw; if (glow){ ctx.shadowColor = stroke; ctx.shadowBlur = glow; } ctx.stroke(); ctx.restore();
+}
+function arrow(x1, y1, x2, y2, e, a, color = C.acc, lw = 3){
+  if (e <= 0 || a <= 0) return;
+  const x = lerp(x1, x2, e), y = lerp(y1, y2, e), ang = Math.atan2(y2 - y1, x2 - x1);
+  ctx.save(); al(a); ctx.strokeStyle = color; ctx.fillStyle = color; ctx.lineWidth = lw; ctx.lineCap = 'round';
+  ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x, y); ctx.stroke();
+  if (e > .85){ ctx.translate(x, y); ctx.rotate(ang); ctx.beginPath(); ctx.moveTo(4, 0); ctx.lineTo(-14, -9); ctx.lineTo(-14, 9); ctx.closePath(); ctx.fill(); }
+  ctx.restore();
+}
+function panel(x, y, w, h, title, a){
+  box(x, y, w, h, a, {fill:C.panel, stroke:'rgba(255,255,255,.1)', r:20});
+  if (a <= 0) return;
+  ctx.save(); al(a); ctx.strokeStyle = 'rgba(255,255,255,.07)'; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(x, y + 52); ctx.lineTo(x + w, y + 52); ctx.stroke();
+  ['#ff6b6b','#ffd166','#6ee7a0'].forEach((c, i) => { ctx.fillStyle = c; ctx.globalAlpha = clamp(SA*a*.8); ctx.beginPath(); ctx.arc(x + 30 + i*24, y + 26, 7, 0, 6.283); ctx.fill(); });
+  ctx.restore();
+  txt(title, x + w/2, y + 27, {size:22, weight:500, color:C.muted, font:MONO, alpha:a});
+}
+
+/* ============ 背景 ============ */
+const PARTS = (() => { const r = rnd(337); return Array.from({length:100}, () => ({
+  x:r()*W, y:r()*H, s:r()*2.2+.5, v:r()*12+4, ph:r()*6.283, c:r()<.25})); })();
+function background(t){
+  const g = ctx.createLinearGradient(0,0,W,H);
+  g.addColorStop(0,'#0a0916'); g.addColorStop(.55,'#110f24'); g.addColorStop(1,'#18122c');
+  ctx.globalAlpha = 1; ctx.fillStyle = g; ctx.fillRect(0,0,W,H);
+  const gx = W*.5 + Math.sin(t*.27)*140;
+  const rg = ctx.createRadialGradient(gx, H*.45, 0, gx, H*.45, 950);
+  rg.addColorStop(0,'rgba(255,159,128,0.09)'); rg.addColorStop(1,'rgba(255,159,128,0)');
+  ctx.fillStyle = rg; ctx.fillRect(0,0,W,H);
+  ctx.fillStyle = C.acc;
+  for (let x = 40; x < W; x += 80) for (let y = 40; y < H; y += 80){ ctx.globalAlpha = .06; ctx.fillRect(x, y, 2, 2); }
+  for (const q of PARTS){
+    const y = ((q.y - t*q.v) % H + H) % H, x = q.x + Math.sin(t*.35 + q.ph)*12;
+    ctx.globalAlpha = .2 + .3*(.5 + .5*Math.sin(t*1.2 + q.ph));
+    ctx.fillStyle = q.c ? C.acc : '#d8d0ff';
+    ctx.beginPath(); ctx.arc(x, y, q.s, 0, 6.283); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+}
+function vignette(){
+  const v = ctx.createRadialGradient(W/2, H/2, W*.28, W/2, H/2, W*.62);
+  v.addColorStop(0,'rgba(0,0,0,0)'); v.addColorStop(1,'rgba(0,0,0,.55)');
+  ctx.globalAlpha = 1; ctx.fillStyle = v; ctx.fillRect(0,0,W,H);
+}
+function codeLine(s, x, y, size, a, kw = /\b(public|class|static|void|new|return)\b/){
+  const parts = s.split(/("[^"]*"|\b(?:public|class|static|void|new|return|getstatic|ldc|invokevirtual)\b)/g);
+  ctx.save(); al(a); ctx.font = `500 ${size}px ${MONO}`; ctx.textBaseline = 'middle'; ctx.textAlign = 'left';
+  let xx = x;
+  for (const seg of parts){ if (!seg) continue;
+    ctx.fillStyle = seg.startsWith('"') ? C.mint : /^(public|class|static|void|new|return|getstatic|ldc|invokevirtual)$/.test(seg) ? C.acc : C.text;
+    ctx.fillText(seg, xx, y); xx += ctx.measureText(seg).width; }
+  ctx.restore();
+}
+
+const GA = 'rgba(255,159,128,';
+function card(h, lines, x, y, w, hh, a, c = C.acc, o = {}){
+  const {hs=30, ls=22, lh=40} = o;
+  box(x, y, w, hh, a, {fill:GA + '.05)', stroke:c === C.acc ? GA + '.5)' : c, r:20});
+  txt(h, x + 30, y + 44, {size:hs, weight:900, color:c, align:'left', alpha:a});
+  lines.forEach((s, i) => txt(s, x + 30, y + 96 + i*lh, {size:ls, weight:600, color:'#d9d2e4', align:'left', alpha:a}));
+}
+/* 对象框：kind = commit/tree/blob */
+const KC = {commit:'#ff9f80', tree:'#ffd38a', blob:'#9cc3ff'};
+function obj(kind, hash, label, x, y, a, o = {}){
+  const {w = 230, hl = false} = o, c = KC[kind];
+  box(x - w/2, y - 42, w, 84, a, {fill:hl ? 'rgba(255,255,255,.12)' : 'rgba(255,255,255,.05)', stroke:c, lw:hl ? 3 : 2, glow:hl ? 16 : 0, r:14});
+  txt(kind + ' ' + hash, x, y - 14, {size:20, weight:800, font:MONO, color:c, alpha:a});
+  txt(label, x, y + 18, {size:20, weight:700, alpha:a});
+}
+function link(x1, y1, x2, y2, a, c = 'rgba(255,255,255,.45)'){
+  if (a <= 0) return;
+  ctx.save(); al(a); ctx.strokeStyle = c; ctx.lineWidth = 2.5; ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x2, y2); ctx.stroke();
+  const ang = Math.atan2(y2 - y1, x2 - x1); ctx.translate(x2, y2); ctx.rotate(ang); ctx.fillStyle = c; ctx.beginPath(); ctx.moveTo(0, 0); ctx.lineTo(-12, -7); ctx.lineTo(-12, 7); ctx.closePath(); ctx.fill(); ctx.restore();
+}
+function cnode(label, x, y, a, c = C.acc, o = {}){
+  const {r = 34, dim = false} = o; if (a <= 0) return;
+  ctx.save(); al(a*(dim ? .4 : 1)); ctx.fillStyle = '#14121f'; ctx.strokeStyle = c; ctx.lineWidth = 3; ctx.beginPath(); ctx.arc(x, y, r, 0, 6.283); ctx.fill(); ctx.stroke(); ctx.restore();
+  txt(label, x, y, {size:22, weight:900, color:c, alpha:a*(dim ? .4 : 1)});
+}
+function edge(x1, y1, x2, y2, a, c = 'rgba(255,255,255,.4)'){
+  if (a <= 0) return; ctx.save(); al(a); ctx.strokeStyle = c; ctx.lineWidth = 3; ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x2, y2); ctx.stroke(); ctx.restore();
+}
+function tag(s, x, y, a, c = C.gold){
+  if (a <= 0) return;
+  ctx.save(); ctx.font = `800 20px ${MONO}`; const w = ctx.measureText(s).width + 28; ctx.restore();
+  box(x - w/2, y - 18, w, 36, a, {fill:'rgba(255,211,138,.12)', stroke:c, r:10}); txt(s, x, y, {size:20, weight:800, font:MONO, color:c, alpha:a});
+}
+
+/* ============ 场景 1 · 钩子 (0–7s) ============ */
+function s1(t){
+  rise('每次 git commit，Git 到底存了什么？', W/2, 130, t, .2, {size:54, weight:900});
+  const a = eo(p(t, 1, 1.5));
+  panel(200, 230, 700, 300, '你以为', a);
+  txt('存的是「改动」', 550, 330, {size:40, weight:900, color:C.muted, alpha:a});
+  txt('- hello', 550, 400, {size:30, weight:700, font:MONO, color:C.rose, alpha:a});
+  txt('+ hello git', 550, 450, {size:30, weight:700, font:MONO, color:C.mint, alpha:a});
+  const b = eo(p(t, 2.4, 2.9));
+  panel(1020, 230, 700, 300, '实际上', b);
+  txt('存的是每个版本的「快照」', 1370, 330, {size:36, weight:900, color:C.acc, alpha:b});
+  txt('.git/objects/ce/013625…', 1370, 410, {size:28, weight:700, font:MONO, alpha:b});
+  txt('文件名就是内容的哈希值', 1370, 465, {size:24, weight:700, color:C.muted, alpha:b});
+  const k = p(t, 3.8, 4.4);
+  if (k > 0){ box(410, 640, 1100, 140, clamp(k*2), {fill:GA + '.12)', stroke:C.acc, r:24, glow:22});
+    txt('Git 的核心：一个「内容寻址」的文件系统', W/2, 690, {size:36, weight:900, color:C.acc, alpha:clamp(k*2)});
+    txt('版本控制，是在它上面搭起来的', W/2, 745, {size:26, weight:700, alpha:eo(p(t, 4.6, 5))}); }
+  rise('打开 .git 目录看一看', W/2, 900, t, 5.4, {size:32, weight:800, color:C.gold});
+}
+
+/* ============ 场景 2 · 内容寻址 (7–19s) ============ */
+function s2(t){
+  rise('内容寻址：用内容的哈希当名字', W/2, 90, t, 7.2, {size:54, weight:900});
+  const steps = [['文件内容', 'hello\\n', 7.8], ['加上对象头', 'blob 6\\0hello\\n', 8.6], ['SHA-1 哈希', 'ce013625030b…', 9.4], ['zlib 压缩后存入', '.git/objects/ce/013625…', 10.2]];
+  steps.forEach(([h, v, ts], i) => { const e = eback(p(t, ts, ts + .5)), x = 260 + i*465;
+    if (e > 0){ ctx.save(); ctx.translate(x, 280); ctx.scale(e, e); ctx.translate(-x, -280); box(x - 200, 210, 400, 140, clamp(e), {fill:GA + '.08)', stroke:C.acc, r:18}); ctx.restore(); }
+    txt(h, x, 250, {size:26, weight:900, color:C.acc, alpha:clamp(e)}); txt(v, x, 305, {size:i === 3 ? 20 : 24, weight:700, font:MONO, alpha:clamp(e)});
+    if (i) arrow(x - 258, 280, x - 208, 280, e, clamp(e), C.acc, 3); });
+  txt('目录名取哈希的前 2 位，文件名是剩下的 38 位', W/2, 410, {size:24, weight:700, color:C.muted, alpha:eo(p(t, 11, 11.4))});
+  const b = eo(p(t, 12, 12.5));
+  panel(160, 480, 760, 420, 'git ls-files --stage', b);
+  [['a.txt', 'ce01362'], ['b.txt', 'ce01362']].forEach(([n, h], i) => { const y = 600 + i*80;
+    txt(n, 220, y, {size:28, weight:800, font:MONO, align:'left', alpha:b}); txt('内容：hello', 390, y, {size:24, weight:600, color:C.muted, align:'left', alpha:b}); txt(h, 700, y, {size:28, weight:800, font:MONO, color:KC.blob, align:'left', alpha:b}); });
+  txt('两个文件，内容相同 → 哈希相同 → 只存一份', 540, 810, {size:24, weight:800, color:C.gold, alpha:eo(p(t, 13.2, 13.6))});
+  card('这样设计的好处', ['相同内容自动去重，存一份就够', '内容一改哈希就变，篡改和损坏一眼看出', '拿着哈希就能找到内容，不需要额外索引'], 1000, 480, 760, 300, eo(p(t, 14.4, 14.9)), C.acc, {ls:24, lh:50});
+  rise('Git 正在从 SHA-1 逐步迁移到 SHA-256，原理不变', 1380, 860, t, 16.4, {size:22, weight:700, color:C.muted});
+}
+
+/* ============ 场景 3 · 三种对象 (19–32s) ============ */
+function s3(t){
+  rise('三种对象：blob、tree、commit', W/2, 90, t, 19.2, {size:54, weight:900});
+  const a1 = eo(p(t, 19.8, 20.3)), a2 = eo(p(t, 21, 21.5)), a3 = eo(p(t, 22.2, 22.7));
+  obj('commit', 'a57e960', 'first commit', 560, 240, a1);
+  obj('tree', 'a5a7d83', '根目录 /', 560, 430, a2);
+  link(560, 284, 560, 386, a2);
+  obj('blob', 'ce01362', 'a.txt 和 b.txt', 280, 640, a3);
+  obj('tree', '37a4b05', 'src/', 840, 640, a3);
+  obj('blob', 'b80e322', 'main.py', 840, 840, eo(p(t, 23, 23.5)));
+  link(500, 474, 330, 596, a3); link(620, 474, 790, 596, a3); link(840, 684, 840, 796, eo(p(t, 23, 23.5)));
+  const items = [['blob', '文件内容', '只有内容，没有文件名', 24], ['tree', '目录', '一行一条：权限、类型、哈希、名字', 25.2], ['commit', '一次提交', '根 tree + 父提交 + 作者 + 时间 + 说明', 26.4]];
+  items.forEach(([k, h, d, ts], i) => { const e = eo(p(t, ts, ts + .5)), y = 230 + i*190;
+    box(1100, y - 70, 700, 150, e, {fill:'rgba(255,255,255,.04)', stroke:KC[k], r:18});
+    txt(k, 1140, y - 24, {size:32, weight:900, font:MONO, color:KC[k], align:'left', alpha:e}); txt(h, 1300, y - 24, {size:28, weight:900, align:'left', alpha:e});
+    txt(d, 1140, y + 30, {size:22, weight:600, color:'#d9d2e4', align:'left', alpha:e}); });
+  rise('文件名存在 tree 里，所以改名不会产生新的 blob', 1450, 830, t, 28, {size:24, weight:800, color:C.gold});
+  rise('提交的哈希由它的全部内容决定，包括父提交 → 历史无法悄悄篡改', 1450, 890, t, 29.2, {size:22, weight:700, color:C.muted});
+}
+
+/* ============ 场景 4 · 快照 (32–44s) ============ */
+function s4(t){
+  rise('快照，而不是差异', W/2, 90, t, 32.2, {size:54, weight:900});
+  rise('第二次提交只改了 a.txt', W/2, 160, t, 32.6, {size:30, weight:700, color:C.muted});
+  const a = eo(p(t, 33, 33.5));
+  obj('commit', 'a57e960', '第 1 次提交', 420, 280, a); obj('tree', 'a5a7d83', '/', 420, 460, a);
+  link(420, 324, 420, 416, a);
+  const b = eo(p(t, 34.2, 34.7));
+  obj('commit', '9443839', '第 2 次提交', 1500, 280, b, {hl:true}); obj('tree', '3ed6bb6', '/', 1500, 460, b, {hl:true});
+  link(1500, 324, 1500, 416, b); link(1385, 280, 537, 280, eo(p(t, 34.6, 35)), C.acc); txt('parent', 960, 252, {size:22, weight:800, font:MONO, color:C.acc, alpha:b});
+  const c = eo(p(t, 35.4, 35.9)), n = eo(p(t, 36.4, 36.9)), d = eo(p(t, 37.2, 37.7));
+  obj('blob', 'ce01362', 'a.txt v1 / b.txt', 620, 700, c); obj('tree', '37a4b05', 'src/', 1060, 700, c); obj('blob', '8d0e412', 'a.txt v2', 1500, 700, n, {hl:true});
+  link(400, 504, 580, 656, c); link(450, 504, 1010, 656, c);
+  link(1450, 504, 680, 656, d, 'rgba(156,195,255,.8)'); link(1490, 504, 1110, 656, d, 'rgba(255,211,138,.8)'); link(1500, 504, 1500, 656, n, C.acc);
+  txt('b.txt：两次提交共用', 620, 775, {size:22, weight:800, color:KC.blob, alpha:d});
+  txt('src/：两次提交共用', 1060, 775, {size:22, weight:800, color:KC.tree, alpha:d});
+  txt('只有它是新对象', 1500, 775, {size:22, weight:800, color:C.acc, alpha:n});
+  const e = eo(p(t, 39, 39.5));
+  card('每次提交都是完整快照，但并不浪费', ['没变的文件和目录直接指向已有的对象，只有改动的部分是新对象', '打包（packfile）时，Git 还会对相似的对象做增量压缩'], 260, 830, 1400, 200, e, C.acc, {ls:24, lh:46});
+}
+
+/* ============ 场景 5 · 分支与 HEAD (44–56s) ============ */
+function s5(t){
+  rise('分支：一个写着提交哈希的小文件', W/2, 90, t, 44.2, {size:54, weight:900});
+  const a = eo(p(t, 44.6, 45.1)), k = p(t, 48.6, 49.4), y = 380;
+  const xs = [300, 560, 820, 1080];
+  [0, 1, 2].forEach(i => { cnode('C' + (i + 1), xs[i], y, a); if (i) edge(xs[i - 1] + 34, y, xs[i] - 34, y, a); });
+  const nb = eo(p(t, 48.6, 49.2));
+  cnode('C4', xs[3], y, nb, C.acc); edge(xs[2] + 34, y, xs[3] - 34, y, nb);
+  const mx = lerp(xs[2], xs[3], eio(k));
+  tag('main', mx, y - 90, a); link(mx, y - 70, mx, y - 40, a, C.gold);
+  tag('HEAD', mx, y - 170, eo(p(t, 46, 46.5)), C.acc); link(mx, y - 150, mx, y - 110, eo(p(t, 46, 46.5)), C.acc);
+  tag('feature', xs[1], y + 100, eo(p(t, 50.4, 50.9))); link(xs[1], y + 80, xs[1], y + 40, eo(p(t, 50.4, 50.9)), C.gold);
+  txt('新提交后，main 自动前移', 1290, y - 90, {size:22, weight:800, color:C.gold, align:'left', alpha:eo(p(t, 49.4, 49.8))});
+  const b = eo(p(t, 45.2, 45.7));
+  panel(160, 600, 800, 330, '终端', b);
+  [['$ cat .git/HEAD', C.text], ['ref: refs/heads/main', C.acc], ['$ cat .git/refs/heads/main', C.text], [k > .5 ? '(C4 的哈希)' : '(C3 的哈希)', C.gold]].forEach(([s, c], i) =>
+    txt(s, 200, 690 + i*58, {size:24, weight:600, font:MONO, color:c, align:'left', alpha:eo(p(t, 45.6 + i*.4, 46 + i*.4))}));
+  card('所以分支非常便宜', ['新建分支 = 新建一个约 41 字节的文件', 'HEAD 指向当前分支；直接指向提交时叫「分离 HEAD」', '标签（tag）也是指针，但不会移动'], 1020, 600, 780, 330, eo(p(t, 51.4, 51.9)), C.acc, {ls:23, lh:52});
+}
+
+/* ============ 场景 6 · 三个区域 (56–67s) ============ */
+function s6(t){
+  rise('三个区域：工作区、暂存区、仓库', W/2, 90, t, 56.2, {size:54, weight:900});
+  const zs = [['工作区', '你看到、编辑的文件', 330], ['暂存区（index）', '下一次提交的「草稿」', 960], ['仓库（.git）', '所有对象和提交历史', 1590]];
+  zs.forEach(([h, d, x], i) => { const e = eo(p(t, 56.6 + i*.4, 57.1 + i*.4));
+    box(x - 220, 190, 440, 200, e, {fill:GA + (.05 + i*.04) + ')', stroke:C.acc, r:22});
+    txt(h, x, 260, {size:34, weight:900, color:C.acc, alpha:e}); txt(d, x, 320, {size:22, weight:600, color:C.muted, alpha:e}); });
+  const a = eo(p(t, 58.4, 58.9)), b = eo(p(t, 60, 60.5));
+  arrow(570, 300, 720, 300, a, a, C.acc, 4); txt('git add', 645, 255, {size:24, weight:800, font:MONO, color:C.gold, alpha:a});
+  arrow(1200, 300, 1350, 300, b, b, C.acc, 4); txt('git commit', 1275, 255, {size:24, weight:800, font:MONO, color:C.gold, alpha:b});
+  card('git add 做了什么', ['把文件内容写成 blob 对象', '在 index 里记下：路径 → blob 哈希'], 140, 470, 760, 210, eo(p(t, 59, 59.5)), C.acc, {ls:24, lh:48});
+  card('git commit 做了什么', ['按 index 生成 tree 对象', '写 commit 对象，指向根 tree 和父提交', '把当前分支移到新提交'], 1020, 470, 760, 250, eo(p(t, 60.8, 61.3)), C.acc, {ls:24, lh:48});
+  [['git restore <文件>', '用暂存区覆盖工作区的修改'], ['git reset --soft / --mixed / --hard', '移动分支，并分别保留 / 清空暂存区 / 连工作区一起重置'], ['git revert <提交>', '新增一个「反向」提交，不改写历史']].forEach(([c, d], i) => {
+    const e = eo(p(t, 62.6 + i*.6, 63 + i*.6)), y = 800 + i*64;
+    txt(c, 160, y, {size:24, weight:800, font:MONO, color:C.gold, align:'left', alpha:e}); txt(d, 760, y, {size:24, weight:600, align:'left', alpha:e}); });
+}
+
+/* ============ 场景 7 · merge vs rebase (67–78s) ============ */
+function s7(t){
+  rise('合并分支：merge 还是 rebase？', W/2, 80, t, 67.2, {size:54, weight:900});
+  const a = eo(p(t, 67.6, 68.1));
+  box(100, 150, 840, 560, a, {fill:'rgba(255,255,255,.03)', stroke:'rgba(255,255,255,.18)', r:24});
+  txt('merge', 520, 200, {size:36, weight:900, font:MONO, color:C.acc, alpha:a});
+  cnode('A', 190, 450, a, C.muted); cnode('B', 320, 450, a, C.muted); cnode('C', 470, 450, a, C.blue);
+  cnode('F1', 400, 320, a, C.mint); cnode('F2', 540, 320, a, C.mint);
+  edge(224, 450, 286, 450, a); edge(354, 450, 436, 450, a); edge(345, 425, 370, 345, a); edge(434, 320, 506, 320, a);
+  const m = eo(p(t, 68.6, 69.1));
+  cnode('M', 680, 450, m, C.acc, {r:38}); edge(504, 450, 642, 450, m, C.acc); edge(574, 330, 648, 425, m, C.acc);
+  txt('合并提交 M 有两个父提交', 520, 560, {size:24, weight:800, color:C.gold, alpha:m});
+  txt('✓ 如实保留分叉历史，不改写已有提交', 140, 625, {size:22, weight:700, color:C.mint, align:'left', alpha:eo(p(t, 69.4, 69.8))});
+  txt('✗ 合并提交多了，历史图会比较乱', 140, 670, {size:22, weight:700, color:C.rose, align:'left', alpha:eo(p(t, 69.8, 70.2))});
+  const b = eo(p(t, 70.6, 71.1));
+  box(980, 150, 840, 560, b, {fill:'rgba(255,255,255,.03)', stroke:'rgba(255,255,255,.18)', r:24});
+  txt('rebase', 1400, 200, {size:36, weight:900, font:MONO, color:C.acc, alpha:b});
+  cnode('A', 1060, 450, b, C.muted); cnode('B', 1180, 450, b, C.muted); cnode('C', 1300, 450, b, C.blue);
+  edge(1094, 450, 1146, 450, b); edge(1214, 450, 1266, 450, b);
+  cnode('F1', 1260, 320, b, C.mint, {dim:true}); cnode('F2', 1390, 320, b, C.mint, {dim:true}); edge(1205, 425, 1235, 345, b*.4); edge(1294, 320, 1356, 320, b*.4);
+  const r = eo(p(t, 71.6, 72.2));
+  cnode("F1'", 1440, 450, r, C.acc); cnode("F2'", 1580, 450, r, C.acc); edge(1334, 450, 1406, 450, r, C.acc); edge(1474, 450, 1546, 450, r, C.acc);
+  txt('把 F1、F2 在 C 后面「重放」一遍：内容相同，但哈希全变了', 1400, 560, {size:22, weight:800, color:C.gold, alpha:r});
+  txt('✓ 历史是一条直线，清爽', 1020, 625, {size:22, weight:700, color:C.mint, align:'left', alpha:eo(p(t, 72.6, 73))});
+  txt('✗ 改写了历史：别 rebase 已经推送、别人在用的分支', 1020, 670, {size:22, weight:700, color:C.rose, align:'left', alpha:eo(p(t, 73, 73.4))});
+  const c = eo(p(t, 74.4, 74.9));
+  box(260, 780, 1400, 150, c, {fill:GA + '.08)', stroke:C.acc, r:22});
+  txt('后悔药：git reflog', W/2, 830, {size:32, weight:900, font:MONO, color:C.acc, alpha:c});
+  txt('记录 HEAD 去过的每一个提交。误 reset、rebase 后，旧提交通常还在，可以找回', W/2, 885, {size:24, weight:700, alpha:eo(p(t, 75.2, 75.6))});
+}
+
+/* ============ 场景 8 · 收尾 (78–84s) ============ */
+function s8(t){
+  [['内容寻址', '哈希即名字，自动去重'], ['三种对象', 'blob · tree · commit'], ['分支', '指向提交的指针'], ['三个区域', '工作区 → 暂存区 → 仓库']].forEach(([a, b], i) => {
+    const st = 78.2 + i*.25, e = eback(p(t, st, st + .5)); if (e <= 0) return;
+    const x = 330 + i*420, y = 330;
+    ctx.save(); ctx.translate(x, y); ctx.scale(e, e); ctx.translate(-x, -y);
+    box(x - 185, y - 90, 370, 180, clamp(e), {fill:GA + '.08)', stroke:GA + '.5)', r:26}); ctx.restore();
+    txt(a, x, y - 22, {size:40, weight:900, color:C.acc, alpha:clamp(e)}); txt(b, x, y + 40, {size:24, weight:600, color:C.muted, alpha:clamp(e)});
+  });
+  rise('看懂对象和指针，Git 就不再神秘', W/2, 600, t, 79.2, {size:62, weight:900, glow:22});
+  rise('关注拾星，一起搞懂计算机', W/2, 760, t, 80, {size:36, weight:500, color:C.muted});
+}
+/* ============ 总调度 ============ */
+const SCENES = [[s1,-1,7],[s2,7,19],[s3,19,32],[s4,32,44],[s5,44,56],[s6,56,67],[s7,67,78],[s8,78,84]];
+function draw(t){
+  t = clamp(t, 0, DUR);
+  ctx.save(); ctx.globalAlpha = 1; ctx.clearRect(0,0,W,H); background(t);
+  for (const [fn,a,b] of SCENES){
+    if (t < a || t > b) continue;
+    SA = sceneA(t, a, b, b === DUR ? .8 : .5);
+    if (SA > 0){ ctx.save(); fn(t); ctx.restore(); }
+  }
+  SA = 1; vignette();
+  const fo = p(t, DUR - .8, DUR);
+  if (fo > 0){ ctx.globalAlpha = fo; ctx.fillStyle = '#000'; ctx.fillRect(0,0,W,H); }
+  ctx.restore();
+}
+
+/* ============ 播放器 / 逐帧渲染接口 ============ */
+const isRender = new URLSearchParams(location.search).has('render');
+window.DURATION = DUR;
+window.renderFrame = t => draw(t);
+const btn = document.getElementById('btn'), seek = document.getElementById('seek'), timeEl = document.getElementById('time');
+const fmt = s => `${Math.floor(s/60)}:${String(Math.floor(s%60)).padStart(2,'0')}`;
+function fit(){
+  if (isRender){ cv.style.width = W+'px'; cv.style.height = H+'px'; return; }
+  const w = Math.min(innerWidth - 32, (innerHeight - 84)*16/9);
+  cv.style.width = w + 'px'; cv.style.height = w*9/16 + 'px';
+}
+addEventListener('resize', fit); fit();
+
+let cur = 0, playing = !isRender, last = null;
+function toggle(){ if (cur >= DUR) cur = 0; playing = !playing; }
+btn.onclick = toggle; cv.onclick = toggle;
+addEventListener('keydown', e => { if (e.code === 'Space'){ e.preventDefault(); toggle(); } });
+seek.oninput = () => { cur = +seek.value; draw(cur); };
+function loop(ts){
+  if (playing && last != null){ cur += (ts - last)/1000; if (cur >= DUR){ cur = DUR; playing = false; } }
+  last = ts; draw(cur);
+  seek.value = cur; timeEl.textContent = `${fmt(cur)} / ${fmt(DUR)}`;
+  btn.textContent = playing ? '❚❚' : (cur >= DUR ? '↺' : '▶');
+  requestAnimationFrame(loop);
+}
+document.fonts.ready.then(() => {
+  window.ready = true;
+  if (isRender) draw(0); else requestAnimationFrame(loop);
+});
+</script>
+</body>
+</html>
