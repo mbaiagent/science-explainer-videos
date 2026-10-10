@@ -1,0 +1,313 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Transformer 详解 · 拾星</title>
+<style>
+  :root{--bg:#07080f;--fg:#f4ede4;--muted:#9a93a8;--acc:#f9a8d4}
+  html,body{margin:0;height:100%;background:var(--bg);color:var(--fg);
+    font-family:-apple-system,"PingFang SC","Noto Sans SC","Noto Sans CJK SC","Microsoft YaHei",sans-serif}
+  body{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;overflow:hidden}
+  #stage{display:block;background:#07080f;border-radius:12px;box-shadow:0 20px 60px rgba(0,0,0,.55);cursor:pointer}
+  #bar{display:flex;align-items:center;gap:12px;width:min(calc(100vw - 32px),640px)}
+  #btn{width:40px;height:40px;border-radius:50%;border:1px solid rgba(249,168,212,.5);background:transparent;
+    color:var(--acc);font-size:16px;cursor:pointer;flex:none}
+  #seek{flex:1;accent-color:var(--acc)}
+  #time{font-variant-numeric:tabular-nums;font-size:13px;color:var(--muted);min-width:84px;text-align:right}
+  body.render{display:block}
+  body.render #bar{display:none}
+  body.render #stage{border-radius:0;box-shadow:none}
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="bar">
+  <button id="btn" aria-label="播放/暂停">❚❚</button>
+  <input id="seek" type="range" min="0" max="84" step="0.01" value="0">
+  <span id="time">0:00 / 1:24</span>
+</div>
+<script>
+/* ============ 基础设置（横屏 1920×1080） ============ */
+const W = 1920, H = 1080, DUR = 84;
+const cv = document.getElementById('stage'), ctx = cv.getContext('2d');
+cv.width = W; cv.height = H;
+const FONT = '"PingFang SC","Noto Sans SC","Noto Sans CJK SC","Source Han Sans SC","Microsoft YaHei",sans-serif';
+const MONO = '"JetBrains Mono","SF Mono",Menlo,Consolas,"DejaVu Sans Mono","Noto Sans Mono CJK SC","PingFang SC","Microsoft YaHei",monospace';
+const C = {acc:'#f9a8d4', mint:'#6ee7c8', gold:'#ffd38a', coral:'#ff9e7a', rose:'#ff8a8a', blue:'#9cc3ff', text:'#f4ede4', muted:'#9a93a8', dim:'#4a4558', panel:'#0f0e1f'};
+
+const clamp = (x,a=0,b=1) => Math.max(a, Math.min(b, x));
+const lerp = (a,b,t) => a + (b-a)*t;
+const p = (t,a,b) => clamp((t-a)/(b-a));
+const eo = x => 1 - Math.pow(1-x, 3);
+const eio = x => x < .5 ? 4*x*x*x : 1 - Math.pow(-2*x+2, 3)/2;
+const eback = x => { const c1=1.70158, c3=c1+1; return 1 + c3*Math.pow(x-1,3) + c1*Math.pow(x-1,2); };
+function rnd(seed){ let s = seed>>>0; return () => { s = (s*1664525 + 1013904223)>>>0; return s/4294967296; }; }
+
+let SA = 1;
+const al = a => { ctx.globalAlpha = clamp(SA*a); };
+const sceneA = (t,a,b,f=.5) => Math.min(p(t,a,a+f), 1 - p(t,b-f,b));
+
+function txt(s, x, y, o = {}){
+  const {size=64, weight=700, color=C.text, alpha=1, align='center', glow=0, scale=1, font=FONT} = o;
+  if (alpha <= 0) return;
+  ctx.save(); al(alpha);
+  ctx.font = `${weight} ${size}px ${font}`;
+  ctx.textAlign = align; ctx.textBaseline = 'middle'; ctx.fillStyle = color;
+  if (glow){ ctx.shadowColor = color; ctx.shadowBlur = glow; }
+  if (scale !== 1){ ctx.translate(x, y); ctx.scale(scale, scale); ctx.fillText(s, 0, 0); }
+  else ctx.fillText(s, x, y);
+  ctx.restore();
+}
+function rise(s, x, y, t, t0, o = {}, d = .7){
+  const e = eo(p(t, t0, t0+d));
+  if (e <= 0) return;
+  txt(s, x, y + (1-e)*36, {...o, alpha:(o.alpha ?? 1)*e});
+}
+function rr(x,y,w,h,r){ ctx.beginPath(); ctx.roundRect(x,y,w,h,r); }
+function box(x, y, w, h, a, o = {}){
+  const {fill='rgba(255,255,255,.05)', stroke='rgba(249,168,212,.35)', lw=2, glow=0, r=18, dash=null} = o;
+  if (a <= 0) return;
+  ctx.save(); al(a); rr(x, y, w, h, r); ctx.fillStyle = fill; ctx.fill();
+  if (dash) ctx.setLineDash(dash);
+  ctx.strokeStyle = stroke; ctx.lineWidth = lw; if (glow){ ctx.shadowColor = stroke; ctx.shadowBlur = glow; } ctx.stroke(); ctx.restore();
+}
+function arrow(x1, y1, x2, y2, e, a, color = C.acc, lw = 3){
+  if (e <= 0 || a <= 0) return;
+  const x = lerp(x1, x2, e), y = lerp(y1, y2, e), ang = Math.atan2(y2 - y1, x2 - x1);
+  ctx.save(); al(a); ctx.strokeStyle = color; ctx.fillStyle = color; ctx.lineWidth = lw; ctx.lineCap = 'round';
+  ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x, y); ctx.stroke();
+  if (e > .85){ ctx.translate(x, y); ctx.rotate(ang); ctx.beginPath(); ctx.moveTo(4, 0); ctx.lineTo(-14, -9); ctx.lineTo(-14, 9); ctx.closePath(); ctx.fill(); }
+  ctx.restore();
+}
+function panel(x, y, w, h, title, a){
+  box(x, y, w, h, a, {fill:C.panel, stroke:'rgba(255,255,255,.1)', r:20});
+  if (a <= 0) return;
+  ctx.save(); al(a); ctx.strokeStyle = 'rgba(255,255,255,.07)'; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(x, y + 52); ctx.lineTo(x + w, y + 52); ctx.stroke();
+  ['#ff6b6b','#ffd166','#6ee7a0'].forEach((c, i) => { ctx.fillStyle = c; ctx.globalAlpha = clamp(SA*a*.8); ctx.beginPath(); ctx.arc(x + 30 + i*24, y + 26, 7, 0, 6.283); ctx.fill(); });
+  ctx.restore();
+  txt(title, x + w/2, y + 27, {size:22, weight:500, color:C.muted, font:MONO, alpha:a});
+}
+
+/* ============ 背景 ============ */
+const PARTS = (() => { const r = rnd(211); return Array.from({length:100}, () => ({
+  x:r()*W, y:r()*H, s:r()*2.2+.5, v:r()*12+4, ph:r()*6.283, c:r()<.25})); })();
+function background(t){
+  const g = ctx.createLinearGradient(0,0,W,H);
+  g.addColorStop(0,'#0a0916'); g.addColorStop(.55,'#110f24'); g.addColorStop(1,'#18122c');
+  ctx.globalAlpha = 1; ctx.fillStyle = g; ctx.fillRect(0,0,W,H);
+  const gx = W*.5 + Math.sin(t*.27)*140;
+  const rg = ctx.createRadialGradient(gx, H*.45, 0, gx, H*.45, 950);
+  rg.addColorStop(0,'rgba(249,168,212,0.09)'); rg.addColorStop(1,'rgba(249,168,212,0)');
+  ctx.fillStyle = rg; ctx.fillRect(0,0,W,H);
+  ctx.fillStyle = C.acc;
+  for (let x = 40; x < W; x += 80) for (let y = 40; y < H; y += 80){ ctx.globalAlpha = .06; ctx.fillRect(x, y, 2, 2); }
+  for (const q of PARTS){
+    const y = ((q.y - t*q.v) % H + H) % H, x = q.x + Math.sin(t*.35 + q.ph)*12;
+    ctx.globalAlpha = .2 + .3*(.5 + .5*Math.sin(t*1.2 + q.ph));
+    ctx.fillStyle = q.c ? C.acc : '#d8d0ff';
+    ctx.beginPath(); ctx.arc(x, y, q.s, 0, 6.283); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+}
+function vignette(){
+  const v = ctx.createRadialGradient(W/2, H/2, W*.28, W/2, H/2, W*.62);
+  v.addColorStop(0,'rgba(0,0,0,0)'); v.addColorStop(1,'rgba(0,0,0,.55)');
+  ctx.globalAlpha = 1; ctx.fillStyle = v; ctx.fillRect(0,0,W,H);
+}
+function codeLine(s, x, y, size, a, kw = /\b(public|class|static|void|new|return)\b/){
+  const parts = s.split(/("[^"]*"|\b(?:public|class|static|void|new|return|getstatic|ldc|invokevirtual)\b)/g);
+  ctx.save(); al(a); ctx.font = `500 ${size}px ${MONO}`; ctx.textBaseline = 'middle'; ctx.textAlign = 'left';
+  let xx = x;
+  for (const seg of parts){ if (!seg) continue;
+    ctx.fillStyle = seg.startsWith('"') ? C.mint : /^(public|class|static|void|new|return|getstatic|ldc|invokevirtual)$/.test(seg) ? C.acc : C.text;
+    ctx.fillText(seg, xx, y); xx += ctx.measureText(seg).width; }
+  ctx.restore();
+}
+
+function pill(s, x, y, a, o = {}){
+  const {size=30, color=C.text, stroke='rgba(255,255,255,.2)', fill='rgba(255,255,255,.05)', font=FONT, weight=700} = o;
+  if (a <= 0) return;
+  ctx.save(); ctx.font = `${weight} ${size}px ${font}`; const w = ctx.measureText(s).width + 52; ctx.restore();
+  box(x - w/2, y - size*.9, w, size*1.8, a, {fill, stroke, r:size*.9});
+  txt(s, x, y, {size, weight, color, font, alpha:a});
+}
+function blk(s, x, y, w, h, a, c = C.acc, sub = '', size = 28){ box(x - w/2, y - h/2, w, h, a, {fill:'rgba(249,168,212,.08)', stroke:c, r:16}); txt(s, x, sub ? y - 13 : y, {size, weight:900, color:c, alpha:a}); if (sub) txt(sub, x, y + 20, {size:18, weight:600, color:C.muted, alpha:a}); }
+const TOKS = ['小猫', '追着', '球', '跑', '，', '因为', '它', '饿', '了'];
+const W8 = [.46, .05, .12, .04, .01, .06, .18, .05, .03];
+
+/* ============ 场景 1 · 钩子 (0–7s) ============ */
+function s1(t){
+  rise('GPT 里的 T，就是它', W/2, 150, t, .2, {size:52, weight:900});
+  ['GPT', 'Claude', 'Gemini', 'DeepSeek', 'Llama', 'Qwen'].forEach((s, i) => pill(s, 360 + i*240, 290, eback(p(t, .8 + i*.12, 1.2 + i*.12)), {size:26}));
+  rise('几乎所有大语言模型，骨架都是同一种结构', W/2, 400, t, 1.8, {size:40, weight:800});
+  const k = p(t, 2.8, 3.4);
+  if (k > 0) txt('Transformer', W/2, 590, {size:130, weight:900, font:MONO, color:C.acc, glow:44, alpha:clamp(k*2), scale:eback(k)});
+  rise('2017 年，论文《Attention Is All You Need》', W/2, 750, t, 3.8, {size:36, weight:700, color:C.gold});
+  rise('这一期，把它拆开看', W/2, 840, t, 4.8, {size:34, weight:700, color:C.muted});
+}
+
+/* ============ 场景 2 · 整体流程 (7–19s) ============ */
+function s2(t){
+  rise('从一句话，到下一个词', W/2, 90, t, 7.2, {size:56, weight:900});
+  const cx = 700, rows = [['输入文字', '「小猫追着球」', 215, C.text], ['切成 token', '小猫 | 追着 | 球', 330, C.text], ['词向量 + 位置编码', '每个 token → 一串数字，并带上「我在第几个」', 445, C.blue], ['Transformer 层 × N', '注意力 + 前馈网络，层层加工', 600, C.acc], ['输出概率', '下一个 token 是什么？', 755, C.gold], ['选出：「跑」', '拼回输入，继续下一轮', 870, C.mint]];
+  rows.forEach(([h, d, y, c], i) => { const e = eo(p(t, 7.8 + i*.6, 8.2 + i*.6)), big = i === 3;
+    box(cx - 330, y - (big ? 75 : 40), 660, big ? 150 : 80, e, {fill:big ? 'rgba(249,168,212,.12)' : 'rgba(255,255,255,.04)', stroke:c, lw:big ? 3 : 2, glow:big ? 16 : 0, r:16});
+    txt(h, cx, y - (big ? 22 : 12), {size:big ? 34 : 28, weight:900, color:c, alpha:e}); txt(d, cx, y + (big ? 30 : 20), {size:20, weight:600, color:C.muted, alpha:e});
+    if (i) arrow(cx, rows[i - 1][2] + (i - 1 === 3 ? 75 : 40), cx, y - (big ? 75 : 40) - 4, e, e, C.acc, 3); });
+  if (t > 9.8){ for (let k = 0; k < 4; k++){ const yy = 545 + k*30, w = eo(p(t, 9.8 + k*.15, 10.2 + k*.15)); ctx.save(); al(w*.35); ctx.strokeStyle = C.acc; ctx.lineWidth = 2; ctx.strokeRect(cx - 300 + k*8, yy - 8, 600 - k*16, 4); ctx.restore(); } }
+  [['只看到「前面」', '生成时，每个位置只能参考它之前的 token'], ['层数很多', '大模型往往有几十层甚至上百层'], ['参数都在这里', '注意力和前馈网络里的矩阵，就是「参数」']].forEach(([h, d], i) => {
+    const e = eo(p(t, 12.4 + i*.7, 12.8 + i*.7)), y = 300 + i*190;
+    box(1150, y - 70, 660, 150, e, {fill:'rgba(249,168,212,.06)', stroke:'rgba(249,168,212,.45)', r:18});
+    txt(h, 1180, y - 25, {size:32, weight:900, color:C.acc, align:'left', alpha:e}); txt(d, 1180, y + 28, {size:22, weight:600, color:'#d9d2e4', align:'left', alpha:e}); });
+  rise('今天的大模型多是「只有解码器」的结构；原论文还有编码器，用于翻译', W/2, 960, t, 15.4, {size:26, weight:600, color:C.muted});
+}
+
+/* ============ 场景 3 · Q K V (19–34s) ============ */
+function s3(t){
+  rise('核心：自注意力，用 Q、K、V 三个向量', W/2, 90, t, 19.2, {size:52, weight:900});
+  const a = eo(p(t, 19.6, 20.1)), tx = i => 220 + i*180, ty = 200;
+  TOKS.forEach((s, i) => { const on = i === 6; box(tx(i) - 70, ty - 32, 140, 64, a, {fill:on ? 'rgba(249,168,212,.2)' : 'rgba(255,255,255,.05)', stroke:on ? C.acc : 'rgba(255,255,255,.25)', r:12}); txt(s, tx(i), ty, {size:28, weight:900, color:on ? C.acc : C.text, alpha:a}); });
+  [['Q 查询', '我在找什么信息？', C.acc], ['K 键', '我能提供什么信息？', C.gold], ['V 值', '我实际携带的内容', C.mint]].forEach(([h, d, c], i) => { const e = eo(p(t, 20.6 + i*.5, 21 + i*.5));
+    box(150 + i*560, 290, 520, 100, e, {fill:'rgba(255,255,255,.03)', stroke:c, r:16}); txt(h, 180 + i*560, 323, {size:30, weight:900, color:c, align:'left', alpha:e}); txt(d, 180 + i*560, 362, {size:22, weight:600, color:'#d9d2e4', align:'left', alpha:e}); });
+  txt('每个 token 的向量，乘以三个学出来的矩阵，得到自己的 Q、K、V', W/2, 430, {size:26, weight:700, color:C.muted, alpha:eo(p(t, 22.2, 22.6))});
+  // 步骤
+  const st = [['① 用「它」的 Q，和每个 token 的 K 做点积 → 相关度分数', 23.4], ['② softmax：分数变成加起来等于 1 的权重', 25.8], ['③ 按权重，把所有 token 的 V 加权求和 → 「它」的新表示', 28.2]];
+  st.forEach(([s, ts], i) => txt(s, 160, 500 + i*46, {size:26, weight:800, color:[C.acc, C.gold, C.mint][i], align:'left', alpha:eo(p(t, ts, ts + .4))}));
+  const by = 900, g = eo(p(t, 24.2, 25.2)), sm = eo(p(t, 26.4, 27.4));
+  TOKS.forEach((s, i) => { const raw = .15 + W8[i]*1.6 + (i === 6 ? .1 : 0), h = lerp(raw*160*g, W8[i]*420*sm + 6, sm), x = tx(i);
+    ctx.save(); al(a); ctx.fillStyle = sm > .5 ? (i === 0 ? C.gold : 'rgba(249,168,212,.6)') : 'rgba(255,255,255,.4)'; rr(x - 40, by - h, 80, h, 6); ctx.fill(); ctx.restore();
+    if (sm > .5) txt(Math.round(W8[i]*100) + '%', x, by - h - 20, {size:20, weight:800, font:MONO, color:i === 0 ? C.gold : C.text, alpha:sm});
+    txt(s, x, by + 26, {size:20, weight:700, color:C.muted, alpha:a}); });
+  if (t > 28.8){ const k = eo(p(t, 28.8, 30)); ctx.save(); al(k); ctx.strokeStyle = C.mint; ctx.lineWidth = 3; ctx.beginPath(); ctx.moveTo(tx(0), by - 210); ctx.quadraticCurveTo((tx(0) + tx(6))/2, by - 280, tx(6), by - 110); ctx.stroke(); ctx.restore();
+    txt('「它」吸收了最多「小猫」的信息', 1480, 760, {size:26, weight:900, color:C.mint, alpha:k}); }
+}
+
+/* ============ 场景 4 · 注意力矩阵与掩码 (34–45s) ============ */
+function s4(t){
+  rise('每个 token 都这样算一遍：注意力矩阵', W/2, 90, t, 34.2, {size:52, weight:900});
+  const n = 7, cs = 78, x0 = 380, y0 = 230, a = eo(p(t, 34.6, 35.1)), mask = eo(p(t, 37.6, 38.4)), labs = TOKS.slice(0, 7);
+  labs.forEach((s, i) => { txt(s, x0 - 50, y0 + i*cs + cs/2, {size:22, weight:800, align:'right', alpha:a}); txt(s, x0 + i*cs + cs/2, y0 - 26, {size:22, weight:800, alpha:a}); });
+  const r = rnd(3);
+  for (let i = 0; i < n; i++) for (let j = 0; j < n; j++){ const v = r(), fut = j > i, e = eo(p(t, 35 + (i + j)*.06, 35.4 + (i + j)*.06));
+    const show = fut ? 1 - mask : 1, w = (i === 6 && j === 0) ? 1 : v*.8;
+    ctx.save(); al(e*show); ctx.fillStyle = `rgba(249,168,212,${.1 + w*.75})`; rr(x0 + j*cs + 3, y0 + i*cs + 3, cs - 6, cs - 6, 8); ctx.fill(); ctx.restore();
+    if (fut && mask > .5){ ctx.save(); al(mask); ctx.strokeStyle = 'rgba(255,255,255,.12)'; ctx.lineWidth = 1; ctx.strokeRect(x0 + j*cs + 3, y0 + i*cs + 3, cs - 6, cs - 6); ctx.restore(); txt('×', x0 + j*cs + cs/2, y0 + i*cs + cs/2, {size:22, weight:700, color:C.muted, alpha:mask*.6}); } }
+  txt('行：谁在看　列：被看的', x0 + n*cs/2, y0 + n*cs + 40, {size:22, weight:700, color:C.muted, alpha:a});
+  [['因果掩码', '生成时只能看前面的 token，不能「偷看」答案：右上角全部遮住', 37.6], ['除以 √d 再 softmax', '向量维度高时点积会很大，缩放一下让训练更稳定', 39.6], ['一次矩阵乘法算完', '所有位置同时计算，非常适合 GPU 并行', 41.4]].forEach(([h, d, ts], i) => {
+    const e = eo(p(t, ts, ts + .4)), y = 300 + i*190;
+    box(1040, y - 70, 780, 150, e, {fill:'rgba(249,168,212,.06)', stroke:'rgba(249,168,212,.45)', r:18});
+    txt(h, 1070, y - 25, {size:32, weight:900, color:C.acc, align:'left', alpha:e}); txt(d, 1070, y + 28, {size:21, weight:600, color:'#d9d2e4', align:'left', alpha:e}); });
+  txt('Attention(Q, K, V) = softmax(QKᵀ / √d) · V', W/2, 900, {size:36, weight:800, font:MONO, color:C.gold, alpha:eo(p(t, 42.6, 43))});
+}
+
+/* ============ 场景 5 · 多头 (45–56s) ============ */
+function s5(t){
+  rise('多头注意力：同时从多个角度看', W/2, 90, t, 45.2, {size:56, weight:900});
+  const heads = [['头 1：指代关系', [[6, 0, .9]], C.acc], ['头 2：语法搭配', [[1, 2, .8], [3, 2, .5]], C.gold], ['头 3：相邻的词', [[1, 0, .7], [2, 1, .7], [3, 2, .7], [6, 5, .7]], C.mint]];
+  heads.forEach(([h, links, c], k) => { const y = 260 + k*200, e = eo(p(t, 45.8 + k*1.2, 46.3 + k*1.2)), tx = i => 520 + i*150;
+    txt(h, 120, y + 10, {size:28, weight:900, color:c, align:'left', alpha:e});
+    TOKS.slice(0, 8).forEach((s, i) => txt(s, tx(i), y + 40, {size:24, weight:800, alpha:e}));
+    links.forEach(([from, to, w], j) => { const x1 = tx(from), x2 = tx(to), hh = 26 + Math.abs(x1 - x2)*.08, f = eo(p(t, 46.4 + k*1.2 + j*.15, 47 + k*1.2 + j*.15));
+      ctx.save(); al(f*(.4 + w*.6)); ctx.strokeStyle = c; ctx.lineWidth = 2 + w*6; ctx.lineCap = 'round'; ctx.beginPath();
+      for (let s2 = 0; s2 <= f; s2 += .03){ const xx = lerp(x1, x2, s2), yy = y + 10 - Math.sin(Math.PI*s2)*hh; s2 ? ctx.lineTo(xx, yy) : ctx.moveTo(xx, yy); } ctx.stroke(); ctx.restore(); }); });
+  rise('每个头有自己的一套 Q、K、V 矩阵，各自学会关注不同的关系', W/2, 870, t, 50.4, {size:34, weight:900});
+  rise('最后把所有头的结果拼起来，再做一次线性变换（示意图，真实模型的「头」不一定这么好解释）', W/2, 940, t, 52.0, {size:24, weight:600, color:C.muted});
+}
+
+/* ============ 场景 6 · 一层的完整结构 (56–67s) ============ */
+function s6(t){
+  rise('一层 Transformer 的完整结构', W/2, 90, t, 56.2, {size:56, weight:900});
+  const cx = 640, a = eo(p(t, 56.6, 57.1));
+  box(cx - 300, 170, 600, 760, a, {fill:'rgba(249,168,212,.03)', stroke:'rgba(249,168,212,.4)', dash:[10, 8], r:24});
+  txt('× N 层', cx + 330, 200, {size:30, weight:900, color:C.gold, align:'left', alpha:a});
+  const L = [['输入', 880, 'rgba(255,255,255,.35)'], ['层归一化', 780, C.blue], ['多头自注意力', 670, C.acc], ['层归一化', 520, C.blue], ['前馈网络（FFN）', 410, C.acc], ['输出 → 下一层', 260, 'rgba(255,255,255,.35)']];
+  L.forEach(([s, y, c], i) => { const e = eo(p(t, 57 + i*.35, 57.4 + i*.35)); blk(s, cx, y, 360, 74, e, c, '', 26); if (i) arrow(cx, L[i - 1][1] - 40, cx, y + 40, e, e, C.acc, 3); });
+  [[880, 620], [580, 330]].forEach(([y1, y2], k) => { const e = eo(p(t, 59.4 + k*.6, 60 + k*.6)); ctx.save(); al(e); ctx.strokeStyle = C.mint; ctx.lineWidth = 4; ctx.beginPath(); ctx.moveTo(cx - 185, y1); ctx.lineTo(cx - 250, y1); ctx.lineTo(cx - 250, y2); ctx.lineTo(cx - 20, y2); ctx.stroke(); ctx.restore();
+    txt('⊕', cx, y2, {size:34, weight:900, color:C.mint, alpha:e}); });
+  [['注意力：在 token 之间交换信息', '「谁和谁有关」'], ['前馈网络：对每个 token 单独加工', '被认为存储了大量知识'], ['残差连接（绿色）', '把输入直接加到输出上，让很深的网络也能训练'], ['层归一化', '把数值稳定在合适的范围']].forEach(([h, d], i) => {
+    const e = eo(p(t, 60.6 + i*.6, 61 + i*.6)), y = 250 + i*165;
+    box(1060, y - 62, 760, 130, e, {fill:'rgba(249,168,212,.06)', stroke:'rgba(249,168,212,.45)', r:18});
+    txt(h, 1090, y - 20, {size:28, weight:900, color:i === 2 ? C.mint : C.acc, align:'left', alpha:e}); txt(d, 1090, y + 28, {size:22, weight:600, color:'#d9d2e4', align:'left', alpha:e}); });
+}
+
+/* ============ 场景 7 · 为什么成功 (67–78s) ============ */
+function s7(t){
+  rise('它为什么能赢？又贵在哪？', W/2, 90, t, 67.2, {size:56, weight:900});
+  const a = eo(p(t, 67.6, 68.1));
+  box(110, 170, 820, 380, a, {fill:'rgba(255,255,255,.03)', stroke:'rgba(255,255,255,.25)', r:22});
+  txt('之前的 RNN：一个接一个处理', 520, 215, {size:28, weight:900, alpha:a});
+  for (let i = 0; i < 7; i++){ const on = Math.floor(((t - 68)*3)) % 7 === i && t > 68; box(170 + i*105, 300, 80, 70, a, {fill:on ? 'rgba(255,211,138,.4)' : 'rgba(255,255,255,.05)', stroke:'rgba(255,255,255,.3)', r:10}); if (i) arrow(170 + i*105 - 25, 335, 170 + i*105 - 2, 335, a, a, C.muted, 2); }
+  txt('串行，难以并行；离得远的词，信息要传很多步', 520, 450, {size:22, weight:700, color:C.rose, alpha:a});
+  box(990, 170, 820, 380, a, {fill:'rgba(249,168,212,.06)', stroke:C.acc, r:22});
+  txt('Transformer：所有位置同时处理', 1400, 215, {size:28, weight:900, color:C.acc, alpha:a});
+  for (let i = 0; i < 7; i++){ const on = t > 68 && Math.sin(t*4) > 0; box(1050 + i*105, 300, 80, 70, a, {fill:on ? 'rgba(249,168,212,.4)' : 'rgba(249,168,212,.15)', stroke:C.acc, r:10}); }
+  txt('并行训练，GPU 利用率高；任意两个词一步直达', 1400, 450, {size:22, weight:700, color:C.mint, alpha:a});
+  [['可以堆得很大', '并行 + 稳定，让「更大的模型 + 更多的数据」成为可能'], ['代价：注意力是 n² 的', '序列长度翻倍，注意力的计算量约变成 4 倍，长上下文很贵'], ['推理时的 KV Cache', '缓存之前 token 的 K、V，生成新 token 时不用重算，但很占显存']].forEach(([h, d], i) => {
+    const e = eo(p(t, 70.4 + i*.9, 70.8 + i*.9)), y = 640 + i*125;
+    box(160, y - 52, 1600, 110, e, {fill:'rgba(255,255,255,.03)', stroke:i ? 'rgba(255,211,138,.45)' : 'rgba(110,231,200,.45)', r:18});
+    txt(h, 200, y - 14, {size:30, weight:900, color:i ? C.gold : C.mint, align:'left', alpha:e}); txt(d, 200, y + 26, {size:22, weight:600, color:'#d9d2e4', align:'left', alpha:e}); });
+}
+
+/* ============ 场景 8 · 收尾 (78–84s) ============ */
+function s8(t){
+  [['Q · K · V', '谁和谁有关'], ['多头', '多个角度一起看'], ['FFN + 残差', '加工与稳定'], ['× N 层', '堆叠成大模型']].forEach(([a, b], i) => {
+    const st = 78.2 + i*.25, e = eback(p(t, st, st + .5)); if (e <= 0) return;
+    const x = 330 + i*420, y = 330;
+    ctx.save(); ctx.translate(x, y); ctx.scale(e, e); ctx.translate(-x, -y);
+    box(x - 185, y - 90, 370, 180, clamp(e), {fill:'rgba(249,168,212,.08)', stroke:'rgba(249,168,212,.5)', r:26}); ctx.restore();
+    txt(a, x, y - 22, {size:40, weight:900, font:i === 0 ? MONO : FONT, color:C.acc, alpha:clamp(e)}); txt(b, x, y + 40, {size:24, weight:600, color:C.muted, alpha:clamp(e)});
+  });
+  rise('注意力，就是你需要的一切', W/2, 600, t, 79.0, {size:64, weight:900, glow:22});
+  rise('关注拾星，一起看懂 AI', W/2, 760, t, 79.8, {size:36, weight:500, color:C.muted});
+}
+
+/* ============ 总调度 ============ */
+const SCENES = [[s1,-1,7],[s2,7,19],[s3,19,34],[s4,34,45],[s5,45,56],[s6,56,67],[s7,67,78],[s8,78,84]];
+function draw(t){
+  t = clamp(t, 0, DUR);
+  ctx.save(); ctx.globalAlpha = 1; ctx.clearRect(0,0,W,H); background(t);
+  for (const [fn,a,b] of SCENES){
+    if (t < a || t > b) continue;
+    SA = sceneA(t, a, b, b === DUR ? .8 : .5);
+    if (SA > 0){ ctx.save(); fn(t); ctx.restore(); }
+  }
+  SA = 1; vignette();
+  const fo = p(t, DUR - .8, DUR);
+  if (fo > 0){ ctx.globalAlpha = fo; ctx.fillStyle = '#000'; ctx.fillRect(0,0,W,H); }
+  ctx.restore();
+}
+
+/* ============ 播放器 / 逐帧渲染接口 ============ */
+const isRender = new URLSearchParams(location.search).has('render');
+window.DURATION = DUR;
+window.renderFrame = t => draw(t);
+const btn = document.getElementById('btn'), seek = document.getElementById('seek'), timeEl = document.getElementById('time');
+const fmt = s => `${Math.floor(s/60)}:${String(Math.floor(s%60)).padStart(2,'0')}`;
+function fit(){
+  if (isRender){ cv.style.width = W+'px'; cv.style.height = H+'px'; return; }
+  const w = Math.min(innerWidth - 32, (innerHeight - 84)*16/9);
+  cv.style.width = w + 'px'; cv.style.height = w*9/16 + 'px';
+}
+addEventListener('resize', fit); fit();
+
+let cur = 0, playing = !isRender, last = null;
+function toggle(){ if (cur >= DUR) cur = 0; playing = !playing; }
+btn.onclick = toggle; cv.onclick = toggle;
+addEventListener('keydown', e => { if (e.code === 'Space'){ e.preventDefault(); toggle(); } });
+seek.oninput = () => { cur = +seek.value; draw(cur); };
+function loop(ts){
+  if (playing && last != null){ cur += (ts - last)/1000; if (cur >= DUR){ cur = DUR; playing = false; } }
+  last = ts; draw(cur);
+  seek.value = cur; timeEl.textContent = `${fmt(cur)} / ${fmt(DUR)}`;
+  btn.textContent = playing ? '❚❚' : (cur >= DUR ? '↺' : '▶');
+  requestAnimationFrame(loop);
+}
+document.fonts.ready.then(() => {
+  window.ready = true;
+  if (isRender) draw(0); else requestAnimationFrame(loop);
+});
+</script>
+</body>
+</html>
