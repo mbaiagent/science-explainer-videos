@@ -226,6 +226,6 @@ function rnd(seed) {
 - WPS. How Claude Opus 5.5 Generates Videos with Code. wps.com
 - Playwright 官方文档：playwright.dev
 - FFmpeg 官方文档：ffmpeg.org
-- 本系列源代码：github.com/mbwjs/science-explainer-videos
+- 本系列源代码：github.com/mbaiagent/science-explainer-videos
 
 </div>
