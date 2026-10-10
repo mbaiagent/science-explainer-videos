@@ -195,7 +195,7 @@ CPU 轮流切换 → 进程与隔离 → 线程与竞态条件 → 上下文切�
 
 ## 预览
 
-在线播放：https://mbaiagent.github.io/science-explainer-videos/ （需仓库开启 GitHub Pages）
+在线播放：https://explainer.aipulse.lol/
 
 首页按「AI 与大模型」「计算机与后端」「心理学 · 人生」分类，只列横屏版；竖屏版文件仍保留在 `happiness/vertical.html`。新增视频时在 `index.html` 的 `VIDEOS` 数组里加一行即可。
 
