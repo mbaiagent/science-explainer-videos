@@ -120,9 +120,9 @@ function render(){
     if (!vs.length) return '';
     return `<section><h2>${esc(c.name)} <small>${vs.length} 部</small></h2><div class="grid">` +
       vs.map(v => { const art = v.path.replace(/[^/]+$/, 'article.html');
-        return `<div class="card" style="--accent:${v.color}"><b>${esc(v.title)}</b><span class="d">${esc(v.desc)}</span>` +
-          `<div class="acts"><a class="play" href="${v.path}">▶ 看视频 · ${fmt(v.dur)}</a>` +
-          (v.article === false ? `<a class="read off">📖 文章撰写中</a>` : `<a class="read" href="${art}">📖 读文章</a>`) + `</div></div>`; }).join('') +
+        return `<div class="card" style="--accent:${v.color};cursor:pointer" onclick="location.href='${v.path}'"><b>${esc(v.title)}</b><span class="d">${esc(v.desc)}</span>` +
+          `<div class="acts"><a class="play" href="${v.path}" onclick="event.stopPropagation()">▶ 看视频 · ${fmt(v.dur)}</a>` +
+          (v.article === false ? `<a class="read off">📖 文章撰写中</a>` : `<a class="read" href="${art}" onclick="event.stopPropagation()">📖 读文章</a>`) + `</div></div>`; }).join('') +
       `</div></section>`;
   }).join('');
   document.querySelectorAll('.tab').forEach(b => b.onclick = () => { cur = b.dataset.id; render(); });
