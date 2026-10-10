@@ -101,7 +101,7 @@ def causal_self_attention(X, Wq, Wk, Wv):
 rng = np.random.default_rng(0)
 n, d_model, d = 5, 16, 8
 X = rng.normal(size=(n, d_model))
-Wq, Wk, Wv = (rng.normal(size=(d_model, d)) for _ in range(3))
+Wq, Wk, Wv = (rng.normal(size=(d_model, d)) * 0.2 for _ in range(3))   # 随机初始化的小权重
 out, w = causal_self_attention(X, Wq, Wk, Wv)
 print(out.shape)          # (5, 8)
 print(np.round(w, 2))     # 下三角矩阵：每个位置只关注自己和前面的 token
