@@ -1,0 +1,428 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Raft：让多台机器达成一致 · 拾星</title>
+<style>
+  :root{--bg:#07080f;--fg:#f4ede4;--muted:#9a93a8;--acc:#fef08a}
+  html,body{margin:0;height:100%;background:var(--bg);color:var(--fg);
+    font-family:-apple-system,"PingFang SC","Noto Sans SC","Noto Sans CJK SC","Microsoft YaHei",sans-serif}
+  body{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;overflow:hidden}
+  #stage{display:block;background:#07080f;border-radius:12px;box-shadow:0 20px 60px rgba(0,0,0,.55);cursor:pointer}
+  #bar{display:flex;align-items:center;gap:12px;width:min(calc(100vw - 32px),640px)}
+  #btn{width:40px;height:40px;border-radius:50%;border:1px solid rgba(254,240,138,.5);background:transparent;
+    color:var(--acc);font-size:16px;cursor:pointer;flex:none}
+  #seek{flex:1;accent-color:var(--acc)}
+  #time{font-variant-numeric:tabular-nums;font-size:13px;color:var(--muted);min-width:84px;text-align:right}
+  body.render{display:block}
+  body.render #bar{display:none}
+  body.render #stage{border-radius:0;box-shadow:none}
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="bar">
+  <button id="btn" aria-label="播放/暂停">❚❚</button>
+  <input id="seek" type="range" min="0" max="84" step="0.01" value="0">
+  <span id="time">0:00 / 1:24</span>
+</div>
+<script>
+/* ============ 基础设置（横屏 1920×1080） ============ */
+const W = 1920, H = 1080, DUR = 84;
+const cv = document.getElementById('stage'), ctx = cv.getContext('2d');
+cv.width = W; cv.height = H;
+const FONT = '"PingFang SC","Noto Sans SC","Noto Sans CJK SC","Source Han Sans SC","Microsoft YaHei",sans-serif';
+const MONO = '"JetBrains Mono","SF Mono",Menlo,Consolas,"DejaVu Sans Mono","Noto Sans Mono CJK SC","PingFang SC","Microsoft YaHei",monospace';
+const C = {acc:'#fef08a', mint:'#6ee7c8', gold:'#ffd38a', coral:'#ff9e7a', rose:'#ff8a8a', blue:'#9cc3ff', text:'#f4ede4', muted:'#9a93a8', dim:'#4a4558', panel:'#0f0e1f'};
+
+const clamp = (x,a=0,b=1) => Math.max(a, Math.min(b, x));
+const lerp = (a,b,t) => a + (b-a)*t;
+const p = (t,a,b) => clamp((t-a)/(b-a));
+const eo = x => 1 - Math.pow(1-x, 3);
+const eio = x => x < .5 ? 4*x*x*x : 1 - Math.pow(-2*x+2, 3)/2;
+const eback = x => { const c1=1.70158, c3=c1+1; return 1 + c3*Math.pow(x-1,3) + c1*Math.pow(x-1,2); };
+function rnd(seed){ let s = seed>>>0; return () => { s = (s*1664525 + 1013904223)>>>0; return s/4294967296; }; }
+
+let SA = 1;
+const al = a => { ctx.globalAlpha = clamp(SA*a); };
+const sceneA = (t,a,b,f=.5) => Math.min(p(t,a,a+f), 1 - p(t,b-f,b));
+
+function txt(s, x, y, o = {}){
+  const {size=64, weight=700, color=C.text, alpha=1, align='center', glow=0, scale=1, font=FONT} = o;
+  if (alpha <= 0) return;
+  ctx.save(); al(alpha);
+  ctx.font = `${weight} ${size}px ${font}`;
+  ctx.textAlign = align; ctx.textBaseline = 'middle'; ctx.fillStyle = color;
+  if (glow){ ctx.shadowColor = color; ctx.shadowBlur = glow; }
+  if (scale !== 1){ ctx.translate(x, y); ctx.scale(scale, scale); ctx.fillText(s, 0, 0); }
+  else ctx.fillText(s, x, y);
+  ctx.restore();
+}
+function rise(s, x, y, t, t0, o = {}, d = .7){
+  const e = eo(p(t, t0, t0+d));
+  if (e <= 0) return;
+  txt(s, x, y + (1-e)*36, {...o, alpha:(o.alpha ?? 1)*e});
+}
+function rr(x,y,w,h,r){ ctx.beginPath(); ctx.roundRect(x,y,w,h,r); }
+function box(x, y, w, h, a, o = {}){
+  const {fill='rgba(255,255,255,.05)', stroke='rgba(254,240,138,.35)', lw=2, glow=0, r=18, dash=null} = o;
+  if (a <= 0) return;
+  ctx.save(); al(a); rr(x, y, w, h, r); ctx.fillStyle = fill; ctx.fill();
+  if (dash) ctx.setLineDash(dash);
+  ctx.strokeStyle = stroke; ctx.lineWidth = lw; if (glow){ ctx.shadowColor = stroke; ctx.shadowBlur = glow; } ctx.stroke(); ctx.restore();
+}
+function arrow(x1, y1, x2, y2, e, a, color = C.acc, lw = 3){
+  if (e <= 0 || a <= 0) return;
+  const x = lerp(x1, x2, e), y = lerp(y1, y2, e), ang = Math.atan2(y2 - y1, x2 - x1);
+  ctx.save(); al(a); ctx.strokeStyle = color; ctx.fillStyle = color; ctx.lineWidth = lw; ctx.lineCap = 'round';
+  ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x, y); ctx.stroke();
+  if (e > .85){ ctx.translate(x, y); ctx.rotate(ang); ctx.beginPath(); ctx.moveTo(4, 0); ctx.lineTo(-14, -9); ctx.lineTo(-14, 9); ctx.closePath(); ctx.fill(); }
+  ctx.restore();
+}
+function panel(x, y, w, h, title, a){
+  box(x, y, w, h, a, {fill:C.panel, stroke:'rgba(255,255,255,.1)', r:20});
+  if (a <= 0) return;
+  ctx.save(); al(a); ctx.strokeStyle = 'rgba(255,255,255,.07)'; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(x, y + 52); ctx.lineTo(x + w, y + 52); ctx.stroke();
+  ['#ff6b6b','#ffd166','#6ee7a0'].forEach((c, i) => { ctx.fillStyle = c; ctx.globalAlpha = clamp(SA*a*.8); ctx.beginPath(); ctx.arc(x + 30 + i*24, y + 26, 7, 0, 6.283); ctx.fill(); });
+  ctx.restore();
+  txt(title, x + w/2, y + 27, {size:22, weight:500, color:C.muted, font:MONO, alpha:a});
+}
+
+/* ============ 背景 ============ */
+const PARTS = (() => { const r = rnd(311); return Array.from({length:100}, () => ({
+  x:r()*W, y:r()*H, s:r()*2.2+.5, v:r()*12+4, ph:r()*6.283, c:r()<.25})); })();
+function background(t){
+  const g = ctx.createLinearGradient(0,0,W,H);
+  g.addColorStop(0,'#0a0916'); g.addColorStop(.55,'#110f24'); g.addColorStop(1,'#18122c');
+  ctx.globalAlpha = 1; ctx.fillStyle = g; ctx.fillRect(0,0,W,H);
+  const gx = W*.5 + Math.sin(t*.27)*140;
+  const rg = ctx.createRadialGradient(gx, H*.45, 0, gx, H*.45, 950);
+  rg.addColorStop(0,'rgba(254,240,138,0.09)'); rg.addColorStop(1,'rgba(254,240,138,0)');
+  ctx.fillStyle = rg; ctx.fillRect(0,0,W,H);
+  ctx.fillStyle = C.acc;
+  for (let x = 40; x < W; x += 80) for (let y = 40; y < H; y += 80){ ctx.globalAlpha = .06; ctx.fillRect(x, y, 2, 2); }
+  for (const q of PARTS){
+    const y = ((q.y - t*q.v) % H + H) % H, x = q.x + Math.sin(t*.35 + q.ph)*12;
+    ctx.globalAlpha = .2 + .3*(.5 + .5*Math.sin(t*1.2 + q.ph));
+    ctx.fillStyle = q.c ? C.acc : '#d8d0ff';
+    ctx.beginPath(); ctx.arc(x, y, q.s, 0, 6.283); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+}
+function vignette(){
+  const v = ctx.createRadialGradient(W/2, H/2, W*.28, W/2, H/2, W*.62);
+  v.addColorStop(0,'rgba(0,0,0,0)'); v.addColorStop(1,'rgba(0,0,0,.55)');
+  ctx.globalAlpha = 1; ctx.fillStyle = v; ctx.fillRect(0,0,W,H);
+}
+function codeLine(s, x, y, size, a, kw = /\b(public|class|static|void|new|return)\b/){
+  const parts = s.split(/("[^"]*"|\b(?:public|class|static|void|new|return|getstatic|ldc|invokevirtual)\b)/g);
+  ctx.save(); al(a); ctx.font = `500 ${size}px ${MONO}`; ctx.textBaseline = 'middle'; ctx.textAlign = 'left';
+  let xx = x;
+  for (const seg of parts){ if (!seg) continue;
+    ctx.fillStyle = seg.startsWith('"') ? C.mint : /^(public|class|static|void|new|return|getstatic|ldc|invokevirtual)$/.test(seg) ? C.acc : C.text;
+    ctx.fillText(seg, xx, y); xx += ctx.measureText(seg).width; }
+  ctx.restore();
+}
+
+function card(h, lines, x, y, w, hh, a, c = C.acc, o = {}){
+  const {hs=30, ls=22, lh=40} = o;
+  box(x, y, w, hh, a, {fill:'rgba(254,240,138,.05)', stroke:c === C.acc ? 'rgba(254,240,138,.5)' : c, r:20});
+  txt(h, x + 30, y + 44, {size:hs, weight:900, color:c, align:'left', alpha:a});
+  lines.forEach((s, i) => txt(s, x + 30, y + 96 + i*lh, {size:ls, weight:600, color:'#d9d2e4', align:'left', alpha:a}));
+}
+const TC = {1:'#9cc3ff', 2:'#6ee7c8', 3:'#ff9e7a', 4:'#ff8a8a'};
+function ent(x, y, term, cmd, a, o = {}){
+  const {w = 104, h = 70, dash = null, dim = 1} = o, c = TC[term];
+  if (a <= 0) return;
+  box(x, y, w, h, a*dim, {fill:dash ? 'rgba(255,255,255,.03)' : 'rgba(255,255,255,.08)', stroke:c, r:10, dash, lw:dash ? 2 : 2.5});
+  txt('T' + term, x + 10, y + 18, {size:18, weight:800, font:MONO, color:c, align:'left', alpha:a*dim});
+  txt(cmd, x + w/2, y + 46, {size:22, weight:800, font:MONO, color:C.text, alpha:a*dim});
+}
+function ring(x, y, r, a, c, lw = 3){
+  if (a <= 0) return;
+  ctx.save(); al(a); ctx.strokeStyle = c; ctx.lineWidth = lw; ctx.beginPath(); ctx.arc(x, y, r, 0, 6.283); ctx.stroke(); ctx.restore();
+}
+function disc(x, y, r, a, c){
+  if (a <= 0) return;
+  ctx.save(); al(a); ctx.fillStyle = c; ctx.beginPath(); ctx.arc(x, y, r, 0, 6.283); ctx.fill(); ctx.restore();
+}
+function srv(name, x, y, a, c = C.text, r = 60, o = {}){
+  const {fill = 'rgba(255,255,255,.06)', sub, subc = C.muted, lw = 3} = o;
+  disc(x, y, r, a, fill); ring(x, y, r, a, c, lw);
+  txt(name, x, y, {size:30, weight:900, color:c, alpha:a});
+  if (sub) txt(sub, x, y + r + 28, {size:20, weight:800, color:subc, alpha:a});
+}
+function timer(x, y, r, frac, a, c){
+  if (a <= 0 || frac <= 0) return;
+  ctx.save(); al(a); ctx.strokeStyle = c; ctx.lineWidth = 6; ctx.lineCap = 'round';
+  ctx.beginPath(); ctx.arc(x, y, r, -Math.PI/2, -Math.PI/2 + 6.283*clamp(frac)); ctx.stroke(); ctx.restore();
+}
+function cross(x, y, s, a, c = C.rose){
+  if (a <= 0) return;
+  ctx.save(); al(a); ctx.strokeStyle = c; ctx.lineWidth = 7; ctx.lineCap = 'round'; ctx.beginPath();
+  ctx.moveTo(x - s, y - s); ctx.lineTo(x + s, y + s); ctx.moveTo(x + s, y - s); ctx.lineTo(x - s, y + s); ctx.stroke(); ctx.restore();
+}
+function bolt(x, y1, y2, a){
+  if (a <= 0) return;
+  ctx.save(); al(a); ctx.strokeStyle = C.gold; ctx.lineWidth = 5; ctx.lineJoin = 'round'; ctx.beginPath(); ctx.moveTo(x, y1);
+  const n = 8; for (let i = 1; i <= n; i++) ctx.lineTo(x + (i % 2 ? 22 : -22)*(i < n ? 1 : 0), lerp(y1, y2, i/n)); ctx.stroke(); ctx.restore();
+}
+
+/* ============ 场景 1 · 钩子：脑裂 (0–7s) ============ */
+function s1(t){
+  rise('主库宕机了，两台从库都觉得「该我上了」', W/2, 110, t, .2, {size:52, weight:900});
+  const a = eo(p(t, .7, 1.2)), dead = t > 1.6;
+  srv('主', 960, 340, a, dead ? C.dim : C.text, 74, {sub:dead ? '宕机' : '主库', subc:dead ? C.rose : C.muted});
+  cross(960, 340, 40, eo(p(t, 1.6, 2)));
+  const b = eo(p(t, 2.2, 2.6)), up = t > 2.4;
+  [[540, 'x=1'], [1380, 'x=2']].forEach(([x, w], i) => {
+    srv(up ? '主' : '从', x, 560, a, up ? C.rose : C.text, 74, {sub:up ? '「我是新主库！」' : '从库', subc:up ? C.rose : C.muted});
+    const e = eo(p(t, 3 + i*.3, 3.4 + i*.3));
+    box(x - 110 + (i ? 260 : -260), 530, 220, 60, e, {fill:'rgba(255,255,255,.06)', stroke:'rgba(255,255,255,.3)', r:14});
+    txt('写入 ' + w, x + (i ? 260 : -260), 560, {size:24, weight:800, font:MONO, alpha:e});
+    arrow(x + (i ? 145 : -145), 560, x + (i ? 84 : -84), 560, e, e, C.text, 3); });
+  ctx.save(); al(b*.8); ctx.strokeStyle = 'rgba(255,255,255,.35)'; ctx.setLineDash([12, 12]); ctx.lineWidth = 3; ctx.beginPath(); ctx.moveTo(630, 560); ctx.lineTo(1290, 560); ctx.stroke(); ctx.restore();
+  txt('⚡ 网络不通，互相联系不上', 960, 520, {size:24, weight:800, color:C.gold, alpha:b});
+  const c = eo(p(t, 3.9, 4.4));
+  box(380, 730, 1160, 100, c, {fill:'rgba(255,138,138,.10)', stroke:C.rose, r:20, glow:14});
+  txt('脑裂：两个主库同时接受写入，数据从此对不上', W/2, 780, {size:34, weight:900, color:C.rose, alpha:c});
+  rise('Raft：让一群机器对「谁是 Leader、日志是什么」达成一致', W/2, 930, t, 5.2, {size:36, weight:900, color:C.acc});
+}
+
+/* ============ 场景 2 · 复制状态机 (7–18s) ============ */
+function s2(t){
+  rise('为什么需要共识：复制状态机', W/2, 90, t, 7.2, {size:54, weight:900});
+  const a = eo(p(t, 7.6, 8.1));
+  box(110, 330, 220, 100, a, {fill:'rgba(255,255,255,.06)', stroke:'rgba(255,255,255,.35)', r:18});
+  txt('客户端', 220, 380, {size:30, weight:900, alpha:a});
+  arrow(340, 380, 470, 380, eo(p(t, 8.2, 8.7)), a, C.acc, 3);
+  const cmds = [['x=1', 1], ['y=2', 1], ['z=3', 2]], down = eo(p(t, 14.6, 15));
+  for (let i = 0; i < 5; i++){ const x = 500 + i*270, e = eo(p(t, 8.4 + i*.2, 8.8 + i*.2)), dim = i >= 3 ? 1 - down*.65 : 1;
+    box(x, 170, 240, 430, e*dim, {fill:'rgba(255,255,255,.03)', stroke:'rgba(255,255,255,.2)', r:20});
+    txt('S' + (i + 1), x + 120, 210, {size:28, weight:900, color:C.acc, alpha:e*dim});
+    txt('日志', x + 22, 250, {size:18, weight:700, color:C.muted, align:'left', alpha:e*dim});
+    cmds.forEach(([c, tm], j) => ent(x + 22 + j*68, 270, tm, c, eo(p(t, 9.2 + j*.4 + i*.05, 9.6 + j*.4 + i*.05))*dim, {w:62, h:70}));
+    txt('状态机', x + 22, 395, {size:18, weight:700, color:C.muted, align:'left', alpha:e*dim});
+    const sm = eo(p(t, 10.8, 11.3));
+    box(x + 22, 415, 196, 150, sm*dim, {fill:'rgba(254,240,138,.06)', stroke:'rgba(254,240,138,.4)', r:12});
+    ['x = 1', 'y = 2', 'z = 3'].forEach((s, j) => txt(s, x + 120, 448 + j*42, {size:22, weight:800, font:MONO, alpha:sm*dim}));
+    if (i >= 3) cross(x + 120, 385, 60, down); }
+  txt('每台机器保存同一串日志，按同样的顺序执行 → 得到同样的状态', W/2, 670, {size:30, weight:800, color:C.gold, alpha:eo(p(t, 11.6, 12))});
+  txt('共识算法要解决的，就是让多台机器对这串日志达成一致', W/2, 725, {size:24, weight:700, color:C.muted, alpha:eo(p(t, 12.3, 12.7))});
+  card('容错', ['5 台坏 2 台，剩下 3 台仍是多数，照常工作', '2f + 1 台机器，可以容忍 f 台故障'], 110, 790, 560, 200, eo(p(t, 13.6, 14.1)), C.acc, {ls:21});
+  card('多数派', ['任意两个多数派至少有一台重叠', '这是不会出现「两个结果」的关键'], 690, 790, 540, 200, eo(p(t, 15.2, 15.7)), C.mint, {ls:21});
+  card('为什么用奇数台', ['4 台也只能容忍 1 台故障', '和 3 台一样，还多一台开销'], 1250, 790, 560, 200, eo(p(t, 16.2, 16.7)), C.blue, {ls:21});
+}
+
+/* ============ 场景 3 · 角色与任期 (18–30s) ============ */
+function s3(t){
+  rise('三种角色，一个任期号', W/2, 90, t, 18.2, {size:56, weight:900});
+  const R = [['Follower', '被动：响应请求', 250, 330, C.blue, 18.6], ['Candidate', '拉票中', 750, 330, C.mint, 19], ['Leader', '处理写请求、发心跳', 500, 660, C.acc, 19.4]];
+  R.forEach(([h, d, x, y, c, ts]) => { const e = eo(p(t, ts, ts + .5));
+    box(x - 160, y - 60, 320, 120, e, {fill:'rgba(255,255,255,.05)', stroke:c, r:20, lw:3});
+    txt(h, x, y - 16, {size:34, weight:900, color:c, alpha:e}); txt(d, x, y + 28, {size:20, weight:700, color:C.muted, alpha:e}); });
+  const A = (x1, y1, x2, y2, ts, label, lx, ly, c, al2 = 'center') => { const e = eo(p(t, ts, ts + .5));
+    arrow(x1, y1, x2, y2, e, e, c, 3); txt(label, lx, ly, {size:20, weight:800, color:c, align:al2, alpha:eo(p(t, ts + .3, ts + .7))}); };
+  A(410, 305, 590, 305, 20.2, '选举超时', 500, 270, C.mint);
+  A(590, 360, 410, 360, 21.6, '发现 Leader / 更高任期', 500, 410, C.blue);
+  A(720, 392, 590, 598, 20.9, '获得多数票', 700, 520, C.acc, 'left');
+  A(420, 598, 270, 392, 22.3, '发现更高任期', 300, 520, C.rose, 'right');
+  txt('超时还没选出来：任期 +1，再来一轮', 750, 228, {size:20, weight:700, color:C.muted, alpha:eo(p(t, 22.8, 23.2))});
+  const b = eo(p(t, 23.4, 23.9)), segs = [[1, 1020, 260, true], [2, 1290, 230, true], [3, 1530, 80, false], [4, 1620, 180, true]];
+  txt('时间 →', 1800, 230, {size:20, weight:700, color:C.muted, align:'right', alpha:b});
+  segs.forEach(([n, x, w, ok], i) => { const e = eo(p(t, 23.6 + i*.3, 24 + i*.3));
+    txt('任期 ' + n, x + w/2, 270, {size:20, weight:800, color:ok ? C.text : C.rose, alpha:e});
+    box(x, 295, ok ? 50 : w - 10, 44, e, {fill:'rgba(110,231,200,.35)', stroke:C.mint, r:8});
+    if (ok) box(x + 54, 295, w - 64, 44, e, {fill:'rgba(156,195,255,.25)', stroke:C.blue, r:8}); });
+  txt('■ 选举', 1020, 375, {size:20, weight:700, color:C.mint, align:'left', alpha:b}); txt('■ 有 Leader，正常工作', 1140, 375, {size:20, weight:700, color:C.blue, align:'left', alpha:b});
+  txt('任期 3：选票被瓜分，没选出 Leader', 1580, 375, {size:20, weight:700, color:C.rose, alpha:eo(p(t, 25, 25.4))});
+  ['任期（term）：只增不减的整数，相当于逻辑时钟', '每个任期最多只有一个 Leader', '每条消息都带上任期号：', '　看到更大的任期 → 更新自己，退回 Follower', '　看到更小的任期 → 拒绝这条消息'].forEach((s, i) =>
+    txt(s, 1020, 460 + i*56, {size:24, weight:700, color:i >= 3 ? C.gold : C.text, align:'left', alpha:eo(p(t, 25.6 + i*.5, 26 + i*.5))}));
+  rise('任期号让「过时的 Leader」一眼就能被认出来', W/2, 900, t, 28.4, {size:36, weight:900, color:C.gold});
+}
+
+/* ============ 场景 4 · 领导者选举 (30–43s) ============ */
+function s4(t){
+  rise('领导者选举', W/2, 90, t, 30.2, {size:56, weight:900});
+  const cx = 560, cy = 580, R = 290, TO = [260, 210, 155, 280, 230];
+  const P = i => [cx + R*Math.cos(-Math.PI/2 + i*1.2566), cy + R*Math.sin(-Math.PI/2 + i*1.2566)];
+  const a = eo(p(t, 30.6, 31.1)), T0 = 31, cand = 2;
+  const isCand = t >= 33, isLead = t >= 35.2;
+  for (let i = 0; i < 5; i++){ const [x, y] = P(i);
+    let c = C.text, sub = 'Follower', subc = C.muted, frac;
+    if (i === cand && isCand){ c = isLead ? C.acc : C.mint; sub = isLead ? 'Leader · 任期 2' : 'Candidate · 任期 2'; subc = c; }
+    srv('S' + (i + 1), x, y, a, c, 62, {sub, subc, fill:i === cand && isLead ? 'rgba(254,240,138,.12)' : 'rgba(255,255,255,.06)'});
+    if (i === cand) frac = isCand ? 0 : 1 - (t - T0)/2;
+    else { const voted = t > 33.8 + i*.05; frac = voted ? (isLead ? 1 - ((t - 35.2) % .8)/4 : 1) : 1 - (t - T0)/(2*TO[i]/155); }
+    timer(x, y, 78, frac, a*.9, i === cand ? C.mint : C.blue); }
+  txt('外圈 = 选举超时倒计时', cx, 175, {size:20, weight:700, color:C.muted, alpha:a});
+  const [ox, oy] = P(cand);
+  for (let i = 0; i < 5; i++){ if (i === cand) continue; const [x, y] = P(i), dx = x - ox, dy = y - oy, d = Math.hypot(dx, dy), ux = dx/d, uy = dy/d;
+    const nx = -uy*9, ny = ux*9, g0 = 92, g1 = 125;
+    arrow(ox + ux*g0 + nx, oy + uy*g0 + ny, x - ux*g1 + nx, y - uy*g1 + ny, eo(p(t, 33.3, 33.9)), clamp(1 - p(t, 36, 36.5)), C.mint, 3);
+    arrow(x - ux*g1 - nx, y - uy*g1 - ny, ox + ux*g0 - nx, oy + uy*g0 - ny, eo(p(t, 34.3, 34.9)), clamp(1 - p(t, 36, 36.5)), C.gold, 3); }
+  txt('→ RequestVote（拉票）', 110, 1000, {size:20, weight:800, color:C.mint, align:'left', alpha:eo(p(t, 33.5, 33.9))*clamp(1 - p(t, 36, 36.5))});
+  txt('← 同意投票', 420, 1000, {size:20, weight:800, color:C.gold, align:'left', alpha:eo(p(t, 34.6, 35))*clamp(1 - p(t, 36, 36.5))});
+  if (t > 36.2){ const ph = ((t - 36.2) % .8)/.8;
+    for (let i = 0; i < 5; i++){ if (i === cand) continue; const [x, y] = P(i); disc(lerp(ox, x, ph), lerp(oy, y, ph), 8, (1 - ph)*eo(p(t, 36.2, 36.6)), C.acc); }
+    txt('心跳', ox + 110, oy - 40, {size:22, weight:800, color:C.acc, align:'left', alpha:eo(p(t, 36.2, 36.6))}); }
+  const S = [['① 一段时间没收到 Leader 的心跳 → 超时', 31.5], ['② 任期 +1，变成 Candidate，先投自己一票', 33], ['③ 向所有节点发 RequestVote', 33.5], ['④ 每个任期每个节点只投一票，先到先得', 34.2], ['⑤ 拿到多数票（5 台中 ≥ 3 票）→ Leader', 35.2], ['⑥ 马上发心跳，压住其他节点的选举', 35.8]];
+  S.forEach(([s, ts], i) => txt(s, 1080, 200 + i*54, {size:23, weight:700, color:i === 4 ? C.acc : C.text, align:'left', alpha:eo(p(t, ts, ts + .4))}));
+  card('随机超时', ['每个节点在 150～300 ms 里随机选一个超时', '通常只有一个节点先醒，避免同时参选、瓜分选票'], 1060, 560, 760, 200, eo(p(t, 37.4, 37.9)), C.mint, {ls:21});
+  card('投票限制', ['只投给日志「不比自己旧」的候选人：', '先比最后一条日志的任期，任期相同再比长度'], 1060, 790, 760, 200, eo(p(t, 39.4, 39.9)), C.gold, {ls:21});
+}
+
+/* ============ 场景 5 · 日志复制 (43–56s) ============ */
+function s5(t){
+  rise('日志复制：多数派确认才算提交', W/2, 90, t, 43.2, {size:54, weight:900});
+  const a = eo(p(t, 43.6, 44.1)), X = j => 300 + j*124, Y = i => 200 + i*104;
+  ['#1', '#2', '#3'].forEach((s, j) => txt(s, X(j) + 52, 170, {size:20, weight:700, font:MONO, color:C.muted, alpha:a}));
+  const arrive = [0, 45.6, 45.9, 47.4, 99], acked = [0, 46.3, 46.6, 48.1, 99];
+  const commitT = 46.8, fCommitT = 49.4;
+  for (let i = 0; i < 5; i++){ const y = Y(i) + 20, down = i === 4;
+    txt('S' + (i + 1), 140, y + 20, {size:28, weight:900, color:i ? (down ? C.dim : C.text) : C.acc, align:'left', alpha:a});
+    txt(i ? (down ? '宕机' : 'Follower') : 'Leader', 140, y + 52, {size:18, weight:700, color:down ? C.rose : C.muted, align:'left', alpha:a});
+    ent(X(0), y, 1, 'x=1', a, {dim:down ? .35 : 1}); ent(X(1), y, 1, 'y=2', a, {dim:down ? .35 : 1});
+    const has = i === 0 ? t > 44.9 : t > arrive[i];
+    if (has){ const committed = i === 0 ? t > commitT : t > fCommitT;
+      ent(X(2), y, 2, 'z=3', eo(p(t, i ? arrive[i] : 44.9, (i ? arrive[i] : 44.9) + .3)), {dash:committed ? null : [8, 6]}); }
+    if (i && t > acked[i]) txt('✓ 成功', 700, y + 35, {size:22, weight:800, color:C.mint, align:'left', alpha:eo(p(t, acked[i], acked[i] + .3))});
+    if (i === 3) txt('（慢）', 800, y + 35, {size:20, weight:700, color:C.muted, align:'left', alpha:eo(p(t, 45.9, 46.3))*(t < acked[3] ? 1 : 0)}); }
+  const ca = eo(p(t, 44.3, 44.8));
+  box(880, 190, 200, 64, ca, {fill:'rgba(255,255,255,.06)', stroke:'rgba(255,255,255,.35)', r:14});
+  txt('客户端', 980, 222, {size:24, weight:900, alpha:ca});
+  arrow(875, 222, 680, 222, eo(p(t, 44.4, 44.9)), ca, C.text, 3);
+  txt('SET z=3', 778, 196, {size:18, weight:800, font:MONO, color:C.muted, alpha:ca});
+  for (let i = 1; i < 5; i++){ const k = p(t, 45.2, i < 4 ? arrive[i] : 46.2); if (k > 0 && k < 1) disc(X(2) + 52, lerp(Y(0) + 92, Y(i) + 55, k), 10, 1, C.acc); }
+  txt('AppendEntries', X(2) + 120, Y(1) - 10 + 8, {size:18, weight:800, font:MONO, color:C.acc, align:'left', alpha:eo(p(t, 45.3, 45.7))*clamp(1 - p(t, 48.6, 49))});
+  const n = 1 + [1, 2, 3].filter(i => t > acked[i]).length;
+  txt('已确认 ' + Math.min(n, 5) + ' / 5', 980, 420, {size:34, weight:900, font:MONO, color:n >= 3 ? C.acc : C.text, alpha:eo(p(t, 45.6, 46))});
+  txt(n >= 3 ? '≥ 3：提交！' : '含 Leader 自己', 980, 470, {size:24, weight:800, color:n >= 3 ? C.acc : C.muted, alpha:eo(p(t, 45.6, 46))});
+  txt('回复客户端：OK', 980, 300, {size:22, weight:800, color:C.mint, alpha:eo(p(t, 47.2, 47.6))});
+  const ST = [['① Leader 追加到自己的日志（未提交）', 44.9], ['② 并行发 AppendEntries 给所有 Follower', 45.3], ['③ Follower 写入日志后回复成功', 46.3], ['④ 超过半数（含自己）都有了 → 提交', 46.8], ['⑤ Leader 执行命令，回复客户端', 47.2], ['⑥ 下次心跳带上 commitIndex，Follower 也执行', 49.4]];
+  ST.forEach(([s, ts], i) => txt(s, 1160, 210 + i*66, {size:22, weight:700, color:i === 3 ? C.acc : C.text, align:'left', alpha:eo(p(t, ts, ts + .4))}));
+  txt('虚线框 = 还没提交', 1160, 640, {size:20, weight:700, color:C.muted, align:'left', alpha:eo(p(t, 45, 45.4))});
+  card('「提交」意味着什么', ['这条日志已经在多数派上，以后的 Leader 一定有它', '可以安全地执行，并告诉客户端成功'], 110, 760, 900, 220, eo(p(t, 50.6, 51.1)), C.acc, {ls:22, lh:44});
+  card('慢节点、宕机节点', ['不影响提交；Leader 会一直重试，', '直到它们的日志追上来'], 1060, 760, 760, 220, eo(p(t, 52, 52.5)), C.blue, {ls:22, lh:44});
+}
+
+/* ============ 场景 6 · 一致性检查与安全性 (56–67s) ============ */
+function s6(t){
+  rise('日志对不上怎么办？一致性检查', W/2, 90, t, 56.2, {size:54, weight:900});
+  const a = eo(p(t, 56.6, 57.1)), X = j => 330 + j*124, LY = 200, FY = 340;
+  for (let j = 0; j < 5; j++) txt('#' + (j + 1), X(j) + 52, 172, {size:20, weight:700, font:MONO, color:C.muted, alpha:a});
+  txt('Leader', 140, LY + 35, {size:26, weight:900, color:C.acc, align:'left', alpha:a}); txt('Follower', 140, FY + 35, {size:26, weight:900, align:'left', alpha:a});
+  [[1, 'x=1'], [1, 'y=2'], [3, 'a=5'], [3, 'b=6'], [3, 'c=7']].forEach(([tm, c], j) => ent(X(j), LY, tm, c, a));
+  const del = p(t, 61, 61.5), fill = p(t, 61.6, 62.4);
+  [[1, 'x=1'], [1, 'y=2'], [2, 'q=8'], [2, 'r=9']].forEach(([tm, c], j) => { if (j < 2) ent(X(j), FY, tm, c, a); else ent(X(j), FY, tm, c, a*(1 - del)); });
+  [[3, 'a=5'], [3, 'b=6'], [3, 'c=7']].forEach(([tm, c], j) => ent(X(j + 2), FY, tm, c, eo(p(t, 61.6 + j*.25, 61.9 + j*.25)), {}));
+  const tries = [[57.4, 4, 3, false], [58.8, 3, 3, false], [60.2, 2, 1, true]];
+  tries.forEach(([ts, pi, pt, ok], k) => { const e = eo(p(t, ts, ts + .4)), vis = k === 2 ? 1 : clamp(1 - p(t, ts + 1.2, ts + 1.4));
+    if (e <= 0 || vis <= 0) return;
+    const x = X(pi - 1);
+    box(x - 4, LY - 6, 112, 82, e*vis, {fill:'rgba(0,0,0,0)', stroke:C.acc, r:12, lw:3});
+    box(x - 4, FY - 6, 112, 82, e*vis, {fill:'rgba(0,0,0,0)', stroke:ok ? C.mint : C.rose, r:12, lw:3});
+    txt(`AppendEntries(prevIndex=${pi}, prevTerm=${pt})`, 1000, 255, {size:22, weight:800, font:MONO, color:C.acc, align:'left', alpha:e*vis});
+    txt(ok ? '✓ #2 的任期一致：从 #3 开始覆盖' : `✗ 我的 #${pi} 任期是 2，不是 3 → 拒绝`, 1000, 310, {size:22, weight:800, color:ok ? C.mint : C.rose, align:'left', alpha:eo(p(t, ts + .4, ts + .7))*vis});
+    if (!ok) txt('Leader：nextIndex 往前退一格，再试', 1000, 360, {size:22, weight:700, color:C.muted, align:'left', alpha:eo(p(t, ts + .7, ts + 1))*vis}); });
+  txt('Follower 删掉冲突的 #3、#4，换成 Leader 的；Leader 从不改自己的日志', W/2, 470, {size:24, weight:800, color:C.gold, alpha:eo(p(t, 62.2, 62.6))});
+  const b = eo(p(t, 62.8, 63.3));
+  box(110, 530, 1700, 480, b, {fill:'rgba(255,255,255,.03)', stroke:'rgba(255,255,255,.18)', r:24});
+  txt('为什么已提交的日志不会丢？', W/2, 585, {size:34, weight:900, color:C.acc, alpha:b});
+  const DX = i => 560 + i*200, DY = 750;
+  const e1 = eo(p(t, 63.4, 63.9)), e2 = eo(p(t, 64.2, 64.7));
+  box(DX(0) - 80, DY - 80, DX(2) - DX(0) + 160, 160, e1, {fill:'rgba(110,231,200,.08)', stroke:C.mint, r:80, lw:3});
+  box(DX(2) - 70, DY - 70, DX(4) - DX(2) + 140, 140, e2, {fill:'rgba(255,211,138,.08)', stroke:C.gold, r:70, lw:3, dash:[10, 8]});
+  for (let i = 0; i < 5; i++) srv('S' + (i + 1), DX(i), DY, b, i === 2 ? C.acc : C.text, 46, {fill:i === 2 ? 'rgba(254,240,138,.18)' : 'rgba(255,255,255,.06)'});
+  txt('提交：至少 3 台有这条日志', 300, DY, {size:24, weight:800, color:C.mint, alpha:e1});
+  txt('当选：至少拿到 3 票', 1640, DY, {size:24, weight:800, color:C.gold, alpha:e2});
+  txt('两个多数派必有交集（S3），而 S3 只投给日志不比自己旧的人', W/2, 885, {size:26, weight:800, alpha:eo(p(t, 64.8, 65.2))});
+  txt('→ 新 Leader 一定包含所有已提交的日志', W/2, 950, {size:30, weight:900, color:C.acc, alpha:eo(p(t, 65.4, 65.8))});
+}
+
+/* ============ 场景 7 · 网络分区与应用 (67–78s) ============ */
+function s7(t){
+  rise('网络分区时会怎样？Raft 用在哪里？', W/2, 90, t, 67.2, {size:54, weight:900});
+  const a = eo(p(t, 67.6, 68.1)), healed = t > 71.8;
+  box(110, 170, 340, 400, a, {fill:'rgba(255,255,255,.03)', stroke:'rgba(255,255,255,.2)', r:22});
+  box(570, 170, 430, 400, a, {fill:'rgba(255,255,255,.03)', stroke:'rgba(255,255,255,.2)', r:22});
+  txt('少数派（2 台）', 280, 205, {size:22, weight:800, color:C.muted, alpha:a}); txt('多数派（3 台）', 785, 205, {size:22, weight:800, color:C.muted, alpha:a});
+  bolt(510, 190, 550, a*(1 - eo(p(t, 71.8, 72.2))));
+  srv('S1', 280, 300, a, healed ? C.text : C.coral, 52, {sub:healed ? 'Follower · 任期 4' : '旧 Leader · 任期 3', subc:healed ? C.muted : C.coral});
+  srv('S2', 280, 460, a, C.text, 52, {sub:'Follower'});
+  const nl = eo(p(t, 68.6, 69));
+  srv('S3', 680, 300, a, C.text, 52, {sub:'Follower'});
+  srv('S4', 890, 300, a, nl > .5 ? C.acc : C.text, 52, {sub:nl > .5 ? '新 Leader · 任期 4' : 'Follower', subc:nl > .5 ? C.acc : C.muted});
+  srv('S5', 785, 460, a, C.text, 52, {sub:'Follower'});
+  txt('写 w=7：只有 2/5，永远提交不了', 280, 620, {size:22, weight:800, color:C.rose, alpha:eo(p(t, 69.4, 69.8))});
+  txt('写 w=8：3/5，提交成功', 785, 620, {size:22, weight:800, color:C.mint, alpha:eo(p(t, 70.2, 70.6))});
+  txt('网络恢复：S1 看到任期 4，退回 Follower，w=7 被覆盖', 555, 690, {size:24, weight:800, color:C.gold, alpha:eo(p(t, 72, 72.4))});
+  txt('（客户端没收到 w=7 成功的响应，所以不算丢）', 555, 740, {size:20, weight:700, color:C.muted, alpha:eo(p(t, 72.6, 73))});
+  card('谁在用 Raft', ['etcd（Kubernetes 的数据就存在这里）', 'Consul、TiKV、CockroachDB', 'Kafka KRaft（取代 ZooKeeper 管元数据）'], 1060, 160, 760, 250, eo(p(t, 73.2, 73.7)), C.acc, {ls:22, lh:42});
+  card('和 Paxos 的关系', ['解决同一个问题，容错能力相当', '强 Leader、拆成子问题，更容易理解和实现'], 1060, 430, 760, 200, eo(p(t, 74, 74.5)), C.mint, {ls:22, lh:42});
+  card('还没讲的', ['成员变更、日志快照、线性一致读', '都有成熟方案，文章里展开'], 1060, 650, 760, 200, eo(p(t, 74.8, 75.3)), C.blue, {ls:22, lh:42});
+  rise('Raft 是 CP：分区时少数派不能写，换来数据不会错（见《CAP 与 BASE》）', W/2, 930, t, 75.6, {size:30, weight:900, color:C.gold});
+}
+
+/* ============ 场景 8 · 收尾 (78–84s) ============ */
+function s8(t){
+  [['选举', '随机超时 + 多数票'], ['复制', '多数派确认才提交'], ['任期', '更大的任期说了算'], ['安全', '已提交的不会丢']].forEach(([a, b], i) => {
+    const st = 78.2 + i*.25, e = eback(p(t, st, st + .5)); if (e <= 0) return;
+    const x = 330 + i*420, y = 330;
+    ctx.save(); ctx.translate(x, y); ctx.scale(e, e); ctx.translate(-x, -y);
+    box(x - 185, y - 90, 370, 180, clamp(e), {fill:'rgba(254,240,138,.08)', stroke:'rgba(254,240,138,.5)', r:26}); ctx.restore();
+    txt(a, x, y - 22, {size:40, weight:900, color:C.acc, alpha:clamp(e)}); txt(b, x, y + 40, {size:24, weight:600, color:C.muted, alpha:clamp(e)});
+  });
+  rise('少数服从多数，日志一致，状态就一致', W/2, 600, t, 79.2, {size:60, weight:900, glow:22});
+  rise('关注拾星，一起搞懂后端', W/2, 760, t, 80, {size:36, weight:500, color:C.muted});
+}
+/* ============ 总调度 ============ */
+const SCENES = [[s1,-1,7],[s2,7,18],[s3,18,30],[s4,30,43],[s5,43,56],[s6,56,67],[s7,67,78],[s8,78,84]];
+function draw(t){
+  t = clamp(t, 0, DUR);
+  ctx.save(); ctx.globalAlpha = 1; ctx.clearRect(0,0,W,H); background(t);
+  for (const [fn,a,b] of SCENES){
+    if (t < a || t > b) continue;
+    SA = sceneA(t, a, b, b === DUR ? .8 : .5);
+    if (SA > 0){ ctx.save(); fn(t); ctx.restore(); }
+  }
+  SA = 1; vignette();
+  const fo = p(t, DUR - .8, DUR);
+  if (fo > 0){ ctx.globalAlpha = fo; ctx.fillStyle = '#000'; ctx.fillRect(0,0,W,H); }
+  ctx.restore();
+}
+
+/* ============ 播放器 / 逐帧渲染接口 ============ */
+const isRender = new URLSearchParams(location.search).has('render');
+window.DURATION = DUR;
+window.renderFrame = t => draw(t);
+const btn = document.getElementById('btn'), seek = document.getElementById('seek'), timeEl = document.getElementById('time');
+const fmt = s => `${Math.floor(s/60)}:${String(Math.floor(s%60)).padStart(2,'0')}`;
+function fit(){
+  if (isRender){ cv.style.width = W+'px'; cv.style.height = H+'px'; return; }
+  const w = Math.min(innerWidth - 32, (innerHeight - 84)*16/9);
+  cv.style.width = w + 'px'; cv.style.height = w*9/16 + 'px';
+}
+addEventListener('resize', fit); fit();
+
+let cur = 0, playing = !isRender, last = null;
+function toggle(){ if (cur >= DUR) cur = 0; playing = !playing; }
+btn.onclick = toggle; cv.onclick = toggle;
+addEventListener('keydown', e => { if (e.code === 'Space'){ e.preventDefault(); toggle(); } });
+seek.oninput = () => { cur = +seek.value; draw(cur); };
+function loop(ts){
+  if (playing && last != null){ cur += (ts - last)/1000; if (cur >= DUR){ cur = DUR; playing = false; } }
+  last = ts; draw(cur);
+  seek.value = cur; timeEl.textContent = `${fmt(cur)} / ${fmt(DUR)}`;
+  btn.textContent = playing ? '❚❚' : (cur >= DUR ? '↺' : '▶');
+  requestAnimationFrame(loop);
+}
+document.fonts.ready.then(() => {
+  window.ready = true;
+  if (isRender) draw(0); else requestAnimationFrame(loop);
+});
+</script>
+</body>
+</html>

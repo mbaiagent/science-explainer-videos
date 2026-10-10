@@ -102,7 +102,8 @@ const VIDEOS = [
   {cat:'cs', title:"熔断与降级：防止一个服务拖垮全部", desc:"下游一慢全站跟着挂？雪崩、超时重试、熔断三态、降级与舱壁隔离", path:'circuit-breaker/landscape.html', dur:84, color:'#fca5a5'},
   {cat:'cs', title:"负载均衡与一致性哈希", desc:"请求交给谁？四层七层、平滑加权轮询，以及扩容时只挪 1/N 数据的一致性哈希", path:'load-balancing/landscape.html', dur:84, color:'#6ee7b7'},
   {cat:'cs', title:"分库分表与读写分离", desc:"读写分离与主从延迟，垂直/水平拆分、分片策略与分片键，以及拆完后的分页、事务与扩容", path:'sharding/landscape.html', dur:84, color:'#fde68a'},
-  {cat:'cs', title:"volatile 与 Java 内存模型", desc:"另一个线程为什么看不见你的写：JIT 优化、指令重排、happens-before 与双重检查锁", path:'volatile-jmm/landscape.html', dur:84, color:'#d8b4fe'}
+  {cat:'cs', title:"volatile 与 Java 内存模型", desc:"另一个线程为什么看不见你的写：JIT 优化、指令重排、happens-before 与双重检查锁", path:'volatile-jmm/landscape.html', dur:84, color:'#d8b4fe'},
+  {cat:'cs', title:"Raft：让多台机器达成一致", desc:"主库挂了谁接班？任期、选举、日志复制与多数派提交，看 Raft 如何避免脑裂", path:'raft/landscape.html', dur:84, color:'#fef08a'}
 ];
 const fmt = s => `${Math.floor(s/60)}:${String(s%60).padStart(2,'0')}`;
 const esc = s => s.replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
