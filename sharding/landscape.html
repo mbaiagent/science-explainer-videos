@@ -1,0 +1,463 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>分库分表与读写分离 · 拾星</title>
+<style>
+  :root{--bg:#07080f;--fg:#f4ede4;--muted:#9a93a8;--acc:#fde68a}
+  html,body{margin:0;height:100%;background:var(--bg);color:var(--fg);
+    font-family:-apple-system,"PingFang SC","Noto Sans SC","Noto Sans CJK SC","Microsoft YaHei",sans-serif}
+  body{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;overflow:hidden}
+  #stage{display:block;background:#07080f;border-radius:12px;box-shadow:0 20px 60px rgba(0,0,0,.55);cursor:pointer}
+  #bar{display:flex;align-items:center;gap:12px;width:min(calc(100vw - 32px),640px)}
+  #btn{width:40px;height:40px;border-radius:50%;border:1px solid rgba(253,230,138,.5);background:transparent;
+    color:var(--acc);font-size:16px;cursor:pointer;flex:none}
+  #seek{flex:1;accent-color:var(--acc)}
+  #time{font-variant-numeric:tabular-nums;font-size:13px;color:var(--muted);min-width:84px;text-align:right}
+  body.render{display:block}
+  body.render #bar{display:none}
+  body.render #stage{border-radius:0;box-shadow:none}
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="bar">
+  <button id="btn" aria-label="播放/暂停">❚❚</button>
+  <input id="seek" type="range" min="0" max="84" step="0.01" value="0">
+  <span id="time">0:00 / 1:24</span>
+</div>
+<script>
+/* ============ 基础设置（横屏 1920×1080） ============ */
+const W = 1920, H = 1080, DUR = 84;
+const cv = document.getElementById('stage'), ctx = cv.getContext('2d');
+cv.width = W; cv.height = H;
+const FONT = '"PingFang SC","Noto Sans SC","Noto Sans CJK SC","Source Han Sans SC","Microsoft YaHei",sans-serif';
+const MONO = '"JetBrains Mono","SF Mono",Menlo,Consolas,"DejaVu Sans Mono","Noto Sans Mono CJK SC","PingFang SC","Microsoft YaHei",monospace';
+const C = {acc:'#fde68a', mint:'#6ee7c8', gold:'#ffd38a', coral:'#ff9e7a', rose:'#ff8a8a', blue:'#9cc3ff', text:'#f4ede4', muted:'#9a93a8', dim:'#4a4558', panel:'#0f0e1f'};
+
+const clamp = (x,a=0,b=1) => Math.max(a, Math.min(b, x));
+const lerp = (a,b,t) => a + (b-a)*t;
+const p = (t,a,b) => clamp((t-a)/(b-a));
+const eo = x => 1 - Math.pow(1-x, 3);
+const eio = x => x < .5 ? 4*x*x*x : 1 - Math.pow(-2*x+2, 3)/2;
+const eback = x => { const c1=1.70158, c3=c1+1; return 1 + c3*Math.pow(x-1,3) + c1*Math.pow(x-1,2); };
+function rnd(seed){ let s = seed>>>0; return () => { s = (s*1664525 + 1013904223)>>>0; return s/4294967296; }; }
+
+let SA = 1;
+const al = a => { ctx.globalAlpha = clamp(SA*a); };
+const sceneA = (t,a,b,f=.5) => Math.min(p(t,a,a+f), 1 - p(t,b-f,b));
+
+function txt(s, x, y, o = {}){
+  const {size=64, weight=700, color=C.text, alpha=1, align='center', glow=0, scale=1, font=FONT} = o;
+  if (alpha <= 0) return;
+  ctx.save(); al(alpha);
+  ctx.font = `${weight} ${size}px ${font}`;
+  ctx.textAlign = align; ctx.textBaseline = 'middle'; ctx.fillStyle = color;
+  if (glow){ ctx.shadowColor = color; ctx.shadowBlur = glow; }
+  if (scale !== 1){ ctx.translate(x, y); ctx.scale(scale, scale); ctx.fillText(s, 0, 0); }
+  else ctx.fillText(s, x, y);
+  ctx.restore();
+}
+function rise(s, x, y, t, t0, o = {}, d = .7){
+  const e = eo(p(t, t0, t0+d));
+  if (e <= 0) return;
+  txt(s, x, y + (1-e)*36, {...o, alpha:(o.alpha ?? 1)*e});
+}
+function rr(x,y,w,h,r){ ctx.beginPath(); ctx.roundRect(x,y,w,h,r); }
+function box(x, y, w, h, a, o = {}){
+  const {fill='rgba(255,255,255,.05)', stroke='rgba(253,230,138,.35)', lw=2, glow=0, r=18, dash=null} = o;
+  if (a <= 0) return;
+  ctx.save(); al(a); rr(x, y, w, h, r); ctx.fillStyle = fill; ctx.fill();
+  if (dash) ctx.setLineDash(dash);
+  ctx.strokeStyle = stroke; ctx.lineWidth = lw; if (glow){ ctx.shadowColor = stroke; ctx.shadowBlur = glow; } ctx.stroke(); ctx.restore();
+}
+function arrow(x1, y1, x2, y2, e, a, color = C.acc, lw = 3){
+  if (e <= 0 || a <= 0) return;
+  const x = lerp(x1, x2, e), y = lerp(y1, y2, e), ang = Math.atan2(y2 - y1, x2 - x1);
+  ctx.save(); al(a); ctx.strokeStyle = color; ctx.fillStyle = color; ctx.lineWidth = lw; ctx.lineCap = 'round';
+  ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x, y); ctx.stroke();
+  if (e > .85){ ctx.translate(x, y); ctx.rotate(ang); ctx.beginPath(); ctx.moveTo(4, 0); ctx.lineTo(-14, -9); ctx.lineTo(-14, 9); ctx.closePath(); ctx.fill(); }
+  ctx.restore();
+}
+function panel(x, y, w, h, title, a){
+  box(x, y, w, h, a, {fill:C.panel, stroke:'rgba(255,255,255,.1)', r:20});
+  if (a <= 0) return;
+  ctx.save(); al(a); ctx.strokeStyle = 'rgba(255,255,255,.07)'; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(x, y + 52); ctx.lineTo(x + w, y + 52); ctx.stroke();
+  ['#ff6b6b','#ffd166','#6ee7a0'].forEach((c, i) => { ctx.fillStyle = c; ctx.globalAlpha = clamp(SA*a*.8); ctx.beginPath(); ctx.arc(x + 30 + i*24, y + 26, 7, 0, 6.283); ctx.fill(); });
+  ctx.restore();
+  txt(title, x + w/2, y + 27, {size:22, weight:500, color:C.muted, font:MONO, alpha:a});
+}
+
+/* ============ 背景 ============ */
+const PARTS = (() => { const r = rnd(277); return Array.from({length:100}, () => ({
+  x:r()*W, y:r()*H, s:r()*2.2+.5, v:r()*12+4, ph:r()*6.283, c:r()<.25})); })();
+function background(t){
+  const g = ctx.createLinearGradient(0,0,W,H);
+  g.addColorStop(0,'#0a0916'); g.addColorStop(.55,'#110f24'); g.addColorStop(1,'#18122c');
+  ctx.globalAlpha = 1; ctx.fillStyle = g; ctx.fillRect(0,0,W,H);
+  const gx = W*.5 + Math.sin(t*.27)*140;
+  const rg = ctx.createRadialGradient(gx, H*.45, 0, gx, H*.45, 950);
+  rg.addColorStop(0,'rgba(253,230,138,0.09)'); rg.addColorStop(1,'rgba(253,230,138,0)');
+  ctx.fillStyle = rg; ctx.fillRect(0,0,W,H);
+  ctx.fillStyle = C.acc;
+  for (let x = 40; x < W; x += 80) for (let y = 40; y < H; y += 80){ ctx.globalAlpha = .06; ctx.fillRect(x, y, 2, 2); }
+  for (const q of PARTS){
+    const y = ((q.y - t*q.v) % H + H) % H, x = q.x + Math.sin(t*.35 + q.ph)*12;
+    ctx.globalAlpha = .2 + .3*(.5 + .5*Math.sin(t*1.2 + q.ph));
+    ctx.fillStyle = q.c ? C.acc : '#d8d0ff';
+    ctx.beginPath(); ctx.arc(x, y, q.s, 0, 6.283); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+}
+function vignette(){
+  const v = ctx.createRadialGradient(W/2, H/2, W*.28, W/2, H/2, W*.62);
+  v.addColorStop(0,'rgba(0,0,0,0)'); v.addColorStop(1,'rgba(0,0,0,.55)');
+  ctx.globalAlpha = 1; ctx.fillStyle = v; ctx.fillRect(0,0,W,H);
+}
+function codeLine(s, x, y, size, a, kw = /\b(public|class|static|void|new|return)\b/){
+  const parts = s.split(/("[^"]*"|\b(?:public|class|static|void|new|return|getstatic|ldc|invokevirtual)\b)/g);
+  ctx.save(); al(a); ctx.font = `500 ${size}px ${MONO}`; ctx.textBaseline = 'middle'; ctx.textAlign = 'left';
+  let xx = x;
+  for (const seg of parts){ if (!seg) continue;
+    ctx.fillStyle = seg.startsWith('"') ? C.mint : /^(public|class|static|void|new|return|getstatic|ldc|invokevirtual)$/.test(seg) ? C.acc : C.text;
+    ctx.fillText(seg, xx, y); xx += ctx.measureText(seg).width; }
+  ctx.restore();
+}
+
+const AF = a => `rgba(253,230,138,${a})`;
+const SHC = ['#fde68a', '#6ee7c8', '#9cc3ff', '#ff9e7a'];
+function card(h, lines, x, y, w, hh, a, c = C.acc, o = {}){
+  const {hs=30, ls=22, lh=40, top=96} = o;
+  box(x, y, w, hh, a, {fill:AF(.05), stroke:c === C.acc ? AF(.5) : c, r:20});
+  txt(h, x + 30, y + 44, {size:hs, weight:900, color:c, align:'left', alpha:a});
+  lines.forEach((s, i) => txt(s, x + 30, y + top + i*lh, {size:ls, weight:600, color:'#d9d2e4', align:'left', alpha:a}));
+}
+function tw(s, size, weight = 700, font = FONT){ ctx.save(); ctx.font = `${weight} ${size}px ${font}`; const w = ctx.measureText(s).width; ctx.restore(); return w; }
+/* 数据库圆柱：cx, cy 为中心 */
+function dbc(cx, cy, w, h, a, o = {}){
+  const {stroke=C.acc, fill=AF(.07), level=0, lc=C.acc} = o;
+  if (a <= 0) return;
+  const rx = w/2, ry = Math.min(24, h*.13), top = cy - h/2 + ry, bot = cy + h/2 - ry;
+  ctx.save(); al(a); ctx.lineWidth = 2.5; ctx.strokeStyle = stroke; ctx.fillStyle = fill;
+  ctx.beginPath(); ctx.moveTo(cx - rx, top); ctx.lineTo(cx - rx, bot); ctx.ellipse(cx, bot, rx, ry, 0, Math.PI, 0, true);
+  ctx.lineTo(cx + rx, top); ctx.ellipse(cx, top, rx, ry, 0, 0, Math.PI, true); ctx.closePath(); ctx.fill(); ctx.stroke();
+  if (level > 0){
+    const ly = bot - level*(bot - top);
+    ctx.globalAlpha = clamp(SA*a*.28); ctx.fillStyle = lc;
+    ctx.beginPath(); ctx.moveTo(cx + rx, ly); ctx.ellipse(cx, ly, rx, ry, 0, 0, Math.PI, false); ctx.lineTo(cx - rx, bot);
+    ctx.ellipse(cx, bot, rx, ry, 0, Math.PI, 0, true); ctx.closePath(); ctx.fill();
+    ctx.globalAlpha = clamp(SA*a*.6); ctx.strokeStyle = lc; ctx.beginPath(); ctx.ellipse(cx, ly, rx, ry, 0, 0, 6.283); ctx.stroke();
+  }
+  ctx.globalAlpha = clamp(SA*a); ctx.strokeStyle = stroke; ctx.beginPath(); ctx.ellipse(cx, top, rx, ry, 0, 0, 6.283); ctx.stroke();
+  ctx.restore();
+}
+/* 虚线箭头 */
+function darrow(x1, y1, x2, y2, e, a, color = C.muted, lw = 3){
+  if (e <= 0 || a <= 0) return;
+  const x = lerp(x1, x2, e), y = lerp(y1, y2, e), ang = Math.atan2(y2 - y1, x2 - x1);
+  ctx.save(); al(a); ctx.strokeStyle = color; ctx.fillStyle = color; ctx.lineWidth = lw; ctx.setLineDash([12, 9]);
+  ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x, y); ctx.stroke(); ctx.setLineDash([]);
+  if (e > .85){ ctx.translate(x, y); ctx.rotate(ang); ctx.beginPath(); ctx.moveTo(4, 0); ctx.lineTo(-14, -9); ctx.lineTo(-14, 9); ctx.closePath(); ctx.fill(); }
+  ctx.restore();
+}
+/* 二次曲线虚线箭头 */
+function qarrow(x1, y1, cx, cy, x2, y2, e, a, color = C.muted, lw = 3){
+  if (e <= 0 || a <= 0) return;
+  const pt = u => [(1-u)*(1-u)*x1 + 2*(1-u)*u*cx + u*u*x2, (1-u)*(1-u)*y1 + 2*(1-u)*u*cy + u*u*y2];
+  ctx.save(); al(a); ctx.strokeStyle = color; ctx.fillStyle = color; ctx.lineWidth = lw; ctx.setLineDash([12, 9]);
+  ctx.beginPath(); ctx.moveTo(x1, y1); const n = 40;
+  for (let i = 1; i <= n; i++){ const [x, y] = pt(e*i/n); ctx.lineTo(x, y); } ctx.stroke(); ctx.setLineDash([]);
+  if (e > .9){ const [x, y] = pt(e), [px, py] = pt(e - .02); ctx.translate(x, y); ctx.rotate(Math.atan2(y - py, x - px));
+    ctx.beginPath(); ctx.moveTo(4, 0); ctx.lineTo(-14, -9); ctx.lineTo(-14, 9); ctx.closePath(); ctx.fill(); }
+  ctx.restore();
+}
+/* 一行表格：cells = [[文字, 宽度]] */
+function trow(cells, x, y, h, a, o = {}){
+  const {fill='rgba(255,255,255,.04)', stroke='rgba(255,255,255,.22)', color=C.text, size=20, font=MONO, weight=600} = o;
+  let xx = x;
+  cells.forEach(([s, w]) => { box(xx, y, w, h, a, {fill, stroke, r:6}); txt(s, xx + w/2, y + h/2, {size, weight, font, color, alpha:a}); xx += w; });
+}
+/* 一串带箭头的小方块 */
+function chips(list, x, y, a, o = {}){
+  const {size=22, h=54, gap=56} = o;
+  let xx = x;
+  list.forEach(([s, c], i) => { const w = tw(s, size, 800) + 40;
+    box(xx, y - h/2, w, h, a, {fill:'rgba(255,255,255,.05)', stroke:c, r:12}); txt(s, xx + w/2, y, {size, weight:800, color:c, alpha:a});
+    xx += w; if (i < list.length - 1){ arrow(xx + 8, y, xx + gap - 8, y, 1, a, C.muted, 3); xx += gap; } });
+}
+
+/* ============ 场景 1 · 钩子 (0–7s) ============ */
+function s1(t){
+  rise('订单表从 100 万行涨到 10 亿行之后……', W/2, 110, t, .2, {size:54, weight:900});
+  const a = eo(p(t, .7, 1.2)), k = eio(p(t, .9, 3.4)), n = Math.round(Math.pow(10, lerp(6, 9, k)));
+  txt('一台 MySQL，一张 t_order', 470, 235, {size:28, weight:700, color:C.muted, alpha:a});
+  dbc(470, 500, 380, 420, a, {level:lerp(.1, .93, k), lc:k > .75 ? C.rose : C.acc});
+  txt(n.toLocaleString('en-US') + ' 行', 470, 760, {size:40, weight:800, font:MONO, color:k > .75 ? C.rose : C.acc, alpha:a});
+  [['查询变慢', '数据和索引远超内存，频繁读磁盘', FONT], ['连接打满', 'ERROR 1040: Too many connections', MONO], ['写入排队', '所有写入挤在一台机器的磁盘和锁上', FONT], ['运维变难', '加字段、建索引、备份恢复都很慢', FONT]].forEach(([h, d, f], i) => {
+    const e = eo(p(t, 1.6 + i*.55, 2.1 + i*.55)), y = 300 + i*112;
+    box(860, y - 46, 940, 92, e, {fill:'rgba(255,138,138,.06)', stroke:'rgba(255,138,138,.45)', r:16});
+    txt(h, 900, y, {size:30, weight:900, color:C.rose, align:'left', alpha:e});
+    txt(d, 1080, y, {size:24, weight:700, font:f, align:'left', alpha:e}); });
+  const b = eo(p(t, 4.2, 4.7));
+  box(460, 820, 1000, 96, b, {fill:AF(.12), stroke:C.acc, r:24, glow:22});
+  txt('一台数据库扛不住了：读写分离 + 分库分表', W/2, 868, {size:36, weight:900, color:C.acc, alpha:b});
+  rise('什么时候该拆？怎么拆？拆完有哪些坑？', W/2, 990, t, 5.2, {size:32, weight:800});
+}
+
+/* ============ 场景 2 · 先优化 (7–17s) ============ */
+function s2(t){
+  rise('先别急着拆：按代价从低到高', W/2, 90, t, 7.2, {size:54, weight:900});
+  rise('分库分表是「最后一招」，前面还有更便宜的办法', W/2, 160, t, 7.6, {size:28, weight:700, color:C.muted});
+  const S = [['索引与 SQL', '慢查询、EXPLAIN'], ['加缓存', 'Redis 挡住热点读'], ['归档冷数据', '历史订单移出主表'], ['读写分离', '读压力分给从库'], ['垂直拆分', '按业务拆成多个库'], ['水平拆分', '一张表拆成多张']];
+  S.forEach(([h, d], i) => { const e = eback(p(t, 8.2 + i*.45, 8.7 + i*.45)); if (e <= 0) return;
+    const x = 95 + i*290, y = 660 - i*72, c = i < 3 ? C.mint : C.acc, ea = clamp(e);
+    ctx.save(); ctx.translate(x + 135, y + 150); ctx.scale(1, e); ctx.translate(-x - 135, -y - 150);
+    box(x, y, 270, 150, ea, {fill:i < 3 ? 'rgba(110,231,200,.08)' : AF(.10), stroke:c, r:16}); ctx.restore();
+    txt(String(i + 1), x + 28, y + 30, {size:22, weight:900, font:MONO, color:c, alpha:ea});
+    txt(h, x + 135, y + 66, {size:30, weight:900, color:c, alpha:ea});
+    txt(d, x + 135, y + 110, {size:21, weight:600, color:C.muted, alpha:ea}); });
+  const g = eo(p(t, 11, 11.5));
+  [[95, 945, '不改架构，代价小', C.mint], [965, 1815, '改架构，复杂度陡增', C.coral]].forEach(([x1, x2, s, c]) => {
+    if (g <= 0) return; ctx.save(); al(g); ctx.strokeStyle = c; ctx.lineWidth = 3;
+    ctx.beginPath(); ctx.moveTo(x1 + 10, 838); ctx.lineTo(x1 + 10, 852); ctx.lineTo(x2 - 10, 852); ctx.lineTo(x2 - 10, 838); ctx.stroke(); ctx.restore();
+    txt(s, (x1 + x2)/2, 892, {size:26, weight:800, color:c, alpha:g}); });
+  card('拆之前先问自己', ['慢的是读还是写？加缓存能不能挡住？', '大部分数据是不是根本没人访问？', '是数据量的问题，还是 SQL 写得不好？'], 95, 220, 760, 250, eo(p(t, 11.8, 12.3)), C.acc, {ls:24, lh:44, top:100});
+  rise('分库分表解决的是「容量」和「写入」瓶颈，代价是整个系统变复杂', W/2, 985, t, 13.6, {size:30, weight:800, color:C.acc});
+}
+
+/* ============ 场景 3 · 读写分离 (17–29s) ============ */
+function s3(t){
+  rise('读写分离：主库写，从库读', W/2, 90, t, 17.2, {size:54, weight:900});
+  rise('大多数业务读多写少：把读请求分给多个从库', W/2, 155, t, 17.6, {size:28, weight:700, color:C.muted});
+  const a = eo(p(t, 18, 18.5));
+  box(760, 205, 400, 90, a, {fill:'rgba(255,255,255,.06)', stroke:'rgba(255,255,255,.35)', r:16});
+  txt('应用（或中间件）', 960, 250, {size:30, weight:800, alpha:a});
+  const m = eo(p(t, 18.6, 19.1));
+  dbc(420, 470, 280, 180, m, {stroke:C.coral, fill:'rgba(255,158,122,.08)'});
+  txt('主库', 420, 470, {size:34, weight:900, color:C.coral, alpha:m}); txt('Master', 420, 512, {size:20, weight:600, font:MONO, color:C.muted, alpha:m});
+  [1230, 1610].forEach((x, i) => { const e = eo(p(t, 19 + i*.3, 19.5 + i*.3));
+    dbc(x, 470, 280, 180, e, {stroke:C.mint, fill:'rgba(110,231,200,.07)'});
+    txt('从库 ' + (i + 1), x, 470, {size:34, weight:900, color:C.mint, alpha:e}); txt('Replica', x, 512, {size:20, weight:600, font:MONO, color:C.muted, alpha:e}); });
+  arrow(860, 300, 480, 372, eo(p(t, 19.8, 20.4)), m, C.coral, 3);
+  txt('写：INSERT / UPDATE / DELETE', 610, 300, {size:22, weight:800, color:C.coral, align:'right', alpha:eo(p(t, 20.2, 20.6))});
+  arrow(1060, 300, 1200, 372, eo(p(t, 20.6, 21.2)), m, C.mint, 3); arrow(1110, 300, 1570, 372, eo(p(t, 20.6, 21.2)), m, C.mint, 3);
+  txt('读：SELECT', 1400, 290, {size:22, weight:800, color:C.mint, align:'left', alpha:eo(p(t, 21, 21.4))});
+  darrow(565, 450, 1085, 450, eo(p(t, 21.6, 22.4)), m, C.acc, 3);
+  txt('binlog 复制', 825, 420, {size:22, weight:800, color:C.acc, alpha:eo(p(t, 22, 22.4))});
+  qarrow(420, 562, 1015, 650, 1610, 562, eo(p(t, 21.8, 22.8)), m, C.acc, 3);
+  [['① 主库写 binlog', '事务提交时记录数据变更'], ['② IO 线程拉取', '从库把 binlog 存进 relay log'], ['③ SQL 线程重放', '在从库上执行一遍，追上主库']].forEach(([h, d], i) => {
+    const e = eo(p(t, 23 + i*.5, 23.5 + i*.5)), x = 120 + i*590;
+    box(x, 690, 500, 110, e, {fill:AF(.07), stroke:AF(.5), r:16});
+    txt(h, x + 250, 728, {size:28, weight:900, color:C.acc, alpha:e}); txt(d, x + 250, 770, {size:21, weight:600, color:C.muted, alpha:e});
+    if (i) arrow(x - 84, 745, x - 8, 745, e, e, C.acc, 3); });
+  rise('默认是异步复制：主库提交后直接返回，不等从库', W/2, 870, t, 25, {size:30, weight:900, color:C.acc});
+  rise('读能力可以靠加从库扩展；写入仍然只有一台主库', W/2, 940, t, 25.8, {size:26, weight:700, color:C.muted});
+  rise('写也扛不住时，才轮到分库分表', W/2, 1005, t, 26.6, {size:26, weight:700});
+}
+
+/* ============ 场景 4 · 主从延迟 (29–40s) ============ */
+function s4(t){
+  rise('主从延迟：刚下的单，查不到', W/2, 90, t, 29.2, {size:54, weight:900});
+  const a = eo(p(t, 29.5, 30));
+  [['主库', 250, C.coral], ['从库', 420, C.mint]].forEach(([s, y, c]) => {
+    txt(s, 250, y, {size:30, weight:900, color:c, align:'right', alpha:a});
+    ctx.save(); al(a*.5); ctx.strokeStyle = 'rgba(255,255,255,.35)'; ctx.lineWidth = 3; ctx.beginPath(); ctx.moveTo(300, y); ctx.lineTo(1800, y); ctx.stroke(); ctx.restore(); });
+  arrow(300, 560, 1800, 560, a, a*.7, C.muted, 2); txt('时间', 250, 560, {size:22, weight:700, color:C.muted, align:'right', alpha:a});
+  const ev = (s, x, y, w, ts, c, fill) => { const e = eback(p(t, ts, ts + .5)); if (e <= 0) return;
+    ctx.save(); ctx.translate(x + w/2, y); ctx.scale(e, e); ctx.translate(-x - w/2, -y);
+    box(x, y - 34, w, 68, clamp(e), {fill, stroke:c, r:14}); ctx.restore();
+    txt(s, x + w/2, y, {size:24, weight:800, color:c, alpha:clamp(e)}); };
+  ev('① 写入订单 ✓', 340, 250, 260, 30, C.coral, 'rgba(255,158,122,.12)');
+  darrow(600, 270, 1265, 386, eo(p(t, 30.6, 33)), a, C.acc, 3);
+  ev('② 立刻查询 → 空 ✗', 680, 420, 300, 31.4, C.rose, 'rgba(255,138,138,.14)');
+  ev('③ 数据到达', 1250, 420, 220, 33, C.mint, 'rgba(110,231,200,.12)');
+  ev('④ 再查 ✓', 1560, 420, 200, 33.6, C.mint, 'rgba(110,231,200,.12)');
+  const g = eo(p(t, 33.4, 33.9));
+  if (g > 0){ ctx.save(); al(g); ctx.strokeStyle = C.acc; ctx.lineWidth = 3; ctx.beginPath(); ctx.moveTo(600, 466); ctx.lineTo(600, 480); ctx.lineTo(1250, 480); ctx.lineTo(1250, 466); ctx.stroke(); ctx.restore(); }
+  txt('主从延迟：平时很小，大事务、写入高峰时可能到秒级甚至更长', 925, 515, {size:23, weight:800, color:C.acc, alpha:g});
+  card('① 强制读主', ['刚写完就要读的、关键业务的读，', '直接路由到主库', '（中间件一般支持用 Hint 指定）'], 120, 630, 540, 250, eo(p(t, 34.6, 35.1)), C.acc, {ls:22, lh:42});
+  card('② 延迟判断', ['读从库前先检查它追上没有：', '看复制延迟，或比对 GTID 位点', '没追上就改读主库'], 690, 630, 540, 250, eo(p(t, 35.4, 35.9)), C.acc, {ls:22, lh:42});
+  card('③ 业务兜底', ['写完直接用返回结果渲染页面，', '或提示「处理中」稍后再查', '不在写后立刻依赖从库'], 1260, 630, 540, 250, eo(p(t, 36.2, 36.7)), C.acc, {ls:22, lh:42});
+  rise('半同步复制：至少一个从库「收到」binlog 才返回，能减少丢数据，但不消除延迟', W/2, 960, t, 37.4, {size:26, weight:700, color:C.muted});
+}
+
+/* ============ 场景 5 · 垂直 vs 水平 (40–52s) ============ */
+function s5(t){
+  rise('两种拆法：垂直拆分 vs 水平拆分', W/2, 90, t, 40.2, {size:54, weight:900});
+  const a = eo(p(t, 40.6, 41.1)), b = eo(p(t, 44.6, 45.1));
+  box(90, 160, 850, 720, a, {fill:'rgba(255,255,255,.03)', stroke:'rgba(255,255,255,.18)', r:24});
+  txt('垂直拆分：按业务、按列', 515, 212, {size:34, weight:900, color:C.mint, alpha:a});
+  box(130, 270, 250, 120, a, {fill:'rgba(255,255,255,.06)', stroke:'rgba(255,255,255,.35)', r:14});
+  txt('一个大库', 255, 312, {size:28, weight:900, alpha:a}); txt('用户 + 订单 + 商品', 255, 352, {size:20, weight:600, color:C.muted, alpha:a});
+  arrow(390, 330, 455, 330, eo(p(t, 41.2, 41.6)), a, C.mint, 3);
+  ['用户库', '订单库', '商品库'].forEach((s, i) => { const e = eo(p(t, 41.4 + i*.25, 41.9 + i*.25)), x = 540 + i*140;
+    dbc(x, 330, 124, 120, e, {stroke:C.mint, fill:'rgba(110,231,200,.08)'}); txt(s, x, 338, {size:22, weight:800, color:C.mint, alpha:e}); });
+  txt('分库：不同业务放进不同的数据库，各自扩容', 515, 432, {size:22, weight:600, color:C.muted, alpha:eo(p(t, 42, 42.4))});
+  const c = eo(p(t, 42.6, 43.1));
+  trow([['id', 90], ['title', 160], ['price', 130], ['detail（大文本）', 240]], 170, 480, 54, c, {size:20});
+  const d = eo(p(t, 43.3, 43.8));
+  arrow(380, 540, 320, 600, d, d, C.mint, 3); arrow(650, 540, 710, 600, d, d, C.mint, 3);
+  trow([['id', 90], ['title', 160], ['price', 130]], 130, 610, 54, d, {size:20, stroke:'rgba(110,231,200,.6)'});
+  trow([['id', 90], ['detail（大文本）', 240]], 590, 610, 54, d, {size:20, stroke:'rgba(110,231,200,.6)'});
+  txt('拆表：大字段、不常用字段单独存，主表每页能放下更多行', 515, 712, {size:22, weight:600, color:C.muted, alpha:d});
+  txt('✓ 业务解耦，单库压力下降', 130, 790, {size:24, weight:800, color:C.mint, align:'left', alpha:eo(p(t, 44, 44.4))});
+  txt('✗ 单表行数一点没少', 130, 838, {size:24, weight:800, color:C.rose, align:'left', alpha:eo(p(t, 44.3, 44.7))});
+
+  box(980, 160, 850, 720, b, {fill:'rgba(255,255,255,.03)', stroke:'rgba(255,255,255,.18)', r:24});
+  txt('水平拆分：按行', 1405, 212, {size:34, weight:900, color:C.acc, alpha:b});
+  const R = [['9001', 1001], ['9002', 1002], ['9003', 1003], ['9004', 1004], ['9005', 1005], ['9006', 1006], ['9007', 1007], ['9008', 1008]];
+  trow([['order_id', 150], ['user_id', 150]], 1020, 260, 44, b, {size:20, fill:AF(.12), stroke:AF(.5), color:C.acc});
+  [0, 1, 2, 3].forEach(k => { const e = eo(p(t, 45.4 + k*.2, 45.9 + k*.2)), y = 260 + k*145;
+    trow([['t_order_' + k + '   ·   % 4 = ' + k, 330]], 1470, y, 40, e, {size:19, fill:'rgba(255,255,255,.05)', stroke:SHC[k], color:SHC[k]});
+    box(1470, y + 40, 330, 84, e, {fill:'rgba(255,255,255,.02)', stroke:'rgba(255,255,255,.14)', r:6}); });
+  R.forEach(([o, u], i) => { const sh = u % 4, slot = i < 4 ? 0 : 1, c = SHC[sh];
+    const x0 = 1020, y0 = 304 + i*46, x1 = 1485, y1 = 260 + sh*145 + 44 + slot*40;
+    const k = eio(p(t, 46.6 + i*.28, 47.4 + i*.28));
+    trow([[o, 150], [String(u), 150]], x0, y0, 42, b*(1 - .6*clamp(k*3)), {size:20, color:c, stroke:'rgba(255,255,255,.18)'});
+    if (k > 0) trow([[o, 150], [String(u), 150]], lerp(x0, x1, k), lerp(y0, y1, k), 36, b, {size:20, color:c, stroke:c, fill:'rgba(15,14,31,.9)'}); });
+  txt('表结构完全相同，每张表只存一部分行', 1405, 845, {size:22, weight:600, color:C.muted, alpha:eo(p(t, 49.2, 49.6))});
+  rise('垂直拆分缓解「业务耦合、单库压力」；水平拆分才真正解决「单表数据太多」', W/2, 960, t, 49.8, {size:28, weight:800, color:C.acc});
+}
+
+/* ============ 场景 6 · 分片策略与分片键 (52–64s) ============ */
+function s6(t){
+  rise('分片策略：这条数据该去哪个分片？', W/2, 90, t, 52.2, {size:54, weight:900});
+  const K = [
+    ['哈希取模', 'hash(user_id) % N', '✓ 分布均匀，路由简单', '✗ N 一变，大部分数据要搬家'],
+    ['范围分片', '按时间 / ID 区间', '✓ 扩容只需加新区间', '✗ 新数据集中在最新分片'],
+    ['一致性哈希', '哈希环 + 虚拟节点', '✓ 加节点只迁移一小部分', '✗ 实现更复杂，见负载均衡篇'],
+    ['基因法', 'order_id 嵌入 user_id 基因', '✓ 按两种 ID 都能直接路由', '✗ 依赖定制的 ID 生成规则']];
+  K.forEach(([h, f, ok, bad], i) => { const e = eo(p(t, 52.7 + i*.55, 53.2 + i*.55)), x = 100 + i*435, y = 165, cx = x + 207;
+    card(h, [], x, y, 415, 380, e);
+    txt(f, x + 30, y + 92, {size:20, weight:600, font:i === 0 ? MONO : FONT, color:C.muted, align:'left', alpha:e});
+    txt(ok, x + 30, y + 290, {size:22, weight:700, color:C.mint, align:'left', alpha:e});
+    txt(bad, x + 30, y + 336, {size:22, weight:700, color:C.rose, align:'left', alpha:e});
+    if (e <= 0) return; const vy = y + 190;
+    if (i === 0){ [0, 1, 2, 3].forEach(j => { box(cx - 150 + j*78, vy - 50, 66, 100, e, {fill:'rgba(255,255,255,.04)', stroke:SHC[j], r:10});
+      for (let q = 0; q < 3; q++){ ctx.save(); al(e); ctx.fillStyle = SHC[j]; ctx.beginPath(); ctx.arc(cx - 117 + j*78, vy - 25 + q*25, 7, 0, 6.283); ctx.fill(); ctx.restore(); } }); }
+    if (i === 1){ ['2024', '2025', '2026'].forEach((s, j) => { const hot = j === 2;
+      box(cx - 165 + j*112, vy - 45, 100, 90, e, {fill:hot ? 'rgba(255,138,138,.16)' : 'rgba(255,255,255,.04)', stroke:hot ? C.rose : 'rgba(255,255,255,.3)', r:10, glow:hot ? 14 + 6*Math.sin(t*6) : 0});
+      txt(s, cx - 115 + j*112, vy - 8, {size:22, weight:800, font:MONO, color:hot ? C.rose : C.text, alpha:e});
+      txt(hot ? '热点' : '冷', cx - 115 + j*112, vy + 24, {size:18, weight:700, color:hot ? C.rose : C.muted, alpha:e}); }); }
+    if (i === 2){ ctx.save(); al(e); ctx.strokeStyle = AF(.6); ctx.lineWidth = 3; ctx.beginPath(); ctx.arc(cx, vy, 58, 0, 6.283); ctx.stroke();
+      for (let j = 0; j < 8; j++){ const an = j/8*6.283 + .3; ctx.fillStyle = SHC[j % 4]; ctx.beginPath(); ctx.arc(cx + Math.cos(an)*58, vy + Math.sin(an)*58, 9, 0, 6.283); ctx.fill(); }
+      ctx.restore(); }
+    if (i === 3){ box(cx - 170, vy - 32, 230, 64, e, {fill:'rgba(255,255,255,.05)', stroke:'rgba(255,255,255,.3)', r:8});
+      box(cx + 60, vy - 32, 110, 64, e, {fill:AF(.18), stroke:C.acc, r:8});
+      txt('时间戳 + 序列号', cx - 55, vy, {size:20, weight:700, color:C.muted, alpha:e}); txt('基因', cx + 115, vy, {size:22, weight:900, color:C.acc, alpha:e});
+      txt('user_id 的低几位', cx + 115, vy + 56, {size:18, weight:600, color:C.acc, alpha:e}); }
+  });
+  const b = eo(p(t, 55.6, 56.1));
+  box(100, 590, 1720, 420, b, {fill:AF(.04), stroke:AF(.4), r:24});
+  txt('分片键：最重要的一个决定', 140, 638, {size:32, weight:900, color:C.acc, align:'left', alpha:b});
+  txt('订单表按 user_id 分片', 140, 712, {size:28, weight:800, align:'left', alpha:eo(p(t, 56.4, 56.8))});
+  txt('✓ 用户查「我的订单」：只查 1 个分片', 140, 772, {size:24, weight:700, color:C.mint, align:'left', alpha:eo(p(t, 56.9, 57.3))});
+  txt('✗ 商家查「店铺订单」：要查全部分片', 140, 832, {size:24, weight:700, color:C.rose, align:'left', alpha:eo(p(t, 57.4, 57.8))});
+  arrow(600, 832, 950, 832, eo(p(t, 58, 58.5)), b, C.rose, 3);
+  txt('商家查询怎么办？', 980, 712, {size:28, weight:900, color:C.acc, align:'left', alpha:eo(p(t, 58.3, 58.7))});
+  ['① 冗余一份：按 seller_id 再分片存一份订单', '② 异构索引表：seller_id → order_id 的映射', '③ 同步到 Elasticsearch，做复杂搜索和统计'].forEach((s, i) => {
+    const e = eo(p(t, 58.8 + i*.5, 59.3 + i*.5)), y = 772 + i*62;
+    box(970, y - 26, 810, 52, e, {fill:'rgba(255,255,255,.04)', stroke:'rgba(255,255,255,.2)', r:12});
+    txt(s, 995, y, {size:22, weight:700, align:'left', alpha:e}); });
+  rise('选分片键：最常用的查询条件 · 取值分布均匀 · 写入后不再变化', W/2, 966, t, 60.6, {size:24, weight:700, color:C.muted});
+}
+
+/* ============ 场景 7 · 拆完之后 (64–78s) ============ */
+function s7(t){
+  rise('拆完之后：新的麻烦', W/2, 85, t, 64.2, {size:54, weight:900});
+  const a = eo(p(t, 64.6, 65.1));
+  panel(90, 150, 960, 540, 'ORDER BY create_time LIMIT 100, 20', a);
+  [0, 1, 2, 3].forEach(i => { const e = eo(p(t, 65.1 + i*.2, 65.6 + i*.2)), x = 125 + i*228;
+    box(x, 232, 208, 100, e, {fill:'rgba(255,255,255,.04)', stroke:SHC[i], r:14});
+    txt('分片 ' + i, x + 104, 264, {size:24, weight:900, color:SHC[i], alpha:e}); txt('取前 120 条', x + 104, 304, {size:20, weight:700, color:C.text, alpha:e});
+    arrow(x + 104, 338, lerp(x + 104, 450, .55), 418, eo(p(t, 66, 66.5)), e, C.muted, 2.5); });
+  const m = eo(p(t, 66.5, 67));
+  box(220, 425, 460, 76, m, {fill:AF(.10), stroke:C.acc, r:14}); txt('合并 480 条，重新排序', 450, 463, {size:24, weight:900, color:C.acc, alpha:m});
+  arrow(450, 506, 450, 546, eo(p(t, 67, 67.4)), m, C.acc, 3);
+  const r = eo(p(t, 67.3, 67.8));
+  box(250, 552, 400, 62, r, {fill:'rgba(110,231,200,.10)', stroke:C.mint, r:14}); txt('跳过 100 条，返回 20 条', 450, 583, {size:23, weight:800, color:C.mint, alpha:r});
+  const s = eo(p(t, 67.8, 68.2));
+  txt('每片都要取', 730, 440, {size:22, weight:700, color:C.muted, align:'left', alpha:s});
+  txt('offset + limit 条', 730, 476, {size:22, weight:800, font:MONO, color:C.rose, align:'left', alpha:s});
+  txt('翻到第 1000 页：', 730, 530, {size:22, weight:700, color:C.muted, align:'left', alpha:eo(p(t, 68.2, 68.6))});
+  txt('每片取 20000 条', 730, 566, {size:22, weight:800, color:C.rose, align:'left', alpha:eo(p(t, 68.2, 68.6))});
+  txt('对策：不允许跳页，用「上一页最后一条」当游标往后查', 570, 655, {size:22, weight:800, color:C.acc, alpha:eo(p(t, 68.8, 69.2))});
+  [['分布式事务', ['下单要同时改两个库，本地事务管不了', '→ 尽量同库；必要时用 Seata、可靠消息等方案']],
+   ['全局唯一 ID', ['各表各自自增，主键会重复', '→ 雪花算法、号段（见《分布式 ID》）']],
+   ['扩容迁移', ['分片数一变，数据要重新分布', '→ 双写 + 校验后切读；翻倍扩容只搬一半']]].forEach(([h, ls], i) =>
+    card(h, ls, 1090, 150 + i*185, 740, 170, eo(p(t, 69.4 + i*.7, 69.9 + i*.7)), C.acc, {hs:28, ls:21, lh:36, top:90}));
+  const u = eo(p(t, 72.2, 72.7)), v = eo(p(t, 73.4, 73.9));
+  box(90, 730, 860, 270, u, {fill:'rgba(255,255,255,.03)', stroke:'rgba(255,255,255,.18)', r:22});
+  txt('客户端模式', 130, 775, {size:30, weight:900, color:C.acc, align:'left', alpha:u}); txt('ShardingSphere-JDBC', 340, 777, {size:20, weight:600, font:MONO, color:C.muted, align:'left', alpha:u});
+  chips([['应用 + 分片 jar 包', C.text], ['库 0 … 库 N', C.mint]], 130, 850, u);
+  txt('✓ 直连数据库，没有额外网络跳转', 130, 915, {size:22, weight:700, color:C.mint, align:'left', alpha:u});
+  txt('✗ 仅限 Java；连接数随应用实例增长', 130, 960, {size:22, weight:700, color:C.rose, align:'left', alpha:u});
+  box(970, 730, 860, 270, v, {fill:'rgba(255,255,255,.03)', stroke:'rgba(255,255,255,.18)', r:22});
+  txt('代理模式', 1010, 775, {size:30, weight:900, color:C.acc, align:'left', alpha:v}); txt('ShardingSphere-Proxy、MyCat', 1180, 777, {size:20, weight:600, font:MONO, color:C.muted, align:'left', alpha:v});
+  chips([['应用', C.text], ['代理（像一台 MySQL）', C.acc], ['库 0 … 库 N', C.mint]], 1010, 850, v);
+  txt('✓ 对应用透明，任何语言都能用', 1010, 915, {size:22, weight:700, color:C.mint, align:'left', alpha:v});
+  txt('✗ 多一跳网络，代理本身要做高可用', 1010, 960, {size:22, weight:700, color:C.rose, align:'left', alpha:v});
+}
+
+/* ============ 场景 8 · 收尾 (78–84s) ============ */
+function s8(t){
+  [['先优化', '索引、缓存、归档'], ['读写分离', '主写从读，当心延迟'], ['分库分表', '垂直按业务，水平按键'], ['代价', '跨片查询、事务、ID']].forEach(([a, b], i) => {
+    const st = 78.2 + i*.25, e = eback(p(t, st, st + .5)); if (e <= 0) return;
+    const x = 330 + i*420, y = 330;
+    ctx.save(); ctx.translate(x, y); ctx.scale(e, e); ctx.translate(-x, -y);
+    box(x - 185, y - 90, 370, 180, clamp(e), {fill:AF(.08), stroke:AF(.5), r:26}); ctx.restore();
+    txt(a, x, y - 22, {size:40, weight:900, color:C.acc, alpha:clamp(e)}); txt(b, x, y + 40, {size:24, weight:600, color:C.muted, alpha:clamp(e)});
+  });
+  rise('能不拆就不拆；要拆，先选对分片键', W/2, 600, t, 79.2, {size:60, weight:900, glow:22});
+  rise('关注拾星，一起搞懂后端', W/2, 760, t, 80, {size:36, weight:500, color:C.muted});
+}
+/* ============ 总调度 ============ */
+const SCENES = [[s1,-1,7],[s2,7,17],[s3,17,29],[s4,29,40],[s5,40,52],[s6,52,64],[s7,64,78],[s8,78,84]];
+function draw(t){
+  t = clamp(t, 0, DUR);
+  ctx.save(); ctx.globalAlpha = 1; ctx.clearRect(0,0,W,H); background(t);
+  for (const [fn,a,b] of SCENES){
+    if (t < a || t > b) continue;
+    SA = sceneA(t, a, b, b === DUR ? .8 : .5);
+    if (SA > 0){ ctx.save(); fn(t); ctx.restore(); }
+  }
+  SA = 1; vignette();
+  const fo = p(t, DUR - .8, DUR);
+  if (fo > 0){ ctx.globalAlpha = fo; ctx.fillStyle = '#000'; ctx.fillRect(0,0,W,H); }
+  ctx.restore();
+}
+
+/* ============ 播放器 / 逐帧渲染接口 ============ */
+const isRender = new URLSearchParams(location.search).has('render');
+window.DURATION = DUR;
+window.renderFrame = t => draw(t);
+const btn = document.getElementById('btn'), seek = document.getElementById('seek'), timeEl = document.getElementById('time');
+const fmt = s => `${Math.floor(s/60)}:${String(Math.floor(s%60)).padStart(2,'0')}`;
+function fit(){
+  if (isRender){ cv.style.width = W+'px'; cv.style.height = H+'px'; return; }
+  const w = Math.min(innerWidth - 32, (innerHeight - 84)*16/9);
+  cv.style.width = w + 'px'; cv.style.height = w*9/16 + 'px';
+}
+addEventListener('resize', fit); fit();
+
+let cur = 0, playing = !isRender, last = null;
+function toggle(){ if (cur >= DUR) cur = 0; playing = !playing; }
+btn.onclick = toggle; cv.onclick = toggle;
+addEventListener('keydown', e => { if (e.code === 'Space'){ e.preventDefault(); toggle(); } });
+seek.oninput = () => { cur = +seek.value; draw(cur); };
+function loop(ts){
+  if (playing && last != null){ cur += (ts - last)/1000; if (cur >= DUR){ cur = DUR; playing = false; } }
+  last = ts; draw(cur);
+  seek.value = cur; timeEl.textContent = `${fmt(cur)} / ${fmt(DUR)}`;
+  btn.textContent = playing ? '❚❚' : (cur >= DUR ? '↺' : '▶');
+  requestAnimationFrame(loop);
+}
+document.fonts.ready.then(() => {
+  window.ready = true;
+  if (isRender) draw(0); else requestAnimationFrame(loop);
+});
+</script>
+</body>
+</html>
