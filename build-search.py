@@ -14,8 +14,11 @@ def clean(html):
     return html.strip()
 
 docs = []
+DRAFTS = {'rpc', 'concurrent-hashmap', 'io-models', 'kubernetes', 'load-balancing'}
 for p in sorted(glob.glob(os.path.join(ROOT, '*/article.html'))):
     topic = os.path.basename(os.path.dirname(p))
+    if topic in DRAFTS:
+        continue
     h = open(p, encoding='utf-8').read()
     title = re.search(r'<h1>(.*?)</h1>', h, re.S)
     title = clean(title.group(1)) if title else topic

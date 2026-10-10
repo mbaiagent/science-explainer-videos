@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>拾星电子书 · 用代码画出看得懂的原理</title>
-<meta name="description" content="拾星电子书：26 章图文详解目录，每章独立成页，配配套视频。">
+<meta name="description" content="拾星电子书：35 章图文详解目录，每章独立成页，配配套视频。">
 <link rel="stylesheet" href="assets/article.css">
 <style>
   body{padding-top:0}
@@ -40,7 +40,7 @@
   <div class="cover">
     <h1>拾星电子书</h1>
     <p class="slogan">用代码，画出看得懂的原理</p>
-    <p>26 章图文详解，每章独立成页，按顺序读完。每章配一段配套视频，文章页顶部可看。</p>
+    <p>35 章图文详解，每章独立成页，按顺序读完。每章配一段配套视频，文章页顶部可看。</p>
     <a class="back" href="videos.html">🎬 去视频站</a><a class="back" href="index.html">← 回到拾星首页</a>
   </div>
   <nav id="toc"><h2 class="toc-h">目录</h2>
@@ -49,38 +49,47 @@
 <a class="toc-item" href="llm/article.html"><span class="toc-no">01</span>什么是 LLM</a>
 <a class="toc-item" href="embedding/article.html"><span class="toc-no">02</span>Embedding 向量</a>
 <a class="toc-item" href="rag/article.html"><span class="toc-no">03</span>RAG 是什么</a>
+<a class="toc-item" href="transformer/article.html"><span class="toc-no">04</span>Transformer 详解</a>
+<a class="toc-item" href="fine-tuning-lora/article.html"><span class="toc-no">05</span>微调与 LoRA</a>
 <div class="toc-sub">Agent 与应用</div>
-<a class="toc-item" href="claude-code/article.html"><span class="toc-no">04</span>从零做一个 Claude Code</a>
-<a class="toc-item" href="function-calling-mcp/article.html"><span class="toc-no">05</span>Function Calling 与 MCP</a>
-<a class="toc-item" href="prompt-engineering/article.html"><span class="toc-no">06</span>Prompt 工程与结构化输出</a>
-<a class="toc-item" href="agent-patterns/article.html"><span class="toc-no">07</span>Agent 设计模式</a>
-<a class="toc-item" href="evals/article.html"><span class="toc-no">08</span>评估（Evals）</a>
+<a class="toc-item" href="claude-code/article.html"><span class="toc-no">06</span>从零做一个 Claude Code</a>
+<a class="toc-item" href="function-calling-mcp/article.html"><span class="toc-no">07</span>Function Calling 与 MCP</a>
+<a class="toc-item" href="prompt-engineering/article.html"><span class="toc-no">08</span>Prompt 工程与结构化输出</a>
+<a class="toc-item" href="agent-patterns/article.html"><span class="toc-no">09</span>Agent 设计模式</a>
+<a class="toc-item" href="evals/article.html"><span class="toc-no">10</span>评估（Evals）</a>
 <div class="toc-sub">跨界趣味</div>
-<a class="toc-item" href="opus-video/article.html"><span class="toc-no">09</span>Opus 5.5 是怎么做视频的</a>
+<a class="toc-item" href="opus-video/article.html"><span class="toc-no">11</span>Opus 5.5 是怎么做视频的</a>
 <div class="toc-cat">计算机与后端</div>
 <div class="toc-sub">计算机基础</div>
-<a class="toc-item" href="jvm/article.html"><span class="toc-no">10</span>JVM 是什么</a>
-<a class="toc-item" href="process-thread-coroutine/article.html"><span class="toc-no">11</span>进程、线程与协程</a>
-<a class="toc-item" href="thread-pool/article.html"><span class="toc-no">12</span>线程池是什么</a>
-<a class="toc-item" href="tcp-handshake/article.html"><span class="toc-no">13</span>TCP 三次握手</a>
-<a class="toc-item" href="http-request/article.html"><span class="toc-no">14</span>按下回车后发生了什么</a>
+<a class="toc-item" href="jvm/article.html"><span class="toc-no">12</span>JVM 是什么</a>
+<a class="toc-item" href="process-thread-coroutine/article.html"><span class="toc-no">13</span>进程、线程与协程</a>
+<a class="toc-item" href="thread-pool/article.html"><span class="toc-no">14</span>线程池是什么</a>
+<a class="toc-item" href="java-lock/article.html"><span class="toc-no">15</span>Java 的锁</a>
+<a class="toc-item" href="tcp-handshake/article.html"><span class="toc-no">16</span>TCP 三次握手</a>
+<a class="toc-item" href="http-request/article.html"><span class="toc-no">17</span>按下回车后发生了什么</a>
+<a class="toc-item" href="https-tls/article.html"><span class="toc-no">18</span>HTTPS 加密全过程</a>
+<a class="toc-item" href="docker-container/article.html"><span class="toc-no">19</span>Docker 容器原理</a>
 <div class="toc-sub">数据库</div>
-<a class="toc-item" href="mysql-mvcc/article.html"><span class="toc-no">15</span>MySQL 的 MVCC</a>
-<a class="toc-item" href="bplus-tree/article.html"><span class="toc-no">16</span>数据库索引：为什么是 B+ 树</a>
-<a class="toc-item" href="transaction-acid/article.html"><span class="toc-no">17</span>事务与 ACID</a>
-<a class="toc-item" href="redis-cache/article.html"><span class="toc-no">18</span>Redis 缓存</a>
-<a class="toc-item" href="mysql-lock/article.html"><span class="toc-no">19</span>MySQL 的锁</a>
+<a class="toc-item" href="mysql-mvcc/article.html"><span class="toc-no">20</span>MySQL 的 MVCC</a>
+<a class="toc-item" href="bplus-tree/article.html"><span class="toc-no">21</span>数据库索引：为什么是 B+ 树</a>
+<a class="toc-item" href="transaction-acid/article.html"><span class="toc-no">22</span>事务与 ACID</a>
+<a class="toc-item" href="redis-cache/article.html"><span class="toc-no">23</span>Redis 缓存</a>
+<a class="toc-item" href="mysql-lock/article.html"><span class="toc-no">24</span>MySQL 的锁</a>
+<a class="toc-item" href="snowflake-id/article.html"><span class="toc-no">25</span>分布式 ID：雪花算法</a>
 <div class="toc-sub">架构设计</div>
-<a class="toc-item" href="message-queue/article.html"><span class="toc-no">20</span>消息队列</a>
-<a class="toc-item" href="cap-theorem/article.html"><span class="toc-no">21</span>CAP 与 BASE</a>
-<a class="toc-item" href="rate-limiting/article.html"><span class="toc-no">22</span>限流算法</a>
-<a class="toc-item" href="distributed-lock/article.html"><span class="toc-no">23</span>分布式锁</a>
+<a class="toc-item" href="message-queue/article.html"><span class="toc-no">26</span>消息队列</a>
+<a class="toc-item" href="cap-theorem/article.html"><span class="toc-no">27</span>CAP 与 BASE</a>
+<a class="toc-item" href="rate-limiting/article.html"><span class="toc-no">28</span>限流算法</a>
+<a class="toc-item" href="distributed-lock/article.html"><span class="toc-no">29</span>分布式锁</a>
+<a class="toc-item" href="microservices/article.html"><span class="toc-no">30</span>微服务</a>
+<a class="toc-item" href="auth-session-jwt/article.html"><span class="toc-no">31</span>登录认证</a>
+<a class="toc-item" href="idempotency/article.html"><span class="toc-no">32</span>幂等性设计</a>
 <div class="toc-cat">心理学 · 人生</div>
 <div class="toc-sub">幸福</div>
-<a class="toc-item" href="happiness/article.html"><span class="toc-no">24</span>幸福的科学</a>
-<a class="toc-item" href="positive-psychology/article.html"><span class="toc-no">25</span>积极心理学</a>
+<a class="toc-item" href="happiness/article.html"><span class="toc-no">33</span>幸福的科学</a>
+<a class="toc-item" href="positive-psychology/article.html"><span class="toc-no">34</span>积极心理学</a>
 <div class="toc-sub">意义</div>
-<a class="toc-item" href="meaning-of-life/article.html"><span class="toc-no">26</span>人生的意义</a>
+<a class="toc-item" href="meaning-of-life/article.html"><span class="toc-no">35</span>人生的意义</a>
   </nav>
   <footer>拾星 · 用代码，画出看得懂的原理<br>联系邮箱：<a href="mailto:contact@aipulse.lol" style="color:#6ee7c8">contact@aipulse.lol</a><br><a href="videos.html">视频站</a> · <a href="index.html">回到首页</a></footer>
 </main>
