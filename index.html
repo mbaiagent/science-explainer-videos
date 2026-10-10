@@ -83,7 +83,8 @@ const VIDEOS = [
   {cat:'ai', title:"Prompt 工程与结构化输出", desc:"好提示词的结构、少样本、思维链、JSON 输出与校验", path:'prompt-engineering/landscape.html', dur:80, color:'#fdba74'},
   {cat:'cs', title:"MySQL 的锁", desc:"S/X 锁、记录锁·间隙锁·临键锁、死锁", path:'mysql-lock/landscape.html', dur:80, color:'#fb7185'},
   {cat:'ai', title:"Agent 设计模式", desc:"工作流与智能体、五种模式、ReAct 循环、设计原则", path:'agent-patterns/landscape.html', dur:80, color:'#2dd4bf'},
-  {cat:'cs', title:"进程、线程与协程", desc:"隔离的进程、共享的线程、上下文切换、用户态协程", path:'process-thread-coroutine/landscape.html', dur:80, color:'#60a5fa'}
+  {cat:'cs', title:"进程、线程与协程", desc:"隔离的进程、共享的线程、上下文切换、用户态协程", path:'process-thread-coroutine/landscape.html', dur:80, color:'#60a5fa'},
+  {cat:'ai', title:"评估（Evals）", desc:"测试集、三种打分方式、看细分指标、评估驱动迭代", path:'evals/landscape.html', dur:80, color:'#a3e635'}
 ];
 const fmt = s => `${Math.floor(s/60)}:${String(s%60).padStart(2,'0')}`;
 const esc = s => s.replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));

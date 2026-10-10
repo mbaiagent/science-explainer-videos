@@ -1,0 +1,321 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>评估（Evals） · 拾星</title>
+<style>
+  :root{--bg:#07080f;--fg:#f4ede4;--muted:#9a93a8;--acc:#a3e635}
+  html,body{margin:0;height:100%;background:var(--bg);color:var(--fg);
+    font-family:-apple-system,"PingFang SC","Noto Sans SC","Noto Sans CJK SC","Microsoft YaHei",sans-serif}
+  body{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;overflow:hidden}
+  #stage{display:block;background:#07080f;border-radius:12px;box-shadow:0 20px 60px rgba(0,0,0,.55);cursor:pointer}
+  #bar{display:flex;align-items:center;gap:12px;width:min(calc(100vw - 32px),640px)}
+  #btn{width:40px;height:40px;border-radius:50%;border:1px solid rgba(163,230,53,.5);background:transparent;
+    color:var(--acc);font-size:16px;cursor:pointer;flex:none}
+  #seek{flex:1;accent-color:var(--acc)}
+  #time{font-variant-numeric:tabular-nums;font-size:13px;color:var(--muted);min-width:84px;text-align:right}
+  body.render{display:block}
+  body.render #bar{display:none}
+  body.render #stage{border-radius:0;box-shadow:none}
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="bar">
+  <button id="btn" aria-label="播放/暂停">❚❚</button>
+  <input id="seek" type="range" min="0" max="80" step="0.01" value="0">
+  <span id="time">0:00 / 1:20</span>
+</div>
+<script>
+/* ============ 基础设置（横屏 1920×1080） ============ */
+const W = 1920, H = 1080, DUR = 80;
+const cv = document.getElementById('stage'), ctx = cv.getContext('2d');
+cv.width = W; cv.height = H;
+const FONT = '"PingFang SC","Noto Sans SC","Noto Sans CJK SC","Source Han Sans SC","Microsoft YaHei",sans-serif';
+const MONO = '"JetBrains Mono","SF Mono",Menlo,Consolas,"DejaVu Sans Mono","Noto Sans Mono CJK SC","PingFang SC","Microsoft YaHei",monospace';
+const C = {acc:'#a3e635', mint:'#6ee7c8', gold:'#ffd38a', coral:'#ff9e7a', rose:'#ff8a8a', blue:'#9cc3ff', text:'#f4ede4', muted:'#9a93a8', dim:'#4a4558', panel:'#0f0e1f'};
+
+const clamp = (x,a=0,b=1) => Math.max(a, Math.min(b, x));
+const lerp = (a,b,t) => a + (b-a)*t;
+const p = (t,a,b) => clamp((t-a)/(b-a));
+const eo = x => 1 - Math.pow(1-x, 3);
+const eio = x => x < .5 ? 4*x*x*x : 1 - Math.pow(-2*x+2, 3)/2;
+const eback = x => { const c1=1.70158, c3=c1+1; return 1 + c3*Math.pow(x-1,3) + c1*Math.pow(x-1,2); };
+function rnd(seed){ let s = seed>>>0; return () => { s = (s*1664525 + 1013904223)>>>0; return s/4294967296; }; }
+
+let SA = 1;
+const al = a => { ctx.globalAlpha = clamp(SA*a); };
+const sceneA = (t,a,b,f=.5) => Math.min(p(t,a,a+f), 1 - p(t,b-f,b));
+
+function txt(s, x, y, o = {}){
+  const {size=64, weight=700, color=C.text, alpha=1, align='center', glow=0, scale=1, font=FONT} = o;
+  if (alpha <= 0) return;
+  ctx.save(); al(alpha);
+  ctx.font = `${weight} ${size}px ${font}`;
+  ctx.textAlign = align; ctx.textBaseline = 'middle'; ctx.fillStyle = color;
+  if (glow){ ctx.shadowColor = color; ctx.shadowBlur = glow; }
+  if (scale !== 1){ ctx.translate(x, y); ctx.scale(scale, scale); ctx.fillText(s, 0, 0); }
+  else ctx.fillText(s, x, y);
+  ctx.restore();
+}
+function rise(s, x, y, t, t0, o = {}, d = .7){
+  const e = eo(p(t, t0, t0+d));
+  if (e <= 0) return;
+  txt(s, x, y + (1-e)*36, {...o, alpha:(o.alpha ?? 1)*e});
+}
+function rr(x,y,w,h,r){ ctx.beginPath(); ctx.roundRect(x,y,w,h,r); }
+function box(x, y, w, h, a, o = {}){
+  const {fill='rgba(255,255,255,.05)', stroke='rgba(163,230,53,.35)', lw=2, glow=0, r=18, dash=null} = o;
+  if (a <= 0) return;
+  ctx.save(); al(a); rr(x, y, w, h, r); ctx.fillStyle = fill; ctx.fill();
+  if (dash) ctx.setLineDash(dash);
+  ctx.strokeStyle = stroke; ctx.lineWidth = lw; if (glow){ ctx.shadowColor = stroke; ctx.shadowBlur = glow; } ctx.stroke(); ctx.restore();
+}
+function arrow(x1, y1, x2, y2, e, a, color = C.acc, lw = 3){
+  if (e <= 0 || a <= 0) return;
+  const x = lerp(x1, x2, e), y = lerp(y1, y2, e), ang = Math.atan2(y2 - y1, x2 - x1);
+  ctx.save(); al(a); ctx.strokeStyle = color; ctx.fillStyle = color; ctx.lineWidth = lw; ctx.lineCap = 'round';
+  ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x, y); ctx.stroke();
+  if (e > .85){ ctx.translate(x, y); ctx.rotate(ang); ctx.beginPath(); ctx.moveTo(4, 0); ctx.lineTo(-14, -9); ctx.lineTo(-14, 9); ctx.closePath(); ctx.fill(); }
+  ctx.restore();
+}
+function panel(x, y, w, h, title, a){
+  box(x, y, w, h, a, {fill:C.panel, stroke:'rgba(255,255,255,.1)', r:20});
+  if (a <= 0) return;
+  ctx.save(); al(a); ctx.strokeStyle = 'rgba(255,255,255,.07)'; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(x, y + 52); ctx.lineTo(x + w, y + 52); ctx.stroke();
+  ['#ff6b6b','#ffd166','#6ee7a0'].forEach((c, i) => { ctx.fillStyle = c; ctx.globalAlpha = clamp(SA*a*.8); ctx.beginPath(); ctx.arc(x + 30 + i*24, y + 26, 7, 0, 6.283); ctx.fill(); });
+  ctx.restore();
+  txt(title, x + w/2, y + 27, {size:22, weight:500, color:C.muted, font:MONO, alpha:a});
+}
+
+/* ============ 背景 ============ */
+const PARTS = (() => { const r = rnd(197); return Array.from({length:100}, () => ({
+  x:r()*W, y:r()*H, s:r()*2.2+.5, v:r()*12+4, ph:r()*6.283, c:r()<.25})); })();
+function background(t){
+  const g = ctx.createLinearGradient(0,0,W,H);
+  g.addColorStop(0,'#0a0916'); g.addColorStop(.55,'#110f24'); g.addColorStop(1,'#18122c');
+  ctx.globalAlpha = 1; ctx.fillStyle = g; ctx.fillRect(0,0,W,H);
+  const gx = W*.5 + Math.sin(t*.27)*140;
+  const rg = ctx.createRadialGradient(gx, H*.45, 0, gx, H*.45, 950);
+  rg.addColorStop(0,'rgba(163,230,53,0.09)'); rg.addColorStop(1,'rgba(163,230,53,0)');
+  ctx.fillStyle = rg; ctx.fillRect(0,0,W,H);
+  ctx.fillStyle = C.acc;
+  for (let x = 40; x < W; x += 80) for (let y = 40; y < H; y += 80){ ctx.globalAlpha = .06; ctx.fillRect(x, y, 2, 2); }
+  for (const q of PARTS){
+    const y = ((q.y - t*q.v) % H + H) % H, x = q.x + Math.sin(t*.35 + q.ph)*12;
+    ctx.globalAlpha = .2 + .3*(.5 + .5*Math.sin(t*1.2 + q.ph));
+    ctx.fillStyle = q.c ? C.acc : '#d8d0ff';
+    ctx.beginPath(); ctx.arc(x, y, q.s, 0, 6.283); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+}
+function vignette(){
+  const v = ctx.createRadialGradient(W/2, H/2, W*.28, W/2, H/2, W*.62);
+  v.addColorStop(0,'rgba(0,0,0,0)'); v.addColorStop(1,'rgba(0,0,0,.55)');
+  ctx.globalAlpha = 1; ctx.fillStyle = v; ctx.fillRect(0,0,W,H);
+}
+function codeLine(s, x, y, size, a, kw = /\b(public|class|static|void|new|return)\b/){
+  const parts = s.split(/("[^"]*"|\b(?:public|class|static|void|new|return|getstatic|ldc|invokevirtual)\b)/g);
+  ctx.save(); al(a); ctx.font = `500 ${size}px ${MONO}`; ctx.textBaseline = 'middle'; ctx.textAlign = 'left';
+  let xx = x;
+  for (const seg of parts){ if (!seg) continue;
+    ctx.fillStyle = seg.startsWith('"') ? C.mint : /^(public|class|static|void|new|return|getstatic|ldc|invokevirtual)$/.test(seg) ? C.acc : C.text;
+    ctx.fillText(seg, xx, y); xx += ctx.measureText(seg).width; }
+  ctx.restore();
+}
+
+function pill(s, x, y, a, o = {}){
+  const {size=30, color=C.text, stroke='rgba(255,255,255,.2)', fill='rgba(255,255,255,.05)', font=FONT, weight=700} = o;
+  if (a <= 0) return;
+  ctx.save(); ctx.font = `${weight} ${size}px ${font}`; const w = ctx.measureText(s).width + 52; ctx.restore();
+  box(x - w/2, y - size*.9, w, size*1.8, a, {fill, stroke, r:size*.9});
+  txt(s, x, y, {size, weight, color, font, alpha:a});
+}
+function card(h, d, x, y, w, hgt, a, c = C.acc){
+  box(x, y, w, hgt, a, {fill:'rgba(163,230,53,.05)', stroke:c === C.acc ? 'rgba(163,230,53,.5)' : c, r:18});
+  txt(h, x + 30, y + 42, {size:30, weight:900, color:c, align:'left', alpha:a});
+  (Array.isArray(d) ? d : [d]).forEach((s, i) => txt(s, x + 30, y + 92 + i*40, {size:22, weight:600, color:'#d9d2e4', align:'left', alpha:a}));
+}
+function hbar(label, v, x, y, w, a, c, o = {}){
+  const {lw=220, suffix='%', max=100} = o;
+  txt(label, x, y, {size:24, weight:800, align:'left', alpha:a});
+  box(x + lw, y - 18, w, 36, a, {fill:'rgba(255,255,255,.04)', stroke:'rgba(255,255,255,.15)', r:10});
+  if (v > 0){ ctx.save(); al(a); ctx.fillStyle = c; rr(x + lw + 3, y - 15, (w - 6)*clamp(v/max), 30, 8); ctx.fill(); ctx.restore(); }
+  txt(Math.round(v) + suffix, x + lw + w + 16, y, {size:24, weight:800, font:MONO, color:c, align:'left', alpha:a});
+}
+
+/* ============ 场景 1 · 钩子 (0–7s) ============ */
+function s1(t){
+  rise('改了提示词，试了 3 个例子，看起来更好了……', W/2, 150, t, .2, {size:46, weight:900});
+  [0, 1, 2].forEach(i => pill('例子 ' + (i + 1) + '  ✓', 660 + i*300, 270, eback(p(t, .9 + i*.3, 1.3 + i*.3)), {size:28, color:C.mint, stroke:C.mint}));
+  rise('上线后：用户反馈另外一些问题全答错了', W/2, 400, t, 2.4, {size:42, weight:900, color:C.rose});
+  const r = clamp((t - 2.8)/1.4);
+  for (let i = 0; i < 24; i++){ const x = 480 + (i % 12)*80, y = 500 + Math.floor(i/12)*70, bad = [3, 7, 10, 14, 15, 19, 22].includes(i);
+    ctx.save(); al(eo(clamp(r*24 - i))); ctx.fillStyle = bad ? C.rose : 'rgba(163,230,53,.6)'; rr(x, y, 60, 50, 8); ctx.fill(); ctx.restore(); }
+  txt('按下葫芦浮起瓢', W/2, 680, {size:34, weight:800, color:C.gold, alpha:eo(p(t, 4, 4.4))});
+  const k = p(t, 4.6, 5.2);
+  if (k > 0) txt('评估 Evals', W/2, 850, {size:110, weight:900, color:C.acc, glow:40, alpha:clamp(k*2), scale:eback(k)});
+  rise('用数据，而不是感觉，判断 AI 应用变好还是变坏', W/2, 970, t, 5.4, {size:32, weight:700, color:C.muted});
+}
+
+/* ============ 场景 2 · 什么是 Eval (7–19s) ============ */
+function s2(t){
+  rise('Eval：给 AI 应用写的「测试」', W/2, 100, t, 7.2, {size:56, weight:900});
+  const steps = [['测试集', '输入 + 期望 / 评分标准'], ['运行', '用你的系统逐条处理'], ['打分', '规则 / 模型裁判 / 人工'], ['指标', '通过率、分布、对比']];
+  steps.forEach(([h, d], i) => { const x = 280 + i*450, e = eback(p(t, 7.8 + i*.7, 8.3 + i*.7));
+    if (e > 0){ ctx.save(); ctx.translate(x, 330); ctx.scale(e, e); ctx.translate(-x, -330);
+      box(x - 180, 240, 360, 180, clamp(e), {fill:'rgba(163,230,53,.08)', stroke:C.acc, r:24}); ctx.restore(); }
+    txt(h, x, 300, {size:42, weight:900, color:C.acc, alpha:clamp(e)}); txt(d, x, 360, {size:22, weight:600, color:'#d9d2e4', alpha:clamp(e)});
+    if (i) arrow(x - 265, 330, x - 190, 330, e, clamp(e), C.acc, 3); });
+  if (t > 10.6){ const u = ((t - 10.6)/2.2) % 1; ctx.save(); al(1); ctx.fillStyle = C.gold; ctx.shadowColor = C.gold; ctx.shadowBlur = 20; ctx.beginPath(); ctx.arc(lerp(280, 1630, u), 450, 10, 0, 6.283); ctx.fill(); ctx.restore(); }
+  [['普通软件', 'assert add(1, 2) == 3', '结果唯一，对就是对'], ['AI 应用', '「回答要准确、有礼貌、引用出处」', '答案开放、每次可能不同，需要按标准打分']].forEach(([h, c, d], i) => {
+    const e = eo(p(t, 11.6 + i*.8, 12 + i*.8)), x = 160 + i*820;
+    box(x, 560, 780, 230, e, {fill:'rgba(255,255,255,.03)', stroke:i ? C.acc : 'rgba(255,255,255,.25)', r:20});
+    txt(h, x + 30, 605, {size:30, weight:900, color:i ? C.acc : C.text, align:'left', alpha:e});
+    txt(c, x + 30, 670, {size:24, weight:600, font:i ? FONT : MONO, color:C.gold, align:'left', alpha:e});
+    txt(d, x + 30, 730, {size:24, weight:600, color:C.muted, align:'left', alpha:e}); });
+  rise('没有评估，所有的「优化」都只是猜测', W/2, 900, t, 15.2, {size:40, weight:900, color:C.gold});
+}
+
+/* ============ 场景 3 · 测试集 (19–32s) ============ */
+const CATS = [['常见问题', 12, '#a3e635'], ['边界情况', 6, '#ffd38a'], ['线上翻车案例', 5, '#ff8a8a'], ['对抗 / 越狱', 4, '#c084fc'], ['应该拒答的', 3, '#7cc7ff']];
+function s3(t){
+  rise('第一步：建一个好的测试集', W/2, 100, t, 19.2, {size:56, weight:900});
+  let k = 0;
+  CATS.forEach(([h, n, c], i) => { const e = eo(p(t, 19.8 + i*.6, 20.2 + i*.6)), y = 210 + i*95;
+    txt(h, 160, y + 18, {size:28, weight:900, color:c, align:'left', alpha:e});
+    for (let j = 0; j < n; j++){ const ej = eback(p(t, 20 + i*.6 + j*.05, 20.4 + i*.6 + j*.05)); box(440 + j*58, y - 6, 48, 48, clamp(ej), {fill:'rgba(255,255,255,.04)', stroke:c, r:8}); } });
+  txt('起步：几十条就够，持续往里加', 1200, 640, {size:26, weight:800, color:C.gold, alpha:eo(p(t, 23.6, 24))});
+  const card1 = eo(p(t, 24.4, 24.9));
+  panel(1170, 190, 640, 410, 'case_017.json', card1);
+  [['{', C.muted], ['  "input": "我买的耳机没声音，', C.text], ['            能退吗？",', C.text], ['  "expected": {', C.muted], ['    "必须提到": ["7 天无理由", "质量问题"],', C.mint], ['    "不能出现": ["保证退款"],', C.rose], ['    "语气": "礼貌、简洁"', C.text], ['  }', C.muted], ['}', C.muted]].forEach(([s, c], i) =>
+    txt(s, 1195, 270 + i*36, {size:19, weight:600, font:MONO, color:c, align:'left', alpha:eo(p(t, 24.8 + i*.08, 25.2 + i*.08))}));
+  [['来源要真实', '优先用真实用户的问题，而不是自己凭空想'], ['覆盖要全面', '常见、边界、出过错的、应该拒答的都要有'], ['标准要明确', '写清楚「什么算对」，两个人看了结论一致']].forEach(([h, d], i) => {
+    const e = eo(p(t, 27.4 + i*.7, 27.8 + i*.7)), x = 160 + i*560;
+    box(x, 710, 520, 150, e, {fill:'rgba(163,230,53,.06)', stroke:'rgba(163,230,53,.45)', r:18});
+    txt(h, x + 260, 755, {size:30, weight:900, color:C.acc, alpha:e}); txt(d, x + 260, 815, {size:20, weight:600, color:'#d9d2e4', alpha:e}); });
+}
+
+/* ============ 场景 4 · 三种打分 (32–46s) ============ */
+function s4(t){
+  rise('第二步：怎么打分？三种方式', W/2, 100, t, 32.2, {size:56, weight:900});
+  [['代码规则', ['精确匹配、正则', 'JSON 能否解析、字段对不对', '生成的代码能否通过单测'], '✓ 快、便宜、结果稳定', '✗ 只能判断「形式」类的标准', C.acc],
+   ['模型当裁判', ['按评分标准打 1～5 分', '比较两个回答哪个更好', '检查回答是否忠于资料'], '✓ 能判断开放式的回答', '✗ 本身也会出错，需要校准', C.gold],
+   ['人工评审', ['领域专家按标准打分', '抽样检查模型裁判', '分析失败案例'], '✓ 最准，是最终的标准', '✗ 慢、贵，没法每次都做', '#7cc7ff']].forEach(([h, items, pro, con, c], i) => {
+    const st = 32.8 + i*1.4, e = eo(p(t, st, st + .5)), x = 130 + i*570;
+    box(x, 190, 530, 560, e, {fill:'rgba(255,255,255,.03)', stroke:c, r:24});
+    txt(h, x + 265, 245, {size:40, weight:900, color:c, alpha:e});
+    items.forEach((s, k) => txt('· ' + s, x + 40, 330 + k*56, {size:24, weight:600, align:'left', alpha:eo(p(t, st + .3 + k*.2, st + .7 + k*.2))}));
+    txt(pro, x + 265, 580, {size:24, weight:800, color:C.mint, alpha:eo(p(t, st + 1, st + 1.4))});
+    txt(con, x + 265, 640, {size:22, weight:700, color:C.rose, alpha:eo(p(t, st + 1.2, st + 1.6))});
+  });
+  rise('能用代码判断的，就别用模型；模型裁判要先和人工评分对一对，确认靠谱', W/2, 830, t, 38.6, {size:32, weight:900});
+  rise('裁判提示词：给出明确的评分标准，让它先写理由再打分；注意它可能偏爱更长、排在前面的回答', W/2, 900, t, 40.4, {size:26, weight:600, color:C.muted});
+}
+
+/* ============ 场景 5 · 对比 (46–59s) ============ */
+const ROWS = [['常见问题', 82, 91], ['边界情况', 60, 75], ['线上翻车案例', 40, 80], ['对抗 / 越狱', 75, 50], ['应该拒答的', 88, 90]];
+function s5(t){
+  rise('第三步：看指标，更要看细分', W/2, 100, t, 46.2, {size:56, weight:900});
+  const a = eo(p(t, 46.6, 47.1));
+  txt('版本 A（旧提示词）', 760, 200, {size:26, weight:900, color:'rgba(255,255,255,.7)', alpha:a}); txt('版本 B（新提示词）', 1380, 200, {size:26, weight:900, color:C.acc, alpha:a});
+  const g = eo(p(t, 47.4, 48.6));
+  ROWS.forEach(([h, va, vb], i) => { const y = 280 + i*95, e = eo(p(t, 47 + i*.2, 47.4 + i*.2)), drop = vb < va;
+    txt(h, 160, y, {size:26, weight:800, align:'left', alpha:e});
+    hbar('', va*g, 420, y, 480, e, 'rgba(255,255,255,.45)', {lw:0});
+    hbar('', vb*g, 1040, y, 480, e, drop ? C.rose : C.acc, {lw:0});
+    if (drop && t > 49.4) txt('↓ 退步了！', 1700, y, {size:24, weight:900, color:C.rose, align:'left', alpha:eo(p(t, 49.4, 49.8))}); });
+  const avgA = ROWS.reduce((s, r) => s + r[1], 0)/ROWS.length, avgB = ROWS.reduce((s, r) => s + r[2], 0)/ROWS.length;
+  txt(`平均分：${avgA.toFixed(0)} → ${avgB.toFixed(0)}`, W/2, 790, {size:36, weight:900, font:FONT, color:C.mint, alpha:eo(p(t, 50.4, 50.8))});
+  rise('平均分涨了，但「对抗」一类明显变差：只看总分，就会漏掉它', W/2, 860, t, 51.6, {size:32, weight:900, color:C.gold});
+  rise('除了正确率，还要看：延迟、token 花费、拒答率；RAG 看召回和忠实度，Agent 看任务成功率和步数', W/2, 930, t, 53.6, {size:26, weight:600, color:C.muted});
+}
+
+/* ============ 场景 6 · 评估驱动开发 (59–70s) ============ */
+function s6(t){
+  rise('评估驱动的开发循环', W/2, 100, t, 59.2, {size:56, weight:900});
+  const a = eo(p(t, 59.6, 60.1)), cx = 640, cy = 540, R = 270;
+  ctx.save(); al(a*.5); ctx.strokeStyle = C.acc; ctx.lineWidth = 3; ctx.setLineDash([12, 12]); ctx.lineDashOffset = -t*40; ctx.beginPath(); ctx.arc(cx, cy, R, 0, 6.283); ctx.stroke(); ctx.restore();
+  const st = [['改一处', -Math.PI/2], ['跑全量评估', 0], ['和上一版对比', Math.PI/2], ['看失败案例', Math.PI]];
+  const act = t > 60.6 ? Math.floor((t - 60.6)/1.1) % 4 : -1;
+  st.forEach(([s, ang], i) => { const x = cx + Math.cos(ang)*R, y = cy + Math.sin(ang)*R, on = act === i;
+    box(x - 130, y - 44, 260, 88, a, {fill:on ? 'rgba(163,230,53,.22)' : 'rgba(14,20,10,.92)', stroke:C.acc, lw:on ? 3 : 2, glow:on ? 18 : 0, r:20});
+    txt(s, x, y, {size:28, weight:900, alpha:a}); });
+  txt('迭代', cx, cy, {size:48, weight:900, color:C.acc, glow:14, alpha:a});
+  [['每次只改一处', '改动多了，就不知道是谁起的作用'], ['线上翻车，进测试集', '每个 bad case 都变成一条回归测试'], ['放进 CI 自动跑', '提示词、模型、检索参数一变就跑'], ['换模型也要跑', '新模型不一定在你的场景里更好']].forEach(([h, d], i) => {
+    const e = eo(p(t, 61.2 + i*.7, 61.6 + i*.7)), y = 240 + i*150;
+    box(1060, y - 58, 760, 122, e, {fill:'rgba(163,230,53,.05)', stroke:'rgba(163,230,53,.45)', r:18});
+    txt(h, 1090, y - 16, {size:30, weight:900, color:C.acc, align:'left', alpha:e}); txt(d, 1090, y + 30, {size:22, weight:600, color:'#d9d2e4', align:'left', alpha:e}); });
+}
+
+/* ============ 场景 7 · 线上与坑 (70–76s) ============ */
+function s7(t){
+  rise('上线之后，评估还在继续', W/2, 100, t, 70.2, {size:56, weight:900});
+  card('线上评估', ['A/B 测试：新旧版本分流对比', '用户反馈：点赞、点踩、追问率', '抽样人工复核 + 持续监控'], 140, 190, 800, 300, eo(p(t, 70.6, 71)));
+  card('常见的坑', ['测试集太小、太简单，分数虚高', '只看平均分，忽略细分类别', '测试题混进了提示词示例里'], 980, 190, 800, 300, eo(p(t, 71.2, 71.6)), C.rose);
+  rise('评估集是 AI 应用最重要的资产之一：模型可以换，好的测试集一直有用', W/2, 640, t, 72.4, {size:36, weight:900, color:C.gold});
+}
+
+/* ============ 场景 8 · 收尾 (76–80s) ============ */
+function s8(t){
+  [['测试集', '真实、全面、标准明确'], ['打分', '规则 · 裁判 · 人工'], ['看细分', '别被平均分骗了'], ['持续迭代', '改一处，跑全量']].forEach(([a, b], i) => {
+    const st = 76.2 + i*.25, e = eback(p(t, st, st + .5)); if (e <= 0) return;
+    const x = 330 + i*420, y = 330;
+    ctx.save(); ctx.translate(x, y); ctx.scale(e, e); ctx.translate(-x, -y);
+    box(x - 185, y - 90, 370, 180, clamp(e), {fill:'rgba(163,230,53,.08)', stroke:'rgba(163,230,53,.5)', r:26}); ctx.restore();
+    txt(a, x, y - 22, {size:44, weight:900, color:C.acc, alpha:clamp(e)}); txt(b, x, y + 40, {size:24, weight:600, color:C.muted, alpha:clamp(e)});
+  });
+  rise('用数据说话，而不是凭感觉', W/2, 600, t, 77.0, {size:64, weight:900, glow:22});
+  rise('关注拾星，一起看懂 AI', W/2, 760, t, 77.6, {size:36, weight:500, color:C.muted});
+}
+
+/* ============ 总调度 ============ */
+const SCENES = [[s1,-1,7],[s2,7,19],[s3,19,32],[s4,32,46],[s5,46,59],[s6,59,70],[s7,70,76],[s8,76,80]];
+function draw(t){
+  t = clamp(t, 0, DUR);
+  ctx.save(); ctx.globalAlpha = 1; ctx.clearRect(0,0,W,H); background(t);
+  for (const [fn,a,b] of SCENES){
+    if (t < a || t > b) continue;
+    SA = sceneA(t, a, b, b === DUR ? .8 : .5);
+    if (SA > 0){ ctx.save(); fn(t); ctx.restore(); }
+  }
+  SA = 1; vignette();
+  const fo = p(t, DUR - .8, DUR);
+  if (fo > 0){ ctx.globalAlpha = fo; ctx.fillStyle = '#000'; ctx.fillRect(0,0,W,H); }
+  ctx.restore();
+}
+
+/* ============ 播放器 / 逐帧渲染接口 ============ */
+const isRender = new URLSearchParams(location.search).has('render');
+window.DURATION = DUR;
+window.renderFrame = t => draw(t);
+const btn = document.getElementById('btn'), seek = document.getElementById('seek'), timeEl = document.getElementById('time');
+const fmt = s => `${Math.floor(s/60)}:${String(Math.floor(s%60)).padStart(2,'0')}`;
+function fit(){
+  if (isRender){ cv.style.width = W+'px'; cv.style.height = H+'px'; return; }
+  const w = Math.min(innerWidth - 32, (innerHeight - 84)*16/9);
+  cv.style.width = w + 'px'; cv.style.height = w*9/16 + 'px';
+}
+addEventListener('resize', fit); fit();
+
+let cur = 0, playing = !isRender, last = null;
+function toggle(){ if (cur >= DUR) cur = 0; playing = !playing; }
+btn.onclick = toggle; cv.onclick = toggle;
+addEventListener('keydown', e => { if (e.code === 'Space'){ e.preventDefault(); toggle(); } });
+seek.oninput = () => { cur = +seek.value; draw(cur); };
+function loop(ts){
+  if (playing && last != null){ cur += (ts - last)/1000; if (cur >= DUR){ cur = DUR; playing = false; } }
+  last = ts; draw(cur);
+  seek.value = cur; timeEl.textContent = `${fmt(cur)} / ${fmt(DUR)}`;
+  btn.textContent = playing ? '❚❚' : (cur >= DUR ? '↺' : '▶');
+  requestAnimationFrame(loop);
+}
+document.fonts.ready.then(() => {
+  window.ready = true;
+  if (isRender) draw(0); else requestAnimationFrame(loop);
+});
+</script>
+</body>
+</html>
