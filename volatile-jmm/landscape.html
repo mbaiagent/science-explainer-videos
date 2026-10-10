@@ -1,0 +1,379 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>volatile 与 Java 内存模型 · 拾星</title>
+<style>
+  :root{--bg:#07080f;--fg:#f4ede4;--muted:#9a93a8;--acc:#d8b4fe}
+  html,body{margin:0;height:100%;background:var(--bg);color:var(--fg);
+    font-family:-apple-system,"PingFang SC","Noto Sans SC","Noto Sans CJK SC","Microsoft YaHei",sans-serif}
+  body{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;overflow:hidden}
+  #stage{display:block;background:#07080f;border-radius:12px;box-shadow:0 20px 60px rgba(0,0,0,.55);cursor:pointer}
+  #bar{display:flex;align-items:center;gap:12px;width:min(calc(100vw - 32px),640px)}
+  #btn{width:40px;height:40px;border-radius:50%;border:1px solid rgba(216,180,254,.5);background:transparent;
+    color:var(--acc);font-size:16px;cursor:pointer;flex:none}
+  #seek{flex:1;accent-color:var(--acc)}
+  #time{font-variant-numeric:tabular-nums;font-size:13px;color:var(--muted);min-width:84px;text-align:right}
+  body.render{display:block}
+  body.render #bar{display:none}
+  body.render #stage{border-radius:0;box-shadow:none}
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="bar">
+  <button id="btn" aria-label="播放/暂停">❚❚</button>
+  <input id="seek" type="range" min="0" max="84" step="0.01" value="0">
+  <span id="time">0:00 / 1:24</span>
+</div>
+<script>
+/* ============ 基础设置（横屏 1920×1080） ============ */
+const W = 1920, H = 1080, DUR = 84;
+const cv = document.getElementById('stage'), ctx = cv.getContext('2d');
+cv.width = W; cv.height = H;
+const FONT = '"PingFang SC","Noto Sans SC","Noto Sans CJK SC","Source Han Sans SC","Microsoft YaHei",sans-serif';
+const MONO = '"JetBrains Mono","SF Mono",Menlo,Consolas,"DejaVu Sans Mono","Noto Sans Mono CJK SC","PingFang SC","Microsoft YaHei",monospace';
+const C = {acc:'#d8b4fe', mint:'#6ee7c8', gold:'#ffd38a', coral:'#ff9e7a', rose:'#ff8a8a', blue:'#9cc3ff', text:'#f4ede4', muted:'#9a93a8', dim:'#4a4558', panel:'#0f0e1f'};
+
+const clamp = (x,a=0,b=1) => Math.max(a, Math.min(b, x));
+const lerp = (a,b,t) => a + (b-a)*t;
+const p = (t,a,b) => clamp((t-a)/(b-a));
+const eo = x => 1 - Math.pow(1-x, 3);
+const eio = x => x < .5 ? 4*x*x*x : 1 - Math.pow(-2*x+2, 3)/2;
+const eback = x => { const c1=1.70158, c3=c1+1; return 1 + c3*Math.pow(x-1,3) + c1*Math.pow(x-1,2); };
+function rnd(seed){ let s = seed>>>0; return () => { s = (s*1664525 + 1013904223)>>>0; return s/4294967296; }; }
+
+let SA = 1;
+const al = a => { ctx.globalAlpha = clamp(SA*a); };
+const sceneA = (t,a,b,f=.5) => Math.min(p(t,a,a+f), 1 - p(t,b-f,b));
+
+function txt(s, x, y, o = {}){
+  const {size=64, weight=700, color=C.text, alpha=1, align='center', glow=0, scale=1, font=FONT} = o;
+  if (alpha <= 0) return;
+  ctx.save(); al(alpha);
+  ctx.font = `${weight} ${size}px ${font}`;
+  ctx.textAlign = align; ctx.textBaseline = 'middle'; ctx.fillStyle = color;
+  if (glow){ ctx.shadowColor = color; ctx.shadowBlur = glow; }
+  if (scale !== 1){ ctx.translate(x, y); ctx.scale(scale, scale); ctx.fillText(s, 0, 0); }
+  else ctx.fillText(s, x, y);
+  ctx.restore();
+}
+function rise(s, x, y, t, t0, o = {}, d = .7){
+  const e = eo(p(t, t0, t0+d));
+  if (e <= 0) return;
+  txt(s, x, y + (1-e)*36, {...o, alpha:(o.alpha ?? 1)*e});
+}
+function rr(x,y,w,h,r){ ctx.beginPath(); ctx.roundRect(x,y,w,h,r); }
+function box(x, y, w, h, a, o = {}){
+  const {fill='rgba(255,255,255,.05)', stroke='rgba(216,180,254,.35)', lw=2, glow=0, r=18, dash=null} = o;
+  if (a <= 0) return;
+  ctx.save(); al(a); rr(x, y, w, h, r); ctx.fillStyle = fill; ctx.fill();
+  if (dash) ctx.setLineDash(dash);
+  ctx.strokeStyle = stroke; ctx.lineWidth = lw; if (glow){ ctx.shadowColor = stroke; ctx.shadowBlur = glow; } ctx.stroke(); ctx.restore();
+}
+function arrow(x1, y1, x2, y2, e, a, color = C.acc, lw = 3){
+  if (e <= 0 || a <= 0) return;
+  const x = lerp(x1, x2, e), y = lerp(y1, y2, e), ang = Math.atan2(y2 - y1, x2 - x1);
+  ctx.save(); al(a); ctx.strokeStyle = color; ctx.fillStyle = color; ctx.lineWidth = lw; ctx.lineCap = 'round';
+  ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x, y); ctx.stroke();
+  if (e > .85){ ctx.translate(x, y); ctx.rotate(ang); ctx.beginPath(); ctx.moveTo(4, 0); ctx.lineTo(-14, -9); ctx.lineTo(-14, 9); ctx.closePath(); ctx.fill(); }
+  ctx.restore();
+}
+function panel(x, y, w, h, title, a){
+  box(x, y, w, h, a, {fill:C.panel, stroke:'rgba(255,255,255,.1)', r:20});
+  if (a <= 0) return;
+  ctx.save(); al(a); ctx.strokeStyle = 'rgba(255,255,255,.07)'; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(x, y + 52); ctx.lineTo(x + w, y + 52); ctx.stroke();
+  ['#ff6b6b','#ffd166','#6ee7a0'].forEach((c, i) => { ctx.fillStyle = c; ctx.globalAlpha = clamp(SA*a*.8); ctx.beginPath(); ctx.arc(x + 30 + i*24, y + 26, 7, 0, 6.283); ctx.fill(); });
+  ctx.restore();
+  txt(title, x + w/2, y + 27, {size:22, weight:500, color:C.muted, font:MONO, alpha:a});
+}
+
+/* ============ 背景 ============ */
+const PARTS = (() => { const r = rnd(293); return Array.from({length:100}, () => ({
+  x:r()*W, y:r()*H, s:r()*2.2+.5, v:r()*12+4, ph:r()*6.283, c:r()<.25})); })();
+function background(t){
+  const g = ctx.createLinearGradient(0,0,W,H);
+  g.addColorStop(0,'#0a0916'); g.addColorStop(.55,'#110f24'); g.addColorStop(1,'#18122c');
+  ctx.globalAlpha = 1; ctx.fillStyle = g; ctx.fillRect(0,0,W,H);
+  const gx = W*.5 + Math.sin(t*.27)*140;
+  const rg = ctx.createRadialGradient(gx, H*.45, 0, gx, H*.45, 950);
+  rg.addColorStop(0,'rgba(216,180,254,0.09)'); rg.addColorStop(1,'rgba(216,180,254,0)');
+  ctx.fillStyle = rg; ctx.fillRect(0,0,W,H);
+  ctx.fillStyle = C.acc;
+  for (let x = 40; x < W; x += 80) for (let y = 40; y < H; y += 80){ ctx.globalAlpha = .06; ctx.fillRect(x, y, 2, 2); }
+  for (const q of PARTS){
+    const y = ((q.y - t*q.v) % H + H) % H, x = q.x + Math.sin(t*.35 + q.ph)*12;
+    ctx.globalAlpha = .2 + .3*(.5 + .5*Math.sin(t*1.2 + q.ph));
+    ctx.fillStyle = q.c ? C.acc : '#d8d0ff';
+    ctx.beginPath(); ctx.arc(x, y, q.s, 0, 6.283); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+}
+function vignette(){
+  const v = ctx.createRadialGradient(W/2, H/2, W*.28, W/2, H/2, W*.62);
+  v.addColorStop(0,'rgba(0,0,0,0)'); v.addColorStop(1,'rgba(0,0,0,.55)');
+  ctx.globalAlpha = 1; ctx.fillStyle = v; ctx.fillRect(0,0,W,H);
+}
+function codeLine(s, x, y, size, a, kw = /\b(public|class|static|void|new|return)\b/){
+  const parts = s.split(/("[^"]*"|\b(?:public|class|static|void|new|return|getstatic|ldc|invokevirtual)\b)/g);
+  ctx.save(); al(a); ctx.font = `500 ${size}px ${MONO}`; ctx.textBaseline = 'middle'; ctx.textAlign = 'left';
+  let xx = x;
+  for (const seg of parts){ if (!seg) continue;
+    ctx.fillStyle = seg.startsWith('"') ? C.mint : /^(public|class|static|void|new|return|getstatic|ldc|invokevirtual)$/.test(seg) ? C.acc : C.text;
+    ctx.fillText(seg, xx, y); xx += ctx.measureText(seg).width; }
+  ctx.restore();
+}
+
+function card(h, lines, x, y, w, hh, a, c = C.acc, o = {}){
+  const {hs=30, ls=22, lh=40} = o;
+  box(x, y, w, hh, a, {fill:'rgba(216,180,254,.05)', stroke:c === C.acc ? 'rgba(216,180,254,.5)' : c, r:20});
+  txt(h, x + 30, y + 44, {size:hs, weight:900, color:c, align:'left', alpha:a});
+  lines.forEach((s, i) => txt(s, x + 30, y + 96 + i*lh, {size:ls, weight:600, color:'#d9d2e4', align:'left', alpha:a}));
+}
+function cell(label, val, x, y, w, a, c = C.acc, hl = false){
+  box(x - w/2, y - 34, w, 68, a, {fill:hl ? 'rgba(216,180,254,.16)' : 'rgba(255,255,255,.05)', stroke:c, r:12});
+  txt(label + ' = ' + val, x, y, {size:24, weight:800, font:MONO, color:hl ? c : C.text, alpha:a});
+}
+function spinner(x, y, r, t, a, c){
+  if (a <= 0) return;
+  ctx.save(); al(a); ctx.strokeStyle = c; ctx.lineWidth = 6; ctx.lineCap = 'round';
+  ctx.beginPath(); ctx.arc(x, y, r, t*6, t*6 + 4.4); ctx.stroke(); ctx.restore();
+}
+
+/* ============ 场景 1 · 钩子 (0–7s) ============ */
+function s1(t){
+  rise('主线程已经把 stop 设成 true，另一个线程却永远停不下来', W/2, 110, t, .2, {size:50, weight:900});
+  const a = eo(p(t, .8, 1.3));
+  panel(140, 200, 780, 420, '工作线程', a);
+  codeLine('static boolean stop = false;', 180, 300, 28, a);
+  codeLine('while (!stop) {', 180, 380, 28, eo(p(t, 1.1, 1.5)));
+  codeLine('    n++;', 180, 430, 28, eo(p(t, 1.1, 1.5)));
+  codeLine('}', 180, 480, 28, eo(p(t, 1.1, 1.5)));
+  spinner(780, 430, 46, t, eo(p(t, 1.4, 1.8)), C.acc);
+  txt('还在转…', 780, 540, {size:24, weight:800, color:C.acc, alpha:eo(p(t, 3.2, 3.6))});
+  const b = eo(p(t, 1.8, 2.3));
+  panel(1000, 200, 780, 420, '主线程', b);
+  codeLine('Thread.sleep(1000);', 1040, 300, 28, b);
+  codeLine('stop = true;', 1040, 380, 28, eo(p(t, 2.3, 2.7)));
+  txt('✓ 已写入', 1450, 380, {size:26, weight:900, color:C.mint, align:'left', alpha:eo(p(t, 2.6, 3))});
+  const sec = Math.max(0, (t - 2.6)*1.6);
+  txt('已经过去 ' + sec.toFixed(1) + ' 秒…', 1390, 500, {size:28, weight:800, color:C.rose, font:MONO, alpha:eo(p(t, 2.8, 3.2))});
+  rise('本机 JDK 21 实测：连跑 8 次，8 次都停不下来', W/2, 700, t, 3.8, {size:32, weight:900, color:C.rose});
+  rise('给 stop 加上 volatile，立刻就能停。为什么？', W/2, 820, t, 4.8, {size:40, weight:900, color:C.gold});
+}
+
+/* ============ 场景 2 · 为什么看不见 (7–18s) ============ */
+function s2(t){
+  rise('为什么一个线程的写，另一个线程「看不见」？', W/2, 90, t, 7.2, {size:52, weight:900});
+  // 左：硬件
+  const a = eo(p(t, 7.8, 8.3));
+  txt('原因一：硬件', 500, 180, {size:32, weight:900, color:C.blue, alpha:a});
+  [['CPU 核 1', 300], ['CPU 核 2', 700]].forEach(([s, x], i) => { const e = eo(p(t, 8.1 + i*.2, 8.5 + i*.2));
+    box(x - 170, 230, 340, 90, e, {fill:'rgba(255,255,255,.06)', stroke:'rgba(255,255,255,.3)', r:14}); txt(s + '（寄存器）', x, 275, {size:24, weight:800, alpha:e});
+    box(x - 170, 340, 340, 70, e, {fill:'rgba(156,195,255,.08)', stroke:C.blue, r:14}); txt('写缓冲区', x, 375, {size:22, weight:700, color:C.blue, alpha:e});
+    box(x - 170, 430, 340, 70, e, {fill:'rgba(156,195,255,.08)', stroke:C.blue, r:14}); txt('L1 / L2 缓存', x, 465, {size:22, weight:700, color:C.blue, alpha:e}); });
+  const m = eo(p(t, 8.8, 9.3));
+  box(130, 540, 740, 80, m, {fill:'rgba(255,255,255,.05)', stroke:'rgba(255,255,255,.3)', r:14}); txt('共享缓存 / 主内存', 500, 580, {size:24, weight:800, alpha:m});
+  txt('写先进写缓冲区，过一会儿才对其他核可见', 500, 670, {size:22, weight:700, color:C.muted, alpha:eo(p(t, 9.6, 10))});
+  txt('缓存一致性协议保证「最终一致」，但不保证「立刻」和「顺序」', 500, 712, {size:22, weight:700, color:C.muted, alpha:eo(p(t, 10, 10.4))});
+  // 右：编译器
+  const b = eo(p(t, 11, 11.5));
+  txt('原因二：编译器 / JIT 优化', 1400, 180, {size:32, weight:900, color:C.acc, alpha:b});
+  panel(1000, 230, 800, 190, '你写的', b);
+  codeLine('while (!stop) n++;', 1040, 335, 28, b);
+  arrow(1400, 430, 1400, 490, eo(p(t, 12, 12.4)), b, C.acc, 3);
+  panel(1000, 500, 800, 220, 'JIT 编译后（效果等价于）', eo(p(t, 12.4, 12.9)));
+  codeLine('if (!stop) {', 1040, 590, 28, eo(p(t, 12.6, 13)));
+  codeLine('    while (true) n++;', 1040, 645, 28, eo(p(t, 12.8, 13.2)));
+  codeLine('}', 1040, 690, 28, eo(p(t, 12.8, 13.2)));
+  txt('单线程看 stop 不会变，就只读一次', 1400, 760, {size:24, weight:800, color:C.gold, alpha:eo(p(t, 13.4, 13.8))});
+  const c = eo(p(t, 14.6, 15.1));
+  box(260, 830, 1400, 170, c, {fill:'rgba(216,180,254,.08)', stroke:C.acc, r:22, glow:14});
+  txt('开头那个例子，罪魁祸首是 JIT：用 -Xint 关掉 JIT 只解释执行，就能停下来', W/2, 880, {size:28, weight:900, color:C.acc, alpha:c});
+  txt('还有原因三：指令重排序 —— 代码的执行顺序，不一定是你写的顺序', W/2, 945, {size:26, weight:700, alpha:eo(p(t, 15.6, 16))});
+}
+
+/* ============ 场景 3 · 指令重排序 (18–30s) ============ */
+function s3(t){
+  rise('指令重排序：执行顺序 ≠ 代码顺序', W/2, 90, t, 18.2, {size:54, weight:900});
+  rise('编译器和 CPU 为了跑得快，只要单线程结果不变，就可以调整顺序（as-if-serial）', W/2, 160, t, 18.6, {size:26, weight:700, color:C.muted});
+  const a = eo(p(t, 19.2, 19.7));
+  panel(140, 220, 760, 260, '线程 A', a); panel(1020, 220, 760, 260, '线程 B', a);
+  codeLine('x = 1;', 190, 320, 32, eo(p(t, 19.6, 20))); codeLine('r1 = y;', 190, 400, 32, eo(p(t, 19.8, 20.2)));
+  codeLine('y = 1;', 1070, 320, 32, eo(p(t, 19.6, 20))); codeLine('r2 = x;', 1070, 400, 32, eo(p(t, 19.8, 20.2)));
+  txt('x、y 初始都是 0', 600, 360, {size:22, weight:700, color:C.muted, alpha:eo(p(t, 20, 20.4))});
+  txt('同时运行', 1480, 360, {size:22, weight:700, color:C.muted, alpha:eo(p(t, 20, 20.4))});
+  const R = [['r1=1, r2=1', '两边交错', C.mint], ['r1=0, r2=1', 'A 先跑完', C.mint], ['r1=1, r2=0', 'B 先跑完', C.mint], ['r1=0, r2=0', '按代码顺序不可能！', C.rose]];
+  R.forEach(([r, d, c], i) => { const e = eo(p(t, 21 + i*.6, 21.4 + i*.6)), x = 300 + i*440;
+    box(x - 200, 530, 400, 130, e, {fill:i === 3 ? 'rgba(255,138,138,.10)' : 'rgba(255,255,255,.04)', stroke:c, r:18, glow:i === 3 ? 12 : 0});
+    txt(r, x, 575, {size:28, weight:900, font:MONO, color:c, alpha:e}); txt(d, x, 625, {size:22, weight:700, color:i === 3 ? C.rose : C.muted, alpha:e}); });
+  const b = eo(p(t, 23.8, 24.3));
+  box(140, 710, 1640, 200, b, {fill:'rgba(255,255,255,.03)', stroke:'rgba(255,255,255,.2)', r:22});
+  txt('本机实测，每种写法各跑 200 万次：', 180, 755, {size:26, weight:800, align:'left', alpha:b});
+  txt('普通变量：r1 = r2 = 0 出现了 217,122 次', 180, 815, {size:28, weight:900, color:C.rose, align:'left', alpha:eo(p(t, 24.6, 25))});
+  txt('volatile：0 次', 1180, 815, {size:28, weight:900, color:C.mint, align:'left', alpha:eo(p(t, 25.4, 25.8))});
+  txt('效果相当于「读」跑到了「写」前面（写缓冲区、JIT 都可能造成）', 180, 870, {size:22, weight:700, color:C.muted, align:'left', alpha:eo(p(t, 26.2, 26.6))});
+  rise('单线程里看不出来，多线程里就成了 bug', W/2, 980, t, 27.2, {size:32, weight:900, color:C.gold});
+}
+
+/* ============ 场景 4 · JMM (30–41s) ============ */
+function s4(t){
+  rise('Java 内存模型（JMM）', W/2, 90, t, 30.2, {size:56, weight:900});
+  rise('一套规范：规定一个线程的写，什么时候对另一个线程「一定可见」', W/2, 160, t, 30.6, {size:28, weight:700, color:C.muted});
+  const a = eo(p(t, 31.2, 31.7));
+  box(560, 600, 800, 120, a, {fill:'rgba(255,255,255,.06)', stroke:'rgba(255,255,255,.35)', r:18});
+  txt('主内存（所有线程共享）', W/2, 635, {size:26, weight:900, alpha:a});
+  txt('stop = true', W/2, 685, {size:24, weight:800, font:MONO, color:C.gold, alpha:eo(p(t, 33, 33.4))});
+  [['线程 A', '工作内存', 500, 'stop = true', C.gold], ['线程 B', '工作内存', 1420, 'stop = false', C.rose]].forEach(([th, wm, x, v, c], i) => { const e = eo(p(t, 31.6 + i*.3, 32 + i*.3));
+    box(x - 220, 240, 440, 250, e, {fill:'rgba(216,180,254,.06)', stroke:C.acc, r:20});
+    txt(th, x, 285, {size:30, weight:900, color:C.acc, alpha:e}); txt(wm + '（副本）', x, 335, {size:22, weight:700, color:C.muted, alpha:e});
+    box(x - 150, 380, 300, 64, e, {fill:'rgba(255,255,255,.05)', stroke:c, r:12}); txt(v, x, 412, {size:24, weight:800, font:MONO, color:c, alpha:e}); });
+  arrow(560, 495, 760, 595, eo(p(t, 32.6, 33.1)), a, C.gold, 3); txt('写回', 610, 560, {size:20, weight:700, color:C.gold, align:'right', alpha:eo(p(t, 33, 33.4))});
+  arrow(1160, 595, 1360, 495, eo(p(t, 33.6, 34.1)), a*(.4 + .6*Math.abs(Math.sin(t*2))), C.rose, 3); txt('什么时候重新读？不确定', 1310, 560, {size:20, weight:700, color:C.rose, align:'left', alpha:eo(p(t, 34, 34.4))});
+  txt('「工作内存」是抽象概念：对应寄存器、缓存、写缓冲，以及编译器优化', W/2, 770, {size:22, weight:700, color:C.muted, alpha:eo(p(t, 34.8, 35.2))});
+  [['原子性', '一个操作不可分割', 'synchronized、原子类'], ['可见性', '写了，别人能看到', 'volatile、synchronized、final'], ['有序性', '不被乱序执行', 'volatile、synchronized']].forEach(([h, d, s], i) => { const e = eo(p(t, 36 + i*.6, 36.5 + i*.6)), x = 400 + i*560;
+    box(x - 260, 820, 520, 180, e, {fill:'rgba(216,180,254,.07)', stroke:'rgba(216,180,254,.5)', r:20});
+    txt(h, x, 865, {size:32, weight:900, color:C.acc, alpha:e}); txt(d, x, 915, {size:22, weight:700, alpha:e}); txt(s, x, 960, {size:20, weight:700, color:C.muted, alpha:e}); });
+}
+
+/* ============ 场景 5 · volatile 做了什么 (41–53s) ============ */
+function s5(t){
+  rise('volatile 做了什么', W/2, 90, t, 41.2, {size:56, weight:900});
+  card('✓ 可见性', ['写 volatile：立刻对其他线程可见', '读 volatile：总是读到最新值，', '不会被 JIT 缓存在寄存器里'], 100, 170, 560, 270, eo(p(t, 41.8, 42.3)), C.mint);
+  card('✓ 禁止重排序', ['前后插入内存屏障，', '普通读写不能越过 volatile 读写', '（具体规则见下）'], 680, 170, 560, 270, eo(p(t, 42.6, 43.1)), C.mint);
+  card('✗ 不保证原子性', ['volatile count++ 仍然是', '读-改-写三步，照样丢失更新'], 1260, 170, 560, 270, eo(p(t, 43.4, 43.9)), C.rose);
+  // 内存屏障
+  const a = eo(p(t, 44.6, 45.1));
+  box(100, 490, 1000, 450, a, {fill:'rgba(255,255,255,.03)', stroke:'rgba(255,255,255,.18)', r:22});
+  txt('内存屏障（JMM 的保守策略）', 600, 535, {size:28, weight:900, color:C.acc, alpha:a});
+  const rowsW = [['普通读写', C.muted], ['StoreStore 屏障', C.gold], ['volatile 写', C.acc], ['StoreLoad 屏障', C.gold]];
+  const rowsR = [['volatile 读', C.acc], ['LoadLoad 屏障', C.gold], ['LoadStore 屏障', C.gold], ['普通读写', C.muted]];
+  rowsW.forEach(([s, c], i) => { const e = eo(p(t, 45.2 + i*.3, 45.6 + i*.3)), y = 610 + i*72;
+    box(150, y - 28, 400, 56, e, {fill:c === C.gold ? 'rgba(255,211,138,.08)' : 'rgba(255,255,255,.05)', stroke:c, r:12, dash:c === C.gold ? [6, 6] : null});
+    txt(s, 350, y, {size:22, weight:800, color:c, alpha:e}); });
+  rowsR.forEach(([s, c], i) => { const e = eo(p(t, 46.6 + i*.3, 47 + i*.3)), y = 610 + i*72;
+    box(650, y - 28, 400, 56, e, {fill:c === C.gold ? 'rgba(255,211,138,.08)' : 'rgba(255,255,255,.05)', stroke:c, r:12, dash:c === C.gold ? [6, 6] : null});
+    txt(s, 850, y, {size:22, weight:800, color:c, alpha:e}); });
+  txt('x86 上：volatile 写之后加一条 lock 前缀指令，起 StoreLoad 屏障的作用', 600, 905, {size:20, weight:700, color:C.muted, alpha:eo(p(t, 48.2, 48.6))});
+  // 不保证原子性
+  const b = eo(p(t, 49, 49.5));
+  panel(1160, 490, 660, 450, 'volatile count++ 实测', b);
+  txt('4 个线程，各执行 100 万次', 1490, 580, {size:22, weight:700, color:C.muted, alpha:b});
+  txt('期望', 1220, 650, {size:26, weight:800, color:C.muted, align:'left', alpha:b}); txt('4,000,000', 1760, 650, {size:30, weight:900, font:MONO, color:C.mint, align:'right', alpha:b});
+  txt('实测', 1220, 720, {size:26, weight:800, color:C.muted, align:'left', alpha:eo(p(t, 49.6, 50))}); txt('2,786,860', 1760, 720, {size:30, weight:900, font:MONO, color:C.rose, align:'right', alpha:eo(p(t, 49.6, 50))});
+  txt('复合操作要用 AtomicInteger 或加锁', 1490, 810, {size:26, weight:900, color:C.gold, alpha:eo(p(t, 50.6, 51))});
+  txt('（本机某次运行，每次结果不同）', 1490, 870, {size:20, weight:600, color:C.muted, alpha:eo(p(t, 51, 51.4))});
+}
+
+/* ============ 场景 6 · happens-before (53–65s) ============ */
+function s6(t){
+  rise('happens-before：判断「一定看得见」的规则', W/2, 90, t, 53.2, {size:52, weight:900});
+  rise('A happens-before B：A 的结果对 B 可见，且 A 排在 B 之前', W/2, 160, t, 53.6, {size:28, weight:700, color:C.muted});
+  const rules = [['程序顺序', '同一线程内，前面的操作 hb 后面的'], ['监视器锁', '解锁 hb 之后对同一把锁的加锁'], ['volatile', '写 hb 之后对同一变量的读'], ['线程启动', 'start() hb 新线程里的每个操作'], ['线程结束', '线程里的操作 hb 别的线程 join() 返回'], ['传递性', 'A hb B，B hb C → A hb C']];
+  rules.forEach(([h, d], i) => { const e = eo(p(t, 54.2 + i*.45, 54.6 + i*.45)), y = 250 + i*95;
+    box(100, y - 38, 820, 76, e, {fill:'rgba(216,180,254,.06)', stroke:'rgba(216,180,254,.45)', r:14});
+    txt(h, 130, y, {size:26, weight:900, color:C.acc, align:'left', alpha:e}); txt(d, 300, y, {size:22, weight:700, align:'left', alpha:e}); });
+  // 例子
+  const a = eo(p(t, 57.6, 58.1));
+  txt('例：用 volatile 安全地「发布」数据', 1380, 230, {size:28, weight:900, color:C.gold, alpha:a});
+  panel(1000, 280, 360, 300, '线程 A', a); panel(1420, 280, 400, 300, '线程 B', a);
+  txt('data = 42;', 1040, 380, {size:26, weight:700, font:MONO, align:'left', alpha:eo(p(t, 58.2, 58.6))});
+  txt('ready = true;', 1040, 480, {size:26, weight:700, font:MONO, color:C.acc, align:'left', alpha:eo(p(t, 58.4, 58.8))});
+  txt('if (ready)', 1460, 380, {size:26, weight:700, font:MONO, color:C.acc, align:'left', alpha:eo(p(t, 58.8, 59.2))});
+  txt('  use(data);', 1460, 480, {size:26, weight:700, font:MONO, align:'left', alpha:eo(p(t, 59, 59.4))});
+  arrow(1180, 400, 1180, 455, eo(p(t, 59.8, 60.2)), a, C.mint, 3); txt('①', 1210, 428, {size:24, weight:900, color:C.mint, alpha:eo(p(t, 59.8, 60.2))});
+  arrow(1266, 470, 1452, 394, eo(p(t, 60.4, 60.9)), a, C.acc, 3); txt('②', 1300, 420, {size:24, weight:900, color:C.acc, alpha:eo(p(t, 60.6, 61))});
+  arrow(1600, 400, 1600, 455, eo(p(t, 61.2, 61.6)), a, C.mint, 3); txt('③', 1630, 428, {size:24, weight:900, color:C.mint, alpha:eo(p(t, 61.2, 61.6))});
+  txt('① 程序顺序  →  ② volatile 写-读  →  ③ 程序顺序', 1410, 625, {size:22, weight:800, alpha:eo(p(t, 61.4, 61.8))});
+  rise('传递性 → 线程 B 一定看到 data = 42', 1410, 690, t, 62, {size:28, weight:900, color:C.mint});
+  rise('ready 不加 volatile：B 可能看到 ready=true，却读到 data=0', 1410, 750, t, 62.8, {size:22, weight:700, color:C.rose});
+  rise('volatile 写像一道「闸门」：它之前的所有写，都随它一起被看见', W/2, 900, t, 63.4, {size:30, weight:900, color:C.gold});
+}
+
+/* ============ 场景 7 · 双重检查锁与适用场景 (65–78s) ============ */
+function s7(t){
+  rise('经典案例：双重检查锁单例', W/2, 90, t, 65.2, {size:54, weight:900});
+  const a = eo(p(t, 65.6, 66.1));
+  panel(80, 160, 860, 470, 'Singleton.java', a);
+  [['private static volatile Singleton instance;', C.acc], ['', C.text], ['static Singleton get() {', C.text], ['  if (instance == null) {          // 第一次检查', C.text], ['    synchronized (Singleton.class) {', C.text], ['      if (instance == null)         // 第二次检查', C.text], ['        instance = new Singleton();', C.gold], ['    }', C.text], ['  }', C.text], ['  return instance;', C.text], ['}', C.text]].forEach(([s, c], i) => {
+    if (s) txt(s, 115, 240 + i*36, {size:21, weight:600, font:MONO, color:c, align:'left', alpha:eo(p(t, 66 + i*.08, 66.4 + i*.08))}); });
+  // new 的三步
+  const b = eo(p(t, 67.4, 67.9));
+  txt('new Singleton() 其实是三步', 1390, 190, {size:30, weight:900, color:C.gold, alpha:b});
+  const steps = ['① 分配内存', '② 执行构造函数，初始化字段', '③ 把引用赋给 instance'];
+  const k = eio(p(t, 69.4, 70.4));
+  const order = [0, 2, 1];
+  steps.forEach((s, i) => { const moved = i > 0, f = moved ? (k < .5 ? 1 - 2*k : 2*k - 1) : 1, e = eo(p(t, 67.8 + i*.4, 68.2 + i*.4))*f;
+    const y = k < .5 ? 260 + i*85 : 260 + order.indexOf(i)*85, c = i === 2 && k > .5 ? C.rose : C.text;
+    box(1010, y - 32, 760, 64, e, {fill:'rgba(255,255,255,.05)', stroke:i === 0 ? 'rgba(255,255,255,.3)' : (k > .5 ? C.rose : 'rgba(255,255,255,.3)'), r:12});
+    txt(s, 1040, y, {size:24, weight:800, color:c, align:'left', alpha:e}); });
+  txt('可能被重排为 ① → ③ → ②', 1390, 530, {size:26, weight:900, color:C.rose, alpha:eo(p(t, 70, 70.4))});
+  txt('另一线程第一次检查看到 instance ≠ null，拿到「半成品」对象', 1390, 580, {size:22, weight:700, alpha:eo(p(t, 70.8, 71.2))});
+  txt('加 volatile 禁止这种重排 ✓', 1390, 625, {size:24, weight:900, color:C.mint, alpha:eo(p(t, 71.6, 72))});
+  card('适合 volatile', ['状态标志：stop、shutdown', '一写多读：配置刷新、状态发布', '双重检查锁中的实例引用'], 80, 680, 580, 310, eo(p(t, 72.8, 73.3)), C.mint, {ls:22, lh:46});
+  card('不适合', ['count++、check-then-act', '等复合操作：要用锁或原子类', '多个变量需要一起保持一致'], 680, 680, 560, 310, eo(p(t, 73.6, 74.1)), C.rose, {ls:22, lh:46});
+  card('final 字段', ['构造函数结束后，final 字段', '对其他线程可见（安全发布）', '前提：构造中不让 this 逸出'], 1260, 680, 580, 310, eo(p(t, 74.4, 74.9)), C.blue, {ls:22, lh:46});
+}
+
+/* ============ 场景 8 · 收尾 (78–84s) ============ */
+function s8(t){
+  [['可见性', '写完，别人马上看到'], ['有序性', '内存屏障，禁止重排'], ['非原子', 'count++ 照样会丢'], ['happens-before', '判断可见性的规则']].forEach(([a, b], i) => {
+    const st = 78.2 + i*.25, e = eback(p(t, st, st + .5)); if (e <= 0) return;
+    const x = 330 + i*420, y = 330;
+    ctx.save(); ctx.translate(x, y); ctx.scale(e, e); ctx.translate(-x, -y);
+    box(x - 185, y - 90, 370, 180, clamp(e), {fill:'rgba(216,180,254,.08)', stroke:'rgba(216,180,254,.5)', r:26}); ctx.restore();
+    txt(a, x, y - 22, {size:a.length > 8 ? 32 : 40, weight:900, color:C.acc, alpha:clamp(e)}); txt(b, x, y + 40, {size:24, weight:600, color:C.muted, alpha:clamp(e)});
+  });
+  rise('volatile 管「看得见」和「不乱序」，不管「不被打断」', W/2, 600, t, 79.2, {size:54, weight:900, glow:22});
+  rise('关注拾星，一起搞懂后端', W/2, 760, t, 80, {size:36, weight:500, color:C.muted});
+}
+/* ============ 总调度 ============ */
+const SCENES = [[s1,-1,7],[s2,7,18],[s3,18,30],[s4,30,41],[s5,41,53],[s6,53,65],[s7,65,78],[s8,78,84]];
+function draw(t){
+  t = clamp(t, 0, DUR);
+  ctx.save(); ctx.globalAlpha = 1; ctx.clearRect(0,0,W,H); background(t);
+  for (const [fn,a,b] of SCENES){
+    if (t < a || t > b) continue;
+    SA = sceneA(t, a, b, b === DUR ? .8 : .5);
+    if (SA > 0){ ctx.save(); fn(t); ctx.restore(); }
+  }
+  SA = 1; vignette();
+  const fo = p(t, DUR - .8, DUR);
+  if (fo > 0){ ctx.globalAlpha = fo; ctx.fillStyle = '#000'; ctx.fillRect(0,0,W,H); }
+  ctx.restore();
+}
+
+/* ============ 播放器 / 逐帧渲染接口 ============ */
+const isRender = new URLSearchParams(location.search).has('render');
+window.DURATION = DUR;
+window.renderFrame = t => draw(t);
+const btn = document.getElementById('btn'), seek = document.getElementById('seek'), timeEl = document.getElementById('time');
+const fmt = s => `${Math.floor(s/60)}:${String(Math.floor(s%60)).padStart(2,'0')}`;
+function fit(){
+  if (isRender){ cv.style.width = W+'px'; cv.style.height = H+'px'; return; }
+  const w = Math.min(innerWidth - 32, (innerHeight - 84)*16/9);
+  cv.style.width = w + 'px'; cv.style.height = w*9/16 + 'px';
+}
+addEventListener('resize', fit); fit();
+
+let cur = 0, playing = !isRender, last = null;
+function toggle(){ if (cur >= DUR) cur = 0; playing = !playing; }
+btn.onclick = toggle; cv.onclick = toggle;
+addEventListener('keydown', e => { if (e.code === 'Space'){ e.preventDefault(); toggle(); } });
+seek.oninput = () => { cur = +seek.value; draw(cur); };
+function loop(ts){
+  if (playing && last != null){ cur += (ts - last)/1000; if (cur >= DUR){ cur = DUR; playing = false; } }
+  last = ts; draw(cur);
+  seek.value = cur; timeEl.textContent = `${fmt(cur)} / ${fmt(DUR)}`;
+  btn.textContent = playing ? '❚❚' : (cur >= DUR ? '↺' : '▶');
+  requestAnimationFrame(loop);
+}
+document.fonts.ready.then(() => {
+  window.ready = true;
+  if (isRender) draw(0); else requestAnimationFrame(loop);
+});
+</script>
+</body>
+</html>
