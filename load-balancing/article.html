@@ -1,0 +1,533 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>负载均衡与一致性哈希：请求该交给谁 · 拾星</title>
+<meta name="description" content="为什么需要负载均衡，DNS、四层、七层与客户端负载均衡，轮询、平滑加权轮询、最少连接、哈希等算法，取模哈希扩容的问题，一致性哈希环与虚拟节点，健康检查，附可运行的 Python 实测">
+<link rel="stylesheet" href="../assets/article.css">
+<style>:root{--acc:#6ee7b7}</style>
+</head>
+<body>
+<div class="wrap">
+  <nav class="top"><a href="../index.html">← 拾星 · 全部内容</a><a class="watch" href="landscape.html">▶ 看视频</a></nav>
+  <header class="hero">
+    <div class="tag">拾星 · 计算机与后端</div>
+    <h1>负载均衡与一致性哈希：请求该交给谁</h1>
+    <p>为什么需要负载均衡，DNS、四层、七层与客户端负载均衡，轮询、平滑加权轮询、最少连接、哈希等算法，取模哈希扩容的问题，一致性哈希环与虚拟节点，健康检查，附可运行的 Python 实测</p>
+    <div class="meta">约 21 分钟读完 · 配套视频 1:24</div>
+  </header>
+  <nav class="toc">
+<ul>
+<li><a href="#_1">一个真实的坑</a></li>
+<li><a href="#_2">为什么需要负载均衡</a></li>
+<li><a href="#_3">四层、七层与客户端负载均衡</a></li>
+<li><a href="#_6">负载均衡算法</a></li>
+<li><a href="#_8">普通哈希的问题</a></li>
+<li><a href="#_9">一致性哈希</a></li>
+<li><a href="#vs">实测：取模哈希 vs 一致性哈希</a></li>
+<li><a href="#_12">一致性哈希的应用</a></li>
+<li><a href="#_13">健康检查与故障摘除</a></li>
+<li><a href="#_14">高频面试题速答</a></li>
+<li><a href="#_15">总结</a></li>
+</ul>
+</nav>
+
+  <article>
+<figure><img src="img/f-6.4.jpg" alt="缓存集群加一台机器，八成缓存瞬间失效" loading="lazy"><figcaption>缓存集群加一台机器，八成缓存瞬间失效</figcaption></figure>
+<h2 id="_1">一个真实的坑</h2>
+<p>一个缓存集群有 4 台机器，用 <code>hash(key) % 4</code> 决定每个 key 存在哪台。流量涨了，运维加了第 5 台，公式变成 <code>hash(key) % 5</code>。</p>
+<p>结果是：<strong>大约 80% 的 key 换了节点</strong>。这些 key 在新节点上找不到，缓存大面积不命中，请求全部打到数据库，数据库被打垮。</p>
+<p>这个问题的本质是「<strong>请求和数据该怎么分</strong>」。本文从负载均衡讲起，再讲清楚为什么需要一致性哈希。</p>
+<h2 id="_2">为什么需要负载均衡</h2>
+<figure><img src="img/f-17.jpg" alt="负载均衡的几层结构" loading="lazy"><figcaption>负载均衡的几层结构</figcaption></figure>
+<p>一台服务器扛不住，就加机器（<strong>水平扩展</strong>）。但加了机器，就要有人决定每个请求交给哪一台，这就是<strong>负载均衡</strong>（Load Balancing）。它的目标是：</p>
+<ul>
+<li><strong>分摊压力</strong>：让每台机器的负载大致均衡；</li>
+<li><strong>水平扩展</strong>：加机器就能提升整体容量；</li>
+<li><strong>高可用</strong>：一台机器故障，自动把流量转给其他机器，用户无感知。</li>
+</ul>
+<p>一个典型的大型网站，负载均衡往往是<strong>分层</strong>的：</p>
+<ol>
+<li><strong>DNS</strong>：同一个域名解析出多个 IP，或者按用户所在地区返回最近机房的 IP；</li>
+<li><strong>四层负载均衡</strong>（如 LVS）：在机房入口，按 IP 和端口把连接分给多台七层代理；</li>
+<li><strong>七层负载均衡</strong>（如 Nginx）：按 URL、请求头等 HTTP 内容把请求转发给应用服务器；</li>
+<li><strong>应用服务器</strong>：处理请求。</li>
+</ol>
+<h2 id="_3">四层、七层与客户端负载均衡</h2>
+<figure><img src="img/f-29.jpg" alt="四层、七层与客户端负载均衡" loading="lazy"><figcaption>四层、七层与客户端负载均衡</figcaption></figure>
+<h3 id="_4">四层与七层</h3>
+<p>「四层」「七层」指的是网络模型中的层次：第四层是传输层（TCP/UDP），第七层是应用层（HTTP 等）。</p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>四层（LVS、云厂商的网络型负载均衡）</th>
+<th>七层（Nginx、Envoy、云厂商的应用型负载均衡）</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>依据</td>
+<td>IP + 端口</td>
+<td>HTTP 的 URL、Header、Cookie 等</td>
+</tr>
+<tr>
+<td>连接</td>
+<td>只转发数据包或连接，不解析内容</td>
+<td>终止客户端连接，解析请求后再向后端发起新请求</td>
+</tr>
+<tr>
+<td>性能</td>
+<td>很高</td>
+<td>相对低一些，要解析协议</td>
+</tr>
+<tr>
+<td>能力</td>
+<td>简单分发</td>
+<td>按路径路由、改写请求、TLS 卸载、限流、灰度……</td>
+</tr>
+</tbody>
+</table>
+<p>两者常常配合使用：四层负责扛住海量连接，把流量分给多台七层代理；七层负责精细的路由。</p>
+<h3 id="dns">DNS 负载均衡</h3>
+<p>最简单，但有明显的局限：DNS 有缓存，修改后生效慢；客户端拿到 IP 后不知道这台机器是否健康。所以 DNS 一般只做粗粒度的调度，比如按地区分到不同机房。</p>
+<h3 id="_5">客户端负载均衡</h3>
+<p>在微服务内部，经常不经过集中式的代理，而是由<strong>调用方自己选</strong>：</p>
+<ol>
+<li>调用方从注册中心拿到某个服务的所有实例地址（见本系列《微服务》）；</li>
+<li>每次调用时，在本地用负载均衡算法挑一个实例，直接连接。</li>
+</ol>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>集中式（LVS / Nginx）</th>
+<th>客户端式</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>调用方</td>
+<td>无感知，只认一个入口地址</td>
+<td>需要集成服务发现和负载均衡逻辑</td>
+</tr>
+<tr>
+<td>网络</td>
+<td>多一跳</td>
+<td>直连，少一跳</td>
+</tr>
+<tr>
+<td>单点</td>
+<td>代理本身要做高可用</td>
+<td>没有中心节点</td>
+</tr>
+<tr>
+<td>语言</td>
+<td>与语言无关</td>
+<td>每种语言的客户端都要实现一遍</td>
+</tr>
+</tbody>
+</table>
+<p>Dubbo、gRPC、Spring Cloud LoadBalancer 都支持客户端负载均衡。服务网格（如 Istio）则把这部分逻辑放到每个服务旁边的代理（sidecar）中。</p>
+<h2 id="_6">负载均衡算法</h2>
+<figure><img src="img/f-42.jpg" alt="常见的负载均衡算法与平滑加权轮询" loading="lazy"><figcaption>常见的负载均衡算法与平滑加权轮询</figcaption></figure>
+<table>
+<thead>
+<tr>
+<th>算法</th>
+<th>做法</th>
+<th>适合</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>轮询</strong></td>
+<td>依次分给每台机器</td>
+<td>机器配置相同、请求耗时差不多</td>
+</tr>
+<tr>
+<td><strong>加权轮询</strong></td>
+<td>按权重分配，配置高的机器多分</td>
+<td>机器配置不同</td>
+</tr>
+<tr>
+<td><strong>随机 / 加权随机</strong></td>
+<td>随机挑选，请求量大时接近均匀</td>
+<td>实现简单，无状态</td>
+</tr>
+<tr>
+<td><strong>最少连接</strong></td>
+<td>选当前活跃连接（或请求）最少的机器</td>
+<td>请求耗时差异大，比如长连接</td>
+</tr>
+<tr>
+<td><strong>源地址哈希</strong></td>
+<td><code>hash(客户端 IP)</code> 选机器，同一客户端总是到同一台</td>
+<td>需要会话保持</td>
+</tr>
+<tr>
+<td><strong>一致性哈希</strong></td>
+<td>见下文</td>
+<td>有状态的路由，如缓存分片</td>
+</tr>
+</tbody>
+</table>
+<p>另外还有一些更「聪明」的策略：按响应时间加权、「两次随机选择」（随机挑两台，选负载低的那台，实现简单且效果很好）等。</p>
+<h3 id="_7">平滑加权轮询</h3>
+<p>假设 A、B、C 三台机器的权重是 5、1、1。最朴素的加权轮询是按权重展开后轮转：<code>A A A A A B C</code>。比例没问题，但 A 会<strong>连续</strong>挨 5 个请求，流量不够平滑。</p>
+<p>Nginx 使用的是<strong>平滑加权轮询</strong>，每次选择分三步：</p>
+<ol>
+<li>每个节点的 <code>current += 自己的权重</code>；</li>
+<li>选出 <code>current</code> 最大的节点；</li>
+<li>被选中节点的 <code>current -= 总权重</code>。</li>
+</ol>
+<pre><code class="language-python">class SmoothWeightedRR:
+    &quot;&quot;&quot;平滑加权轮询（Nginx upstream 默认的加权轮询算法）&quot;&quot;&quot;
+
+    def __init__(self, weights: dict):
+        self.weights = dict(weights)
+        self.current = {n: 0 for n in weights}
+        self.total = sum(weights.values())
+
+    def next(self, trace=False):
+        for n, w in self.weights.items():          # 1. 每个节点的 current += 自己的权重
+            self.current[n] += w
+        best = max(self.current, key=self.current.get)   # 2. 选 current 最大的（相同时取先出现的）
+        before = dict(self.current)
+        self.current[best] -= self.total            # 3. 被选中的节点 current -= 总权重
+        if trace:
+            print(f&quot;  加权后 {list(before.values())!s:&lt;14} 选 {best}   减总权重后 {list(self.current.values())}&quot;)
+        return best
+
+
+def naive_weighted_rr(weights: dict, n: int):
+    &quot;&quot;&quot;朴素加权轮询：按权重把节点「展开」后依次轮转&quot;&quot;&quot;
+    seq = [node for node, w in weights.items() for _ in range(w)]
+    return [seq[i % len(seq)] for i in range(n)]
+
+
+W = {&quot;A&quot;: 5, &quot;B&quot;: 1, &quot;C&quot;: 1}
+print(&quot;权重:&quot;, W)
+print(&quot;朴素加权轮询:&quot;, &quot; &quot;.join(naive_weighted_rr(W, 7)))
+
+print(&quot;平滑加权轮询，逐步计算（current 依次是 A、B、C）:&quot;)
+lb = SmoothWeightedRR(W)
+seq = [lb.next(trace=True) for _ in range(7)]
+print(&quot;平滑加权轮询:&quot;, &quot; &quot;.join(seq))
+print(&quot;7 次之后 current 回到:&quot;, list(lb.current.values()))
+
+lb = SmoothWeightedRR({&quot;A&quot;: 4, &quot;B&quot;: 2, &quot;C&quot;: 1})
+print(&quot;\n权重 {A:4, B:2, C:1} 的前 14 次:&quot;, &quot; &quot;.join(lb.next() for _ in range(14)))
+</code></pre>
+<p>输出：</p>
+<pre><code class="language-text">权重: {'A': 5, 'B': 1, 'C': 1}
+朴素加权轮询: A A A A A B C
+平滑加权轮询，逐步计算（current 依次是 A、B、C）:
+  加权后 [5, 1, 1]      选 A   减总权重后 [-2, 1, 1]
+  加权后 [3, 2, 2]      选 A   减总权重后 [-4, 2, 2]
+  加权后 [1, 3, 3]      选 B   减总权重后 [1, -4, 3]
+  加权后 [6, -3, 4]     选 A   减总权重后 [-1, -3, 4]
+  加权后 [4, -2, 5]     选 C   减总权重后 [4, -2, -2]
+  加权后 [9, -1, -1]    选 A   减总权重后 [2, -1, -1]
+  加权后 [7, 0, 0]      选 A   减总权重后 [0, 0, 0]
+平滑加权轮询: A A B A C A A
+7 次之后 current 回到: [0, 0, 0]
+
+权重 {A:4, B:2, C:1} 的前 14 次: A B A C A B A A B A C A B A
+</code></pre>
+<p>7 次中 A 仍然被选 5 次，比例不变，但 B 和 C 被均匀地插在中间。每一轮结束后 <code>current</code> 回到全 0，序列周期性重复。</p>
+<h2 id="_8">普通哈希的问题</h2>
+<figure><img src="img/f-53.jpg" alt="取模哈希在扩容时几乎所有 key 都要换地方" loading="lazy"><figcaption>取模哈希在扩容时几乎所有 key 都要换地方</figcaption></figure>
+<p>有些场景<strong>必须</strong>让同一个 key 总是落在同一台机器上，比如分布式缓存：<code>user:42</code> 的数据存在哪台，读的时候就要去哪台。</p>
+<p>最直接的做法是取模：<code>node = hash(key) % N</code>。它分布均匀、计算简单，问题出在 <strong>N 变化的时候</strong>。</p>
+<p>把哈希值 0～19 分别对 4 和 5 取模：</p>
+<table>
+<thead>
+<tr>
+<th>hash</th>
+<th>0</th>
+<th>1</th>
+<th>2</th>
+<th>3</th>
+<th>4</th>
+<th>5</th>
+<th>6</th>
+<th>7</th>
+<th>8</th>
+<th>9</th>
+<th>…</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>% 4</td>
+<td>A</td>
+<td>B</td>
+<td>C</td>
+<td>D</td>
+<td>A</td>
+<td>B</td>
+<td>C</td>
+<td>D</td>
+<td>A</td>
+<td>B</td>
+<td>…</td>
+</tr>
+<tr>
+<td>% 5</td>
+<td>A</td>
+<td>B</td>
+<td>C</td>
+<td>D</td>
+<td>E</td>
+<td>A</td>
+<td>B</td>
+<td>C</td>
+<td>D</td>
+<td>E</td>
+<td>…</td>
+</tr>
+</tbody>
+</table>
+<p>只有在 <code>hash % 4 == hash % 5</code> 的时候 key 才不需要移动。在 0～19 这 20 个数里，只有 0、1、2、3 这 4 个满足，<strong>约 80% 的 key 都换了节点</strong>。一般来说，从 N 台扩到 N+1 台，只有约 1/(N+1) 的 key 能留在原地。</p>
+<p>对于缓存，这意味着扩容（或者一台机器故障被摘除）的瞬间，大部分缓存失效，形成<strong>缓存雪崩</strong>（见本系列《Redis 缓存》）。对于需要会话保持的服务，大部分用户的会话会被打散。</p>
+<p>我们希望：<strong>增删节点时，只挪动一小部分 key</strong>。</p>
+<h2 id="_9">一致性哈希</h2>
+<figure><img src="img/f-66.jpg" alt="一致性哈希环" loading="lazy"><figcaption>一致性哈希环</figcaption></figure>
+<p><strong>一致性哈希</strong>（Consistent Hashing）的做法：</p>
+<ol>
+<li>把哈希值的空间 0 ～ 2³²−1 <strong>首尾相连</strong>，围成一个环；</li>
+<li>把每个<strong>节点</strong>按 <code>hash(节点 IP 或名字)</code> 放到环上；</li>
+<li>把每个 <strong>key</strong> 按 <code>hash(key)</code> 放到环上，从它的位置出发<strong>顺时针</strong>走，遇到的第一个节点就是它的归属。</li>
+</ol>
+<h3 id="_10">增删节点只影响相邻的一段</h3>
+<ul>
+<li><strong>加入节点 E</strong>：E 落在 C 和 D 之间，那么原本属于 D 的、位于 C 到 E 之间的 key 改归 E。<strong>其他所有 key 都不动</strong>；</li>
+<li><strong>删除节点 B</strong>：只有 B 负责的那段 key 交给顺时针的下一个节点，其他 key 不受影响。</li>
+</ul>
+<p>平均来说，增加或删除一个节点只需要迁移约 <strong>1/N</strong> 的 key，而取模哈希几乎要迁移全部。</p>
+<h3 id="_11">虚拟节点</h3>
+<p>只把每台机器放到环上一个点，有两个问题：</p>
+<ul>
+<li><strong>数据倾斜</strong>：几个点在环上的位置是随机的，间隔有大有小，负责大区间的节点压力大；</li>
+<li><strong>扩容不均</strong>：新节点只从<strong>一个</strong>邻居那里分走 key，其他节点的压力没有减轻。</li>
+</ul>
+<p>解决办法是<strong>虚拟节点</strong>：每台物理机器在环上放很多个点，比如 A#0、A#1……A#99，key 落到虚拟节点上，再映射回物理机器。点越多，分布越均匀；新机器加入时，它的上百个虚拟节点散落在环上各处，从<strong>每一台</strong>老机器那里都分走一小部分。</p>
+<p>虚拟节点还能用来实现<strong>权重</strong>：性能好的机器分配更多的虚拟节点。</p>
+<h2 id="vs">实测：取模哈希 vs 一致性哈希</h2>
+<figure><img src="img/f-77.jpg" alt="虚拟节点让分布更均匀" loading="lazy"><figcaption>虚拟节点让分布更均匀</figcaption></figure>
+<p>下面的程序用 10 万个 key，测量从 4 台扩到 5 台时 key 的迁移比例和各节点的负载：</p>
+<pre><code class="language-python">import bisect
+import hashlib
+from collections import Counter
+
+
+def h32(s: str) -&gt; int:
+    &quot;&quot;&quot;把字符串映射到 0 ~ 2^32-1：取 MD5 的前 4 个字节（演示用，生产中常用 MurmurHash 等更快的哈希）&quot;&quot;&quot;
+    return int.from_bytes(hashlib.md5(s.encode()).digest()[:4], &quot;big&quot;)
+
+
+class ModHash:
+    &quot;&quot;&quot;普通取模哈希：node = hash(key) % N&quot;&quot;&quot;
+
+    def __init__(self, nodes):
+        self.nodes = list(nodes)
+
+    def get(self, key):
+        return self.nodes[h32(key) % len(self.nodes)]
+
+
+class ConsistentHash:
+    &quot;&quot;&quot;一致性哈希环，每个物理节点放 vnodes 个虚拟节点&quot;&quot;&quot;
+
+    def __init__(self, nodes, vnodes=1):
+        self.vnodes = vnodes
+        self.ring = []                        # 有序的 (位置, 物理节点) 列表
+        for n in nodes:
+            self.add(n)
+
+    def add(self, node):
+        for i in range(self.vnodes):
+            bisect.insort(self.ring, (h32(f&quot;{node}#{i}&quot;), node))
+
+    def remove(self, node):
+        self.ring = [(p, n) for p, n in self.ring if n != node]
+
+    def get(self, key):
+        pos = h32(key)
+        i = bisect.bisect_left(self.ring, (pos,))      # 二分查找：顺时针第一个位置 &gt;= key 的节点
+        return self.ring[i % len(self.ring)][1]        # 走到末尾就绕回环的起点
+
+
+KEYS = [f&quot;user:{i}&quot; for i in range(100_000)]
+OLD = [&quot;A&quot;, &quot;B&quot;, &quot;C&quot;, &quot;D&quot;]
+NEW = OLD + [&quot;E&quot;]
+
+
+def moved_ratio(before, after):
+    return sum(before.get(k) != after.get(k) for k in KEYS) / len(KEYS)
+
+
+def load(lb):
+    c = Counter(lb.get(k) for k in KEYS)
+    return &quot;  &quot;.join(f&quot;{n}:{c[n] / len(KEYS):6.1%}&quot; for n in sorted(c))
+
+
+print(f&quot;共 {len(KEYS)} 个 key，从 4 台扩容到 5 台\n&quot;)
+
+print(&quot;取模哈希&quot;)
+print(&quot;  迁移比例:&quot;, f&quot;{moved_ratio(ModHash(OLD), ModHash(NEW)):.1%}&quot;)
+print(&quot;  扩容后负载:&quot;, load(ModHash(NEW)))
+
+for v in (1, 10, 100, 200):
+    before, after = ConsistentHash(OLD, v), ConsistentHash(NEW, v)
+    print(f&quot;\n一致性哈希（每台 {v} 个虚拟节点）&quot;)
+    print(&quot;  迁移比例:&quot;, f&quot;{moved_ratio(before, after):.1%}&quot;)
+    print(&quot;  扩容前负载:&quot;, load(before))
+    print(&quot;  扩容后负载:&quot;, load(after))
+
+# 迁走的 key 都去了哪里？
+before, after = ConsistentHash(OLD, 100), ConsistentHash(NEW, 100)
+flows = Counter((before.get(k), after.get(k)) for k in KEYS if before.get(k) != after.get(k))
+print(&quot;\n100 个虚拟节点时，迁移的 key 的去向:&quot;, dict(sorted(flows.items())))
+
+# 缩容：4 台里去掉 B
+before = ConsistentHash(OLD, 100)
+after = ConsistentHash(OLD, 100)
+after.remove(&quot;B&quot;)
+print(&quot;去掉 B 后的迁移比例:&quot;, f&quot;{moved_ratio(before, after):.1%}&quot;,
+      &quot;| 迁移的 key 原来都在:&quot;, {before.get(k) for k in KEYS if before.get(k) != after.get(k)})
+</code></pre>
+<p>输出：</p>
+<pre><code class="language-text">共 100000 个 key，从 4 台扩容到 5 台
+
+取模哈希
+  迁移比例: 79.7%
+  扩容后负载: A: 20.0%  B: 20.0%  C: 20.0%  D: 20.1%  E: 19.9%
+
+一致性哈希（每台 1 个虚拟节点）
+  迁移比例: 17.3%
+  扩容前负载: A:  3.1%  B:  1.3%  C: 40.2%  D: 55.4%
+  扩容后负载: A:  3.1%  B:  1.3%  C: 40.2%  D: 38.1%  E: 17.3%
+
+一致性哈希（每台 10 个虚拟节点）
+  迁移比例: 24.9%
+  扩容前负载: A: 12.0%  B: 39.9%  C: 21.8%  D: 26.3%
+  扩容后负载: A:  9.6%  B: 32.7%  C: 16.4%  D: 16.3%  E: 24.9%
+
+一致性哈希（每台 100 个虚拟节点）
+  迁移比例: 19.6%
+  扩容前负载: A: 25.7%  B: 24.8%  C: 25.2%  D: 24.3%
+  扩容后负载: A: 20.6%  B: 22.5%  C: 19.5%  D: 17.7%  E: 19.6%
+
+一致性哈希（每台 200 个虚拟节点）
+  迁移比例: 18.9%
+  扩容前负载: A: 26.7%  B: 26.4%  C: 26.3%  D: 20.5%
+  扩容后负载: A: 20.6%  B: 22.6%  C: 20.7%  D: 17.2%  E: 18.9%
+
+100 个虚拟节点时，迁移的 key 的去向: {('A', 'E'): 5070, ('B', 'E'): 2340, ('C', 'E'): 5619, ('D', 'E'): 6532}
+去掉 B 后的迁移比例: 24.8% | 迁移的 key 原来都在: {'B'}
+</code></pre>
+<p>从结果可以看出：</p>
+<ul>
+<li><strong>取模哈希</strong>分布非常均匀，但扩容时 <strong>79.7%</strong> 的 key 要迁移，和前面的推算一致；</li>
+<li><strong>一致性哈希</strong>扩容时只迁移了约 20% 的 key，接近理想的 1/5。而且<strong>迁移的 key 全部去了新节点 E</strong>，老节点之间没有任何 key 互相搬家；</li>
+<li><strong>只有 1 个点时</strong>，分布严重倾斜：D 承担了 55.4%，B 只有 1.3%；而且 E 只从 D 那里分走了 key，A、B、C 毫无变化；</li>
+<li><strong>虚拟节点增加到 100 个以上</strong>，各节点的负载接近均匀，E 从 A、B、C、D <strong>每一台</strong>都分走了一部分；</li>
+<li><strong>删除节点 B</strong> 时，迁移的 key 原来都在 B 上，其他节点的 key 一个都没动。</li>
+</ul>
+<h2 id="_12">一致性哈希的应用</h2>
+<table>
+<thead>
+<tr>
+<th>场景</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>分布式缓存分片</strong></td>
+<td>客户端按 key 选择缓存节点，扩缩容时只有少量缓存失效。Memcached 的很多客户端就采用这种方式</td>
+</tr>
+<tr>
+<td><strong>有状态路由</strong></td>
+<td>同一个用户、同一个会话的请求固定落到同一台机器，比如长连接网关、本地缓存命中率优化</td>
+</tr>
+<tr>
+<td><strong>负载均衡器</strong></td>
+<td>Nginx 的 <code>hash $key consistent</code>；Dubbo 的一致性哈希负载均衡策略，相同参数的请求总是发给同一个提供者</td>
+</tr>
+<tr>
+<td><strong>分布式存储</strong></td>
+<td>早期 Amazon Dynamo 的数据分区就基于一致性哈希和虚拟节点；Cassandra 等系统沿用了类似的思路</td>
+</tr>
+</tbody>
+</table>
+<blockquote>
+<p><strong>Redis Cluster 并没有用一致性哈希</strong>，而是用了<strong>哈希槽</strong>：固定 16384 个槽，<code>CRC16(key) % 16384</code> 决定 key 属于哪个槽，再把槽分配给节点。扩容时整槽迁移。它和虚拟节点的思想类似：都是先把 key 映射到固定数量的「中间桶」，再把桶分给机器，这样增减机器时只需要移动部分桶。</p>
+</blockquote>
+<h2 id="_13">健康检查与故障摘除</h2>
+<p>负载均衡不仅要「分得匀」，还要「<strong>不把请求分给坏掉的机器</strong>」：</p>
+<ul>
+<li><strong>主动健康检查</strong>：负载均衡器定期探测每台后端（TCP 连接、HTTP 请求 <code>/health</code>），连续失败若干次就把它摘除，恢复后再加回来；</li>
+<li><strong>被动健康检查</strong>：根据真实请求的结果判断，比如 Nginx 的 <code>max_fails</code> 和 <code>fail_timeout</code>：在一段时间内失败次数达到阈值，就暂时不再转发给它；</li>
+<li><strong>优雅上下线</strong>：发布时先把实例从负载均衡中摘掉，等正在处理的请求完成后再停机；新实例启动并预热完成后再接入流量（Kubernetes 的 readiness 探针就是做这件事，见本系列《Kubernetes 入门》）。</li>
+</ul>
+<p>Nginx 配置示例（参考写法）：</p>
+<pre><code class="language-nginx">upstream app {
+    server 10.0.0.1:8080 weight=5 max_fails=3 fail_timeout=30s;   # 平滑加权轮询
+    server 10.0.0.2:8080 weight=1;
+    server 10.0.0.3:8080 backup;            # 其他节点都不可用时才启用
+    # least_conn;                           # 改为最少连接
+    # hash $request_uri consistent;         # 改为一致性哈希
+}
+
+server {
+    listen 80;
+    location / {
+        proxy_pass http://app;
+        proxy_next_upstream error timeout;  # 出错或超时时尝试下一台
+    }
+}
+</code></pre>
+<h2 id="_14">高频面试题速答</h2>
+<p><strong>Q：四层负载均衡和七层负载均衡有什么区别？</strong>
+四层基于 IP 和端口转发连接，不解析内容，性能高；七层解析 HTTP 等应用层协议，可以按 URL、Header 路由，功能强但开销大一些。</p>
+<p><strong>Q：常见的负载均衡算法有哪些？</strong>
+轮询、加权轮询、随机、最少连接、源地址哈希、一致性哈希等。机器配置相同用轮询，配置不同用加权，请求耗时差异大用最少连接，需要固定路由用哈希。</p>
+<p><strong>Q：Nginx 的平滑加权轮询是怎么做的？</strong>
+每次所有节点的 current 加上各自权重，选出 current 最大的节点，再把它的 current 减去总权重。这样既保证了比例，又让各节点交替出现，不会连续命中同一台。</p>
+<p><strong>Q：为什么要用一致性哈希？</strong>
+普通取模哈希在节点数变化时几乎所有 key 都要重新映射；一致性哈希把节点和 key 放在同一个环上，增删一个节点只影响相邻区间，平均只迁移约 1/N 的 key。</p>
+<p><strong>Q：一致性哈希有什么问题？怎么解决？</strong>
+节点少时分布不均（数据倾斜），扩容时新节点只分担一个邻居的压力。用虚拟节点解决：每台物理机器在环上映射多个点。</p>
+<p><strong>Q：Redis Cluster 用的是一致性哈希吗？</strong>
+不是，它用 16384 个哈希槽，<code>CRC16(key) % 16384</code> 定位槽，槽再分配给节点。</p>
+<h2 id="_15">总结</h2>
+<figure><img src="img/f-83.jpg" alt="四个关键点" loading="lazy"><figcaption>四个关键点</figcaption></figure>
+<ul>
+<li>负载均衡解决「<strong>这个请求交给谁</strong>」，通常是 DNS、四层、七层、客户端多层配合；</li>
+<li>算法上，轮询、加权、最少连接管「<strong>分得匀</strong>」，Nginx 的<strong>平滑加权轮询</strong>让流量交替分布；</li>
+<li>需要固定路由时，取模哈希在扩缩容时会让约 80% 的 key 换节点；</li>
+<li><strong>一致性哈希</strong>把节点和 key 放到一个环上，增删节点只迁移约 1/N 的 key，管「<strong>变得少</strong>」；</li>
+<li><strong>虚拟节点</strong>解决数据倾斜，让扩容时每台老节点都分担一点；</li>
+<li><strong>健康检查</strong>管「<strong>不给坏的</strong>」：及时摘除故障节点，优雅上下线。</li>
+</ul>
+<div class="refs">
+<h3 id="_16">参考资料</h3>
+<ul>
+<li>Karger, D., et al. (1997). Consistent Hashing and Random Trees: Distributed Caching Protocols for Relieving Hot Spots on the World Wide Web. <em>STOC</em>.</li>
+<li>DeCandia, G., et al. (2007). Dynamo: Amazon's Highly Available Key-value Store. <em>SOSP</em>.</li>
+<li>Mitzenmacher, M. (2001). The Power of Two Choices in Randomized Load Balancing. <em>IEEE TPDS</em>.</li>
+<li>Nginx 文档：ngx_http_upstream_module；Nginx 源码 ngx_http_upstream_round_robin.c.</li>
+<li>Redis 文档：Redis cluster specification（Hash slots）.</li>
+<li>LVS 项目文档：Linux Virtual Server.</li>
+<li>Apache Dubbo 文档：负载均衡.</li>
+</ul>
+</div>
+  </article>
+  <div class="foot"><a href="../index.html">← 拾星首页</a><a href="landscape.html">▶ 看配套视频</a></div>
+</div>
+</body>
+</html>

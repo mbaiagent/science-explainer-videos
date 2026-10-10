@@ -99,7 +99,8 @@ const VIDEOS = [
   {cat:'cs', title:"HashMap 与 ConcurrentHashMap", desc:"10 个线程并发 put，HashMap 悄悄丢数据；从哈希扰动、红黑树到 CAS + 锁桶头", path:'concurrent-hashmap/landscape.html', dur:84, color:'#99f6e4'},
   {cat:'cs', title:"I/O 模型：从 BIO 到 epoll 与 Reactor", desc:"一个线程怎么扛住上万连接：select/poll/epoll、LT/ET、Reactor 与零拷贝", path:'io-models/landscape.html', dur:84, color:'#f0abfc'},
   {cat:'cs', title:"Kubernetes 入门：容器的调度员", desc:"你只说要什么，它负责一直做到：控制循环、Pod、Deployment、Service 与自动扩缩", path:'kubernetes/landscape.html', dur:84, color:'#93c5fd'},
-  {cat:'cs', title:"熔断与降级：防止一个服务拖垮全部", desc:"下游一慢全站跟着挂？雪崩、超时重试、熔断三态、降级与舱壁隔离", path:'circuit-breaker/landscape.html', dur:84, color:'#fca5a5'}
+  {cat:'cs', title:"熔断与降级：防止一个服务拖垮全部", desc:"下游一慢全站跟着挂？雪崩、超时重试、熔断三态、降级与舱壁隔离", path:'circuit-breaker/landscape.html', dur:84, color:'#fca5a5'},
+  {cat:'cs', title:"负载均衡与一致性哈希", desc:"请求交给谁？四层七层、平滑加权轮询，以及扩容时只挪 1/N 数据的一致性哈希", path:'load-balancing/landscape.html', dur:84, color:'#6ee7b7'}
 ];
 const fmt = s => `${Math.floor(s/60)}:${String(s%60).padStart(2,'0')}`;
 const esc = s => s.replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
