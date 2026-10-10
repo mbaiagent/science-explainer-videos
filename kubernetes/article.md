@@ -238,7 +238,7 @@ Pod 的 IP 会变，副本数也会变。前端服务要调用 shop 服务，不
 
 Service 工作在四层（TCP/UDP），只认 IP 和端口；Ingress 工作在七层，能看到 HTTP 的域名、路径、请求头，可以做「`/api` 转给 api 服务、`/` 转给前端服务」这样的路由，也可以在这里统一终止 HTTPS（见本系列《HTTPS 加密全过程》）。
 
-Ingress 对象本身只是一份路由规则，需要部署一个 **Ingress Controller**（如基于 Nginx、Traefik、Envoy 的实现）来真正执行。社区的下一代方案是 **Gateway API**，它把「基础设施提供方」「集群运维」「应用开发者」的配置拆分得更清楚，表达能力也更强；Kubernetes 社区维护的 ingress-nginx 项目也已宣布退役，新项目可以优先考虑 Gateway API。
+Ingress 对象本身只是一份路由规则，需要部署一个 **Ingress Controller**（如基于 Nginx、Traefik、Envoy 的实现）来真正执行。社区的下一代方案是 **Gateway API**，它把「基础设施提供方」「集群运维」「应用开发者」的配置拆分得更清楚，表达能力也更强；Kubernetes 社区维护的 Ingress NGINX 项目已于 2025 年 11 月宣布退役：按计划，尽力维护只持续到 2026 年 3 月，此后不再发布任何版本、漏洞修复和安全补丁（已有部署仍能运行）。官方建议迁移到 Gateway API，或者换用其他 Ingress Controller。
 
 ### ConfigMap、Secret 与 Namespace
 
@@ -797,6 +797,7 @@ apiserver 认证鉴权准入后写 etcd → 控制器创建 Pod 对象 → sched
 - Kubernetes 官方文档：Concepts — Overview / Cluster Architecture / Kubernetes Components.
 - Kubernetes 官方文档：Controllers；Deployments（Rolling Update、Rollback）；ReplicaSet.
 - Kubernetes 官方文档：Service；EndpointSlices；Ingress；Gateway API.
+- Kubernetes Blog (2025-11-11)：Ingress NGINX Retirement: What You Need to Know；(2026-01-29)：Ingress NGINX: Statement from the Kubernetes Steering and Security Response Committees.
 - Kubernetes 官方文档：Configure Liveness, Readiness and Startup Probes.
 - Kubernetes 官方文档：Resource Management for Pods and Containers；Pod Quality of Service Classes.
 - Kubernetes 官方文档：Horizontal Pod Autoscaling（算法细节）.
