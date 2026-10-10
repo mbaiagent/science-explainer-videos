@@ -43,6 +43,11 @@
 | 分布式 ID：雪花算法 | `snowflake-id/landscape.html` | 横屏 1920×1080 | 84s |
 | Java 的锁：synchronized、CAS 与 AQS | `java-lock/landscape.html` | 横屏 1920×1080 | 84s |
 | 幂等性设计：重复请求不出错 | `idempotency/landscape.html` | 横屏 1920×1080 | 82s |
+| RPC 原理：像调本地方法一样调远程服务 | `rpc/landscape.html` | 横屏 1920×1080 | 84s |
+| HashMap 与 ConcurrentHashMap | `concurrent-hashmap/landscape.html` | 横屏 1920×1080 | 84s |
+| I/O 模型：从 BIO 到 epoll 与 Reactor | `io-models/landscape.html` | 横屏 1920×1080 | 84s |
+| Kubernetes 入门：容器的调度员 | `kubernetes/landscape.html` | 横屏 1920×1080 | 84s |
+| 熔断与降级：防止一个服务拖垮全部 | `circuit-breaker/landscape.html` | 横屏 1920×1080 | 84s |
 
 ### 幸福的科学
 钩子 → 享乐适应（快乐曲线 + 跑步机）→ 哈佛成人发展研究（关系网络）→ 心流（挑战 × 技能坐标图）→ 今晚就能做的 3 件事 → 收尾
@@ -148,6 +153,21 @@ CPU 轮流切换 → 进程与隔离 → 线程与竞态条件 → 上下文切�
 
 ### 幂等性设计：重复请求不出错
 钩子（连点三次支付扣了三次钱）→ 重复请求的四个来源 → 幂等定义与 HTTP 方法 → 唯一约束与防重 Token → 乐观锁与状态机 → 幂等键 Idempotency-Key → MQ 消费幂等与三个坑 → 收尾
+
+### RPC 原理：像调本地方法一样调远程服务
+钩子（这行代码其实在另一台机器上执行）→ 一次 RPC 调用的完整旅程 → 动态代理与反射 → 序列化方式对比 → 协议帧与粘包拆包 → 请求 ID 与服务治理 → RPC 还是 HTTP REST → 收尾
+
+### HashMap 与 ConcurrentHashMap
+钩子（并发 put 后 size 只有 9358）→ hash 扰动与下标计算 → 数组 + 链表 + 红黑树与扩容 → 为什么线程不安全 → 大锁与 JDK 7 分段锁 → JDK 8：空桶 CAS、锁桶头 → 协助扩容、计数、null 与复合操作 → 收尾
+
+### I/O 模型：从 BIO 到 epoll 与 Reactor
+钩子（一万连接就开一万线程？）→ 一次 read 的两个阶段与零拷贝 → 阻塞与非阻塞 I/O → select / poll / epoll → epoll 内部与 LT/ET → 五种 I/O 模型 → Reactor 三种线程模型 → 收尾
+
+### Kubernetes 入门：容器的调度员
+钩子（几十个容器全靠手动管？）→ 声明式与控制循环 → 控制平面与工作节点 → Pod、ReplicaSet 与 Deployment → Service 与对外暴露 → kubectl apply 之后发生了什么 → 探针、资源与 HPA → 收尾
+
+### 熔断与降级：防止一个服务拖垮全部
+钩子（不重要的服务变慢，整个网站挂了）→ 雪崩效应 → 超时与重试风暴 → 熔断器三态 → 滑动窗口统计 → 降级 → 舱壁隔离与熔断 vs 限流 → 收尾
 
 ## 预览
 

@@ -246,7 +246,7 @@ epoll 监听 600 个 fd: 0 个就绪
   <rect width="440" height="300" fill="#0f0e1c"/>
   <defs><marker id="ea" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#f0abfc"/></marker></defs>
   <g font-family="PingFang SC, Noto Sans SC, sans-serif" text-anchor="middle">
-    <rect x="10" y="10" width="420" height="200" rx="14" fill="rgba(255,255,255,.03)" stroke="rgba(255,255,255,.2)"/>
+    <rect x="10" y="10" width="420" height="208" rx="14" fill="rgba(255,255,255,.03)" stroke="rgba(255,255,255,.2)"/>
     <text x="220" y="34" fill="#f0abfc" font-size="15" font-weight="800">内核中的 epoll 实例</text>
     <text x="120" y="58" fill="#9a93a8" font-size="12">红黑树：所有注册的 fd</text>
     <g stroke="rgba(255,255,255,.35)" stroke-width="1.5">
@@ -265,16 +265,16 @@ epoll 监听 600 个 fd: 0 个就绪
     </g>
     <text x="340" y="58" fill="#9a93a8" font-size="12">就绪链表</text>
     <rect x="290" y="72" width="100" height="30" rx="8" fill="rgba(240,171,252,.14)" stroke="#f0abfc"/>
-    <text x="340" y="92" fill="#f0abfc" font-size="13" font-weight="800">fd 5</text>
+    <text x="340" y="92" fill="#f0abfc" font-size="13" font-weight="800">fd 12</text>
     <rect x="290" y="112" width="100" height="30" rx="8" fill="rgba(240,171,252,.14)" stroke="#f0abfc"/>
-    <text x="340" y="132" fill="#f0abfc" font-size="13" font-weight="800">fd 12</text>
-    <line x1="117" y1="160" x2="286" y2="90" stroke="#f0abfc" stroke-width="1.8" stroke-dasharray="5 4" marker-end="url(#ea)"/>
-    <line x1="182" y1="122" x2="286" y2="127" stroke="#f0abfc" stroke-width="1.8" stroke-dasharray="5 4" marker-end="url(#ea)"/>
+    <text x="340" y="132" fill="#f0abfc" font-size="13" font-weight="800">fd 5</text>
+    <path d="M108,176 Q240,215 286,130" fill="none" stroke="#f0abfc" stroke-width="1.8" stroke-dasharray="5 4" marker-end="url(#ea)"/>
+    <line x1="180" y1="116" x2="286" y2="89" stroke="#f0abfc" stroke-width="1.8" stroke-dasharray="5 4" marker-end="url(#ea)"/>
     <text x="340" y="170" fill="#f0abfc" font-size="12">数据到达 → 回调入链表</text>
-    <text x="220" y="196" fill="#9a93a8" font-size="12">epoll_ctl：增删改红黑树节点，O(log n)</text>
-    <line x1="340" y1="210" x2="340" y2="240" stroke="#86efac" stroke-width="2.5" marker-end="url(#ea)"/>
+    <text x="220" y="208" fill="#9a93a8" font-size="12">epoll_ctl：增删改红黑树节点，O(log n)</text>
+    <line x1="340" y1="218" x2="340" y2="240" stroke="#86efac" stroke-width="2.5" marker-end="url(#ea)"/>
     <rect x="70" y="244" width="300" height="44" rx="12" fill="rgba(134,239,172,.12)" stroke="#86efac"/>
-    <text x="220" y="271" fill="#86efac" font-size="14" font-weight="800">epoll_wait() 只取就绪链表 → [5, 12]</text>
+    <text x="220" y="271" fill="#86efac" font-size="14" font-weight="800">epoll_wait() 只取就绪链表 → [12, 5]</text>
   </g>
 </svg>
 <figcaption>红黑树负责「记住要监听谁」，就绪链表负责「记录谁已经好了」。epoll_wait 只看就绪链表，代价与就绪数成正比，与监听总数无关</figcaption>
@@ -567,7 +567,7 @@ write(sock_fd, buf, len);    // 用户 buf → socket 缓冲区 → 网卡
     <text x="110" y="313" fill="#f4ede4" font-size="13">磁盘</text>
     <line x1="110" y1="294" x2="110" y2="282" stroke="#ffd38a" stroke-width="2.2" marker-end="url(#za)"/>
     <line x1="158" y1="270" x2="290" y2="304" stroke="#86efac" stroke-width="2.2" marker-end="url(#zc)"/>
-    <text x="222" y="270" fill="#86efac" font-size="11">DMA 直接从页缓存取数据</text>
+    <text x="226" y="318" fill="#86efac" font-size="11">DMA 直接取页缓存</text>
   </g>
 </svg>
 <figcaption>传统方式让数据在内核与用户空间之间来回拷贝；sendfile 让数据留在内核里，网卡支持分散/聚集 DMA 时，连内核内部的 CPU 拷贝也省掉了</figcaption>
@@ -634,24 +634,24 @@ strace -f -c -e trace=read,sendto,recvfrom,sendfile python3 zerocopy.py sendfile
 copy 完成
 % time     seconds  usecs/call     calls    errors syscall
 ------ ----------- ----------- --------- --------- ----------------
- 55.61    0.060808          67       897           recvfrom
- 29.44    0.032187          31      1024           sendto
- 14.95    0.016352          14      1096           read
+ 55.36    0.110956         108      1025           recvfrom
+ 32.53    0.065208          63      1024           sendto
+ 12.11    0.024265          22      1095           read
 ------ ----------- ----------- --------- --------- ----------------
-100.00    0.109347          36      3017           total
+100.00    0.200429          63      3144           total
 
 接收端收到 64 MB
 sendfile 完成
 % time     seconds  usecs/call     calls    errors syscall
 ------ ----------- ----------- --------- --------- ----------------
- 66.88    0.093805       93805         1           sendfile
- 32.59    0.045710          93       488           recvfrom
-  0.52    0.000735          10        71           read
+ 54.80    0.033890       33890         1           sendfile
+ 44.76    0.027678          61       449           recvfrom
+  0.44    0.000274           3        71           read
 ------ ----------- ----------- --------- --------- ----------------
-100.00    0.140250         250       560           total
+100.00    0.061842         118       521           total
 ```
 
-传统方式在发送端做了 1024 次 `read` + 1024 次 `sendto`（64 MB ÷ 64 KB），每一次都伴随着用户态与内核态的切换和一次 CPU 拷贝；`sendfile` 只有 **1 次**系统调用，数据一个字节都没有进入 Python 进程。
+传统方式在发送端做了 1024 次 `read`（1095 次减去启动时的约 70 次）+ 1024 次 `sendto`（64 MB ÷ 64 KB），每一次都伴随着用户态与内核态的切换和一次 CPU 拷贝；`sendfile` 只有 **1 次**系统调用，数据一个字节都没有进入 Python 进程。
 
 （strace 本身会拖慢系统调用，表里的耗时没有参考意义，只看调用次数。在本机回环网络和文件已在页缓存的条件下，两种方式的总耗时差距不大；真实的收益体现在大流量、CPU 紧张的服务器上。）
 

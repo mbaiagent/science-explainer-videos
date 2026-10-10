@@ -94,7 +94,12 @@ const VIDEOS = [
   {cat:'cs', title:"微服务：拆开之后的那些组件", desc:"从单体到微服务：注册发现、配置中心、API 网关、服务调用，以及怎么拆、何时不该拆", path:'microservices/landscape.html', dur:84, color:'#a5b4fc'},
   {cat:'cs', title:"分布式 ID：雪花算法", desc:"分库分表后主键冲突怎么办？五种方案对比，雪花算法 64 位结构、时钟回拨与精度丢失", path:'snowflake-id/landscape.html', dur:84, color:'#bae6fd'},
   {cat:'cs', title:"Java 的锁：synchronized、CAS 与 AQS", desc:"count++ 为什么会出错？synchronized、CAS、AQS 与 ReentrantLock，一次讲透 Java 并发的锁", path:'java-lock/landscape.html', dur:84, color:'#f4a261'},
-  {cat:'cs', title:"幂等性设计：重复请求不出错", desc:"唯一约束、防重 Token、状态机、幂等键：让重复请求只生效一次", path:'idempotency/landscape.html', dur:82, color:'#bef264'}
+  {cat:'cs', title:"幂等性设计：重复请求不出错", desc:"唯一约束、防重 Token、状态机、幂等键：让重复请求只生效一次", path:'idempotency/landscape.html', dur:82, color:'#bef264'},
+  {cat:'cs', title:"RPC 原理：像调本地方法一样调远程服务", desc:"动态代理、序列化、协议帧与粘包、请求 ID 多路复用，附 Java 手写迷你 RPC", path:'rpc/landscape.html', dur:84, color:'#c4b5fd'},
+  {cat:'cs', title:"HashMap 与 ConcurrentHashMap", desc:"10 个线程并发 put，HashMap 悄悄丢数据；从哈希扰动、红黑树到 CAS + 锁桶头", path:'concurrent-hashmap/landscape.html', dur:84, color:'#99f6e4'},
+  {cat:'cs', title:"I/O 模型：从 BIO 到 epoll 与 Reactor", desc:"一个线程怎么扛住上万连接：select/poll/epoll、LT/ET、Reactor 与零拷贝", path:'io-models/landscape.html', dur:84, color:'#f0abfc'},
+  {cat:'cs', title:"Kubernetes 入门：容器的调度员", desc:"你只说要什么，它负责一直做到：控制循环、Pod、Deployment、Service 与自动扩缩", path:'kubernetes/landscape.html', dur:84, color:'#93c5fd'},
+  {cat:'cs', title:"熔断与降级：防止一个服务拖垮全部", desc:"下游一慢全站跟着挂？雪崩、超时重试、熔断三态、降级与舱壁隔离", path:'circuit-breaker/landscape.html', dur:84, color:'#fca5a5'}
 ];
 const fmt = s => `${Math.floor(s/60)}:${String(s%60).padStart(2,'0')}`;
 const esc = s => s.replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));

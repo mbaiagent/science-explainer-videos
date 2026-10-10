@@ -1,0 +1,1140 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>I/O 模型：从 BIO 到 epoll 与 Reactor · 拾星</title>
+<meta name="description" content="一次网络读取的两个阶段，阻塞、非阻塞、多路复用、信号驱动与异步 I/O，select/poll/epoll 的区别与 LT/ET，Reactor 三种线程模型、Java NIO 与零拷贝，附 Python 与 Java 可运行代码和 strace 实测">
+<link rel="stylesheet" href="../assets/article.css">
+<style>:root{--acc:#f0abfc}</style>
+</head>
+<body>
+<div class="wrap">
+  <nav class="top"><a href="../index.html">← 拾星 · 全部内容</a><a class="watch" href="landscape.html">▶ 看视频</a></nav>
+  <header class="hero">
+    <div class="tag">拾星 · 计算机与后端</div>
+    <h1>I/O 模型：从 BIO 到 epoll 与 Reactor</h1>
+    <p>一次网络读取的两个阶段，阻塞、非阻塞、多路复用、信号驱动与异步 I/O，select/poll/epoll 的区别与 LT/ET，Reactor 三种线程模型、Java NIO 与零拷贝，附 Python 与 Java 可运行代码和 strace 实测</p>
+    <div class="meta">约 55 分钟读完 · 配套视频 1:24</div>
+  </header>
+  <nav class="toc">
+<ul>
+<li><a href="#_1">一个线程，怎么同时伺候上万个连接</a></li>
+<li><a href="#read">一次 read()，其实分两步</a></li>
+<li><a href="#io-io">阻塞 I/O 与非阻塞 I/O</a></li>
+<li><a href="#io-selectpollepoll">I/O 多路复用：select、poll、epoll</a></li>
+<li><a href="#epoll-ltet">epoll 内部：红黑树、就绪链表与 LT/ET</a></li>
+<li><a href="#io">五种 I/O 模型，与「同步 / 异步、阻塞 / 非阻塞」</a></li>
+<li><a href="#reactor">Reactor 模式：把多路复用组织起来</a></li>
+<li><a href="#_8">零拷贝：让数据少绕路</a></li>
+<li><a href="#echo">动手：写一个单线程 echo 服务器</a></li>
+<li><a href="#_10">工程实践与常见坑</a></li>
+<li><a href="#_13">高频面试题速答</a></li>
+<li><a href="#_14">总结</a></li>
+</ul>
+</nav>
+
+  <article>
+<figure><img src="img/f-6.5.jpg" alt="一连接一线程撑不住上万连接，而 Redis 一个主线程就能扛住" loading="lazy"><figcaption>一连接一线程撑不住上万连接，而 Redis 一个主线程就能扛住</figcaption></figure>
+<h2 id="_1">一个线程，怎么同时伺候上万个连接</h2>
+<p>写一个网络服务，最直观的写法是：来一个连接，开一个线程，线程里循环「读请求 → 处理 → 写响应」。代码顺着逻辑往下写，非常好懂。</p>
+<p>问题出在连接数上来以后。一个聊天服务、一个推送网关、一个 Redis，常常同时挂着几万、几十万个长连接，而<strong>绝大多数连接在绝大多数时间里都没有数据</strong>，用户只是开着 App 而已。一连接一线程意味着：</p>
+<ul>
+<li><strong>一万个连接就是一万个线程</strong>。每个线程都有自己的栈（Java 平台线程默认预留 1 MB 虚拟地址空间），还有内核里的调度结构；</li>
+<li>这些线程几乎都<strong>阻塞在 <code>read()</code> 上等数据</strong>，什么也没干，却占着资源；</li>
+<li>线程多了，操作系统在它们之间来回<strong>上下文切换</strong>，CPU 时间花在了「换人」上，而不是干活上。</li>
+</ul>
+<p>这就是上世纪末被正式提出的 <strong>C10K 问题</strong>：单机怎么同时处理一万个并发连接？</p>
+<p>而另一边，Redis 在 6.0 之前，网络读写和命令执行都由<strong>一个主线程</strong>完成，照样能同时服务上万个客户端连接；Nginx 每个 worker 进程也只有一个事件循环。它们靠的是同一个东西：<strong>I/O 多路复用</strong>（Linux 上是 epoll）+ <strong>事件循环</strong>。</p>
+<p>这篇文章从最底层的「一次 read 到底发生了什么」讲起，依次讲清：</p>
+<ol>
+<li>五种 I/O 模型：阻塞、非阻塞、多路复用、信号驱动、异步；</li>
+<li>select、poll、epoll 的区别，epoll 为什么快，LT 和 ET 是什么；</li>
+<li>「同步 / 异步」和「阻塞 / 非阻塞」到底怎么区分；</li>
+<li>Reactor 模式的三种线程模型，Java NIO、Netty、Redis 分别对应哪种；</li>
+<li>零拷贝（sendfile、mmap）。</li>
+</ol>
+<p>每个关键结论都配了能直接运行的代码，输出均为本机（Linux 6.x、Python 3.13、OpenJDK 21）真实运行结果。</p>
+<blockquote>
+<p>本系列《进程、线程与协程》讲了线程本身的开销，《线程池》讲了线程的复用，《Redis 缓存》提到了 Redis 的单线程模型，这一篇把它们背后的 I/O 机制串起来。</p>
+</blockquote>
+<h2 id="read">一次 read()，其实分两步</h2>
+<figure><img src="img/f-18.5.jpg" alt="一次读取分成「等待数据就绪」和「拷贝数据」两个阶段" loading="lazy"><figcaption>一次读取分成「等待数据就绪」和「拷贝数据」两个阶段</figcaption></figure>
+<h3 id="_2">用户空间与内核空间</h3>
+<p>应用程序运行在<strong>用户空间</strong>，不能直接操作网卡。网络数据的收发由<strong>内核</strong>负责：</p>
+<ul>
+<li>网卡收到数据包后，通过 DMA 把数据写进内存，再由内核协议栈处理，最终放进这个连接对应的 <strong>socket 接收缓冲区</strong>；</li>
+<li>应用调用 <code>read(fd, buf, len)</code>（或 <code>recv</code>）时，内核把接收缓冲区里的数据<strong>拷贝</strong>到应用提供的 <code>buf</code> 里。</li>
+</ul>
+<p>这里的 <code>fd</code> 是<strong>文件描述符</strong>（file descriptor），一个小整数。在 Linux 上，打开的文件、socket、管道都用 fd 表示，「一切皆文件」。</p>
+<h3 id="_3">两个阶段</h3>
+<p>所以一次网络读取，实际上包含两个阶段：</p>
+<table>
+<thead>
+<tr>
+<th>阶段</th>
+<th>做什么</th>
+<th>耗时特点</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>① 等待数据就绪</strong></td>
+<td>等数据从网络到达，进入内核的 socket 接收缓冲区</td>
+<td>不确定，可能几毫秒，也可能几小时（对方一直不发）</td>
+</tr>
+<tr>
+<td><strong>② 拷贝数据</strong></td>
+<td>内核把数据从 socket 缓冲区拷贝到用户空间的 buf</td>
+<td>很快，但需要 CPU 参与</td>
+</tr>
+</tbody>
+</table>
+<p><strong>所有 I/O 模型的区别，都在于这两个阶段里，调用线程是否被阻塞、由谁来等。</strong> 把这句话记住，后面的五种模型就都是它的变体。</p>
+<p>阶段 ① 是真正「浪费时间」的地方。一个线程如果傻等在阶段 ①，那它在等待期间就什么也干不了。I/O 模型演进的主线，就是<strong>怎么让线程不再傻等阶段 ①</strong>。</p>
+<h2 id="io-io">阻塞 I/O 与非阻塞 I/O</h2>
+<figure><img src="img/f-30.5.jpg" alt="阻塞 I/O 一连接一线程；非阻塞 I/O 反复轮询" loading="lazy"><figcaption>阻塞 I/O 一连接一线程；非阻塞 I/O 反复轮询</figcaption></figure>
+<h3 id="iobio">阻塞 I/O（BIO）</h3>
+<p>socket 默认就是阻塞的。调用 <code>read()</code> 时，如果接收缓冲区里没有数据，线程就被挂起（阶段 ①），直到数据到达并拷贝完成（阶段 ②）才返回。</p>
+<p>因为一个线程在 <code>read()</code> 上会一直卡住，所以要同时服务多个连接，只能<strong>一个连接一个线程</strong>：</p>
+<pre><code class="language-text">主线程：  while (true) { conn = accept(); new Thread(() -&gt; handle(conn)).start(); }
+工作线程：while (true) { read(conn) → 处理 → write(conn) }   // 没数据就阻塞在 read
+</code></pre>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>优点</td>
+<td>代码直观，一个连接的处理逻辑就是一段顺序执行的代码</td>
+</tr>
+<tr>
+<td>缺点</td>
+<td>线程数 = 连接数；大量线程阻塞在 <code>read</code> 上空等，内存和上下文切换开销随连接数线性增长</td>
+</tr>
+<tr>
+<td>适合</td>
+<td>连接数少、每个连接都很忙的场景，比如内部服务之间的少量长连接、数据库连接</td>
+</tr>
+</tbody>
+</table>
+<p>用线程池代替「来一个开一个」（有时被称为「伪异步 I/O」），可以给线程数加上限，但治标不治本：线程池里的线程依然阻塞在 <code>read</code> 上，池满了以后，新连接只能排队，哪怕绝大多数已有连接根本没有数据。</p>
+<h3 id="ionio">非阻塞 I/O（NIO）</h3>
+<p>把 socket 设成非阻塞（<code>fcntl(fd, F_SETFL, O_NONBLOCK)</code>）后，<code>read()</code> 在没有数据时<strong>立即返回</strong> <code>-1</code>，错误码为 <code>EAGAIN</code>（或 <code>EWOULDBLOCK</code>），意思是「现在没数据，过会儿再来」。</p>
+<pre><code class="language-text">read(fd) → EAGAIN   还没数据
+read(fd) → EAGAIN   还没数据
+read(fd) → EAGAIN   还没数据
+read(fd) → 128 字节  ✓          ← 这一次进入阶段 ②，拷贝时线程仍然要等
+</code></pre>
+<p>线程不会被卡死，可以一个线程轮流去问很多个连接。但问题也很明显：</p>
+<ul>
+<li><strong>只能靠轮询</strong>：一万个连接问一圈，绝大多数回答都是 <code>EAGAIN</code>，CPU 在空转；</li>
+<li>轮询间隔不好定：问得勤，浪费 CPU；问得少，响应变慢；</li>
+<li>阶段 ② 的拷贝仍然是同步的，线程要等它完成。</li>
+</ul>
+<blockquote>
+<p>注意：这里的「非阻塞 I/O」指的是 socket 的 <code>O_NONBLOCK</code> 模式。Java 里的 <strong>NIO</strong> 是「New I/O」的缩写，它的核心是下面要讲的多路复用（Selector），两者别混淆。</p>
+</blockquote>
+<p>非阻塞 I/O 本身很少单独使用，但它是多路复用的<strong>基础</strong>：多路复用告诉你「哪些 fd 可以读了」，然后你用非阻塞的方式去读，保证不会意外卡住。</p>
+<p>我们真正想要的是：<strong>别让我一个个去问，让内核直接告诉我哪些连接有数据了</strong>。这就是 I/O 多路复用。</p>
+<h2 id="io-selectpollepoll">I/O 多路复用：select、poll、epoll</h2>
+<figure><img src="img/f-43.5.jpg" alt="select、poll、epoll 的对比" loading="lazy"><figcaption>select、poll、epoll 的对比</figcaption></figure>
+<p><strong>多路复用</strong>的意思是：用<strong>一个线程</strong>同时等待<strong>多个 fd</strong>，任何一个就绪了，内核就把线程唤醒，告诉它哪些就绪了。线程再只对这些就绪的 fd 做读写。</p>
+<p>线程依然会阻塞，但阻塞在「等任意一个 fd 就绪」这件事上，一次等一万个，而不是一个线程等一个。Linux 提供了三代接口。</p>
+<h3 id="select">select</h3>
+<pre><code class="language-c">int select(int nfds, fd_set *readfds, fd_set *writefds,
+           fd_set *exceptfds, struct timeval *timeout);
+</code></pre>
+<p><code>fd_set</code> 是一个<strong>位图</strong>，第 n 位为 1 表示关心 fd n。用法是：</p>
+<ol>
+<li>每次调用前，把所有关心的 fd 写进 <code>fd_set</code>；</li>
+<li>调用 <code>select</code>，<strong>整个位图被拷贝进内核</strong>；</li>
+<li>内核<strong>遍历所有 fd</strong>，检查是否就绪；没有就绪的就睡眠，有就绪的就把位图中未就绪的位清零；</li>
+<li>返回后，<strong>用户再遍历一遍位图</strong>，找出哪些位还是 1；</li>
+<li>因为位图被内核改写了，下一轮要<strong>重新填一遍</strong>。</li>
+</ol>
+<p>主要问题：</p>
+<ul>
+<li><strong>fd 上限</strong>：<code>fd_set</code> 的大小由 <code>FD_SETSIZE</code> 决定，glibc 中是 <strong>1024</strong>。注意这是对 <strong>fd 的编号</strong>的限制，不是数量：只要某个 fd 的编号 ≥ 1024 就不能用 select，哪怕总共只监听几个；</li>
+<li><strong>每次全量拷贝</strong>：每次调用都要把整个集合在用户态和内核态之间拷来拷去；</li>
+<li><strong>两次 O(n) 遍历</strong>：内核遍历一次，用户再遍历一次，连接越多越慢。</li>
+</ul>
+<h3 id="poll">poll</h3>
+<pre><code class="language-c">struct pollfd { int fd; short events; short revents; };
+int poll(struct pollfd *fds, nfds_t nfds, int timeout);
+</code></pre>
+<p>poll 用一个 <code>pollfd</code> 数组代替位图：</p>
+<ul>
+<li><strong>没有 1024 的限制</strong>，数组多长都可以（受进程 fd 上限约束）；</li>
+<li><code>events</code>（关心什么）和 <code>revents</code>（发生了什么）分开，不用每轮重新初始化。</li>
+</ul>
+<p>但本质没变：<strong>每次调用仍然要把整个数组拷进内核，内核仍然要遍历全部</strong>，返回后用户也要遍历全部。</p>
+<h3 id="epoll">epoll</h3>
+<p>epoll 把「注册要监听的 fd」和「等待事件」<strong>拆成了两步</strong>：</p>
+<pre><code class="language-c">int epfd = epoll_create1(0);                          // 1. 创建一个 epoll 实例
+
+struct epoll_event ev = { .events = EPOLLIN, .data.fd = connfd };
+epoll_ctl(epfd, EPOLL_CTL_ADD, connfd, &amp;ev);           // 2. 注册一次，长期有效
+
+struct epoll_event events[1024];
+int n = epoll_wait(epfd, events, 1024, -1);           // 3. 只返回就绪的 fd
+for (int i = 0; i &lt; n; i++) handle(events[i].data.fd);
+</code></pre>
+<ul>
+<li><strong>注册一次，长期有效</strong>：fd 只在加入、修改、删除时通过 <code>epoll_ctl</code> 告诉内核一次，不用每轮都全量拷贝；</li>
+<li><strong>只返回就绪的</strong>：<code>epoll_wait</code> 直接返回就绪事件的列表，有 3 个就绪就返回 3 个，用户不用遍历全部；</li>
+<li><strong>没有 1024 的限制</strong>。</li>
+</ul>
+<h3 id="_4">对比</h3>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>select</th>
+<th>poll</th>
+<th>epoll</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>fd 集合的表示</td>
+<td>位图 <code>fd_set</code></td>
+<td><code>pollfd</code> 数组</td>
+<td>内核中的红黑树</td>
+</tr>
+<tr>
+<td>fd 数量限制</td>
+<td>fd 编号 &lt; 1024</td>
+<td>无（受进程 fd 上限约束）</td>
+<td>无（受进程 fd 上限约束）</td>
+</tr>
+<tr>
+<td>每次调用拷贝</td>
+<td>整个集合</td>
+<td>整个数组</td>
+<td>无，注册时拷一次</td>
+</tr>
+<tr>
+<td>内核找就绪 fd</td>
+<td>遍历全部</td>
+<td>遍历全部</td>
+<td>回调把就绪 fd 放进就绪链表</td>
+</tr>
+<tr>
+<td>用户找就绪 fd</td>
+<td>遍历全部</td>
+<td>遍历全部</td>
+<td>直接拿到就绪列表</td>
+</tr>
+<tr>
+<td>每次等待的复杂度</td>
+<td>O(监听数)</td>
+<td>O(监听数)</td>
+<td>O(就绪数)</td>
+</tr>
+<tr>
+<td>可移植性</td>
+<td>几乎所有平台</td>
+<td>类 Unix</td>
+<td>仅 Linux</td>
+</tr>
+</tbody>
+</table>
+<p>macOS / FreeBSD 上对应 epoll 的是 <strong>kqueue</strong>，Windows 上是 <strong>IOCP</strong>（它其实是异步 I/O，后面会讲）。Java 的 <code>Selector</code>、Netty、libuv（Node.js）等都在不同平台上封装了这些接口。</p>
+<p>epoll 不是在所有情况下都比 select / poll 快。如果只监听几个 fd，或者所有连接都非常活跃（每次几乎全部就绪），三者差距不大。epoll 的优势在<strong>连接多、活跃少</strong>的场景，这恰恰是大多数长连接服务的常态。</p>
+<h3 id="select-1024">实验：select 的 1024 限制</h3>
+<p>下面的代码创建 600 对 socket（共 1200 个 fd），分别用 select、poll、epoll 去监听其中 600 个：</p>
+<pre><code class="language-python">import select, socket
+
+pairs = [socket.socketpair() for _ in range(600)]   # 600 对，共 1200 个 fd
+socks = [b for _, b in pairs]                       # 监听每对的接收端
+print(&quot;最大的 fd 编号:&quot;, max(s.fileno() for s in socks))
+
+small = [s for s in socks if s.fileno() &lt; 1024]
+print(&quot;select 监听编号 &lt; 1024 的&quot;, len(small), &quot;个 fd:&quot;, len(select.select(small, [], [], 0)[0]), &quot;个就绪&quot;)
+try:
+    select.select(socks, [], [], 0)                 # 含有编号 ≥ 1024 的 fd
+except ValueError as e:
+    print(&quot;select 监听全部&quot;, len(socks), &quot;个 fd: ValueError:&quot;, e)
+
+p = select.poll()
+ep = select.epoll()
+for s in socks:
+    p.register(s, select.POLLIN)
+    ep.register(s, select.EPOLLIN)
+print(&quot;poll  监听&quot;, len(socks), &quot;个 fd:&quot;, len(p.poll(0)), &quot;个就绪&quot;)
+print(&quot;epoll 监听&quot;, len(socks), &quot;个 fd:&quot;, len(ep.poll(0)), &quot;个就绪&quot;)
+
+pairs[123][0].send(b&quot;hi&quot;)                           # 只给其中一个连接发数据
+print(&quot;给第 123 个连接发数据后 → poll 返回:&quot;, p.poll(0), &quot; epoll 返回:&quot;, ep.poll(0))
+print(&quot;第 123 个连接的 fd 是&quot;, socks[123].fileno())
+</code></pre>
+<p>输出：</p>
+<pre><code class="language-text">最大的 fd 编号: 1202
+select 监听编号 &lt; 1024 的 510 个 fd: 0 个就绪
+select 监听全部 600 个 fd: ValueError: filedescriptor out of range in select()
+poll  监听 600 个 fd: 0 个就绪
+epoll 监听 600 个 fd: 0 个就绪
+给第 123 个连接发数据后 → poll 返回: [(250, 1)]  epoll 返回: [(250, 1)]
+第 123 个连接的 fd 是 250
+</code></pre>
+<p>只监听了 600 个 fd，select 就报错了，因为其中有编号超过 1024 的 fd。这也是 Linux 手册页明确建议新程序使用 poll 或 epoll、不要再用 select 的原因。</p>
+<h2 id="epoll-ltet">epoll 内部：红黑树、就绪链表与 LT/ET</h2>
+<figure><img src="img/f-54.5.jpg" alt="epoll 用红黑树管理 fd，用就绪链表收集就绪事件；LT 与 ET 两种触发方式" loading="lazy"><figcaption>epoll 用红黑树管理 fd，用就绪链表收集就绪事件；LT 与 ET 两种触发方式</figcaption></figure>
+<h3 id="_5">内部结构</h3>
+<p>调用 <code>epoll_create1</code> 时，内核创建一个 eventpoll 对象，里面有两个关键的数据结构：</p>
+<ul>
+<li><strong>红黑树</strong>：保存所有通过 <code>epoll_ctl</code> 注册的 fd（每个 fd 对应一个节点）。增、删、改、查都是 O(log n)，也能快速判断一个 fd 是否已经注册过；</li>
+<li><strong>就绪链表</strong>：保存当前已经就绪、等待交给用户的 fd。</li>
+</ul>
+<p>关键在于<strong>回调</strong>：<code>epoll_ctl</code> 注册 fd 时，内核会在这个 socket 的等待队列上挂一个回调函数。当数据到达、socket 变为可读时，协议栈唤醒等待队列，回调函数就把对应的节点<strong>加入就绪链表</strong>，并唤醒阻塞在 <code>epoll_wait</code> 上的线程。</p>
+<p><code>epoll_wait</code> 要做的事情就很简单了：看就绪链表是否为空；不为空，就把就绪的事件拷贝到用户提供的数组里返回。<strong>它从不遍历全部 fd</strong>。</p>
+<figure>
+<svg viewBox="0 0 440 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="epoll 内部结构">
+  <rect width="440" height="300" fill="#0f0e1c"/>
+  <defs><marker id="ea" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#f0abfc"/></marker></defs>
+  <g font-family="PingFang SC, Noto Sans SC, sans-serif" text-anchor="middle">
+    <rect x="10" y="10" width="420" height="208" rx="14" fill="rgba(255,255,255,.03)" stroke="rgba(255,255,255,.2)"/>
+    <text x="220" y="34" fill="#f0abfc" font-size="15" font-weight="800">内核中的 epoll 实例</text>
+    <text x="120" y="58" fill="#9a93a8" font-size="12">红黑树：所有注册的 fd</text>
+    <g stroke="rgba(255,255,255,.35)" stroke-width="1.5">
+      <line x1="120" y1="82" x2="75" y2="122"/><line x1="120" y1="82" x2="165" y2="122"/>
+      <line x1="75" y1="122" x2="50" y2="162"/><line x1="75" y1="122" x2="100" y2="162"/>
+      <line x1="165" y1="122" x2="140" y2="162"/><line x1="165" y1="122" x2="190" y2="162"/>
+    </g>
+    <g font-size="12" font-weight="800" fill="#f4ede4">
+      <circle cx="120" cy="82" r="15" fill="#3a3648"/><text x="120" y="86">7</text>
+      <circle cx="75" cy="122" r="15" fill="#8a4a55"/><text x="75" y="126">3</text>
+      <circle cx="165" cy="122" r="15" fill="#f0abfc"/><text x="165" y="126" fill="#1a0f22">12</text>
+      <circle cx="50" cy="162" r="15" fill="#3a3648"/><text x="50" y="166">1</text>
+      <circle cx="100" cy="162" r="15" fill="#f0abfc"/><text x="100" y="166" fill="#1a0f22">5</text>
+      <circle cx="140" cy="162" r="15" fill="#3a3648"/><text x="140" y="166">9</text>
+      <circle cx="190" cy="162" r="15" fill="#3a3648"/><text x="190" y="166">15</text>
+    </g>
+    <text x="340" y="58" fill="#9a93a8" font-size="12">就绪链表</text>
+    <rect x="290" y="72" width="100" height="30" rx="8" fill="rgba(240,171,252,.14)" stroke="#f0abfc"/>
+    <text x="340" y="92" fill="#f0abfc" font-size="13" font-weight="800">fd 12</text>
+    <rect x="290" y="112" width="100" height="30" rx="8" fill="rgba(240,171,252,.14)" stroke="#f0abfc"/>
+    <text x="340" y="132" fill="#f0abfc" font-size="13" font-weight="800">fd 5</text>
+    <path d="M108,176 Q240,215 286,130" fill="none" stroke="#f0abfc" stroke-width="1.8" stroke-dasharray="5 4" marker-end="url(#ea)"/>
+    <line x1="180" y1="116" x2="286" y2="89" stroke="#f0abfc" stroke-width="1.8" stroke-dasharray="5 4" marker-end="url(#ea)"/>
+    <text x="340" y="170" fill="#f0abfc" font-size="12">数据到达 → 回调入链表</text>
+    <text x="220" y="208" fill="#9a93a8" font-size="12">epoll_ctl：增删改红黑树节点，O(log n)</text>
+    <line x1="340" y1="218" x2="340" y2="240" stroke="#86efac" stroke-width="2.5" marker-end="url(#ea)"/>
+    <rect x="70" y="244" width="300" height="44" rx="12" fill="rgba(134,239,172,.12)" stroke="#86efac"/>
+    <text x="220" y="271" fill="#86efac" font-size="14" font-weight="800">epoll_wait() 只取就绪链表 → [12, 5]</text>
+  </g>
+</svg>
+<figcaption>红黑树负责「记住要监听谁」，就绪链表负责「记录谁已经好了」。epoll_wait 只看就绪链表，代价与就绪数成正比，与监听总数无关</figcaption>
+</figure>
+
+<p>一个流传很广的说法是「epoll 用 mmap 在内核和用户空间共享内存，所以快」。这是<strong>误解</strong>：<code>epoll_wait</code> 是把就绪事件拷贝到用户数组里的。epoll 快，靠的是「注册与等待分离」和「回调 + 就绪链表」。</p>
+<p>另外，epoll 只能用于支持「就绪通知」的 fd，比如 socket、管道、eventfd。<strong>普通磁盘文件不行</strong>：对普通文件调用 <code>epoll_ctl</code> 会返回 <code>EPERM</code>，因为在这个模型里普通文件永远被视为「就绪」。磁盘 I/O 的异步化要靠线程池或 io_uring。</p>
+<h3 id="lt-et">LT 与 ET：两种触发方式</h3>
+<p>epoll 有两种通知方式，区别在于「数据没读完时，下次还提不提醒」。</p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>LT（水平触发，Level-Triggered）</th>
+<th>ET（边缘触发，Edge-Triggered）</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>何时通知</td>
+<td>只要缓冲区里<strong>还有</strong>数据，每次 <code>epoll_wait</code> 都返回它</td>
+<td>只在状态<strong>变化</strong>时（有新数据到达）通知一次</td>
+</tr>
+<tr>
+<td>没读完会怎样</td>
+<td>下次 <code>epoll_wait</code> 继续提醒</td>
+<td>不再提醒，直到下一次有新数据到达</td>
+</tr>
+<tr>
+<td>编程要求</td>
+<td>宽松，读一部分也没关系</td>
+<td>fd 必须是非阻塞的，<strong>循环读到 <code>EAGAIN</code></strong> 为止</td>
+</tr>
+<tr>
+<td>默认</td>
+<td>是（不加 <code>EPOLLET</code> 就是 LT）</td>
+<td>注册时加 <code>EPOLLET</code></td>
+</tr>
+<tr>
+<td>使用者</td>
+<td>select / poll 都是这种语义；Java NIO 的 Selector；Redis</td>
+<td>Nginx；Netty 的原生 epoll 传输默认使用 ET</td>
+</tr>
+</tbody>
+</table>
+<p>为什么 ET 必须用非阻塞 fd？因为 ET 要求你一直读到读空，而判断「读空」的唯一办法就是读到 <code>EAGAIN</code>。如果 fd 是阻塞的，最后一次 <code>read</code> 会因为没数据而<strong>卡死</strong>整个事件循环。</p>
+<p>ET 的好处是通知次数少：同一批数据只通知一次，适合追求极致性能、并且能保证每次把数据处理干净的程序。代价是更容易写出 bug：只要有一次没读完，剩下的数据就可能「饿死」在缓冲区里，直到对端再发新数据。</p>
+<h3 id="lt-et_1">实验：LT 和 ET 的区别</h3>
+<p>用 Python 的 <code>select.epoll</code> 直接观察。对端发来 10 字节，我们只读 4 字节，再看 epoll 还提不提醒：</p>
+<pre><code class="language-python">import select, socket
+
+def demo(mode):
+    a, b = socket.socketpair()                # 一对互相连通的 socket
+    b.setblocking(False)
+    ep = select.epoll()
+    flags = select.EPOLLIN | (select.EPOLLET if mode == &quot;ET&quot; else 0)
+    ep.register(b.fileno(), flags)
+
+    a.send(b&quot;0123456789&quot;)                     # 对端发来 10 字节
+    print(f&quot;[{mode}] 第 1 次 epoll_wait:&quot;, ep.poll(0))
+    print(f&quot;[{mode}] 只读 4 字节:&quot;, b.recv(4))
+    print(f&quot;[{mode}] 第 2 次 epoll_wait:&quot;, ep.poll(0), &quot;  ← 缓冲区里还剩 6 字节&quot;)
+    a.send(b&quot;!&quot;)                              # 又来了新数据
+    print(f&quot;[{mode}] 新数据到达后:&quot;, ep.poll(0))
+    # ET 的正确读法：循环读到 EAGAIN
+    buf = b&quot;&quot;
+    while True:
+        try:
+            chunk = b.recv(4)
+            if not chunk: break
+            buf += chunk
+        except BlockingIOError:               # EAGAIN：读空了
+            break
+    print(f&quot;[{mode}] 循环读到 EAGAIN:&quot;, buf)
+    print(f&quot;[{mode}] 读空后 epoll_wait:&quot;, ep.poll(0))
+    print()
+
+demo(&quot;LT&quot;)
+demo(&quot;ET&quot;)
+</code></pre>
+<p>输出（<code>(4, 1)</code> 表示 fd 4 上发生了 <code>EPOLLIN</code> 事件）：</p>
+<pre><code class="language-text">[LT] 第 1 次 epoll_wait: [(4, 1)]
+[LT] 只读 4 字节: b'0123'
+[LT] 第 2 次 epoll_wait: [(4, 1)]   ← 缓冲区里还剩 6 字节
+[LT] 新数据到达后: [(4, 1)]
+[LT] 循环读到 EAGAIN: b'456789!'
+[LT] 读空后 epoll_wait: []
+
+[ET] 第 1 次 epoll_wait: [(4, 1)]
+[ET] 只读 4 字节: b'0123'
+[ET] 第 2 次 epoll_wait: []   ← 缓冲区里还剩 6 字节
+[ET] 新数据到达后: [(4, 1)]
+[ET] 循环读到 EAGAIN: b'456789!'
+[ET] 读空后 epoll_wait: []
+</code></pre>
+<p>关键就在第 2 次 <code>epoll_wait</code>：缓冲区里明明还剩 6 字节，LT 继续提醒，ET 一声不吭，直到新数据 <code>!</code> 到达才再次通知。如果程序在 ET 模式下只读一次就去干别的，那 6 个字节就会一直躺在缓冲区里。</p>
+<blockquote>
+<p>还有一个相关的标志 <code>EPOLLONESHOT</code>：事件触发一次后自动禁用这个 fd，需要处理完后用 <code>EPOLL_CTL_MOD</code> 重新启用。多线程同时调用 <code>epoll_wait</code> 时，可以用它保证同一个连接同一时刻只被一个线程处理。</p>
+</blockquote>
+<h2 id="io">五种 I/O 模型，与「同步 / 异步、阻塞 / 非阻塞」</h2>
+<figure><img src="img/f-65.5.jpg" alt="五种 I/O 模型在两个阶段的表现，以及两组概念的区别" loading="lazy"><figcaption>五种 I/O 模型在两个阶段的表现，以及两组概念的区别</figcaption></figure>
+<h3 id="_6">五种模型</h3>
+<p>经典的 Unix 网络编程教材把 I/O 分成五种模型。用「两个阶段」一对照就很清楚：</p>
+<table>
+<thead>
+<tr>
+<th>模型</th>
+<th>阶段 ① 等数据</th>
+<th>阶段 ② 拷数据</th>
+<th>典型接口</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>阻塞 I/O</td>
+<td>阻塞</td>
+<td>阻塞</td>
+<td>默认的 <code>read</code> / <code>recv</code></td>
+</tr>
+<tr>
+<td>非阻塞 I/O</td>
+<td>不阻塞，但要反复轮询</td>
+<td>阻塞</td>
+<td><code>O_NONBLOCK</code> + <code>read</code> 返回 <code>EAGAIN</code></td>
+</tr>
+<tr>
+<td>I/O 多路复用</td>
+<td>阻塞在 select / epoll_wait 上（一次等很多 fd）</td>
+<td>阻塞</td>
+<td>select、poll、epoll</td>
+</tr>
+<tr>
+<td>信号驱动 I/O</td>
+<td>不阻塞，数据就绪时内核发 <code>SIGIO</code> 信号</td>
+<td>阻塞</td>
+<td><code>fcntl</code> 设置 <code>O_ASYNC</code> + 信号处理函数</td>
+</tr>
+<tr>
+<td>异步 I/O</td>
+<td>不阻塞</td>
+<td>不阻塞，内核拷贝完成后再通知</td>
+<td>POSIX AIO、Linux io_uring、Windows IOCP</td>
+</tr>
+</tbody>
+</table>
+<p>几点说明：</p>
+<ul>
+<li><strong>信号驱动 I/O</strong> 在实践中很少用于 TCP：TCP socket 上很多种情况都会触发 <code>SIGIO</code>，信号处理函数里很难分辨到底发生了什么，而且信号本身就不好用；</li>
+<li><strong>异步 I/O</strong> 才是唯一一个「两个阶段都不用等」的模型：你告诉内核「把数据读到这个 buf，好了叫我」，然后就去干别的，内核把数据<strong>拷贝完</strong>之后才通知你；</li>
+<li>前四种模型中，阶段 ② 都需要调用线程亲自参与、等待拷贝完成。</li>
+</ul>
+<h3 id="vs">两组概念：阻塞 / 非阻塞 vs 同步 / 异步</h3>
+<p>这是面试的高频混淆点。它们描述的是<strong>两个不同的维度</strong>：</p>
+<table>
+<thead>
+<tr>
+<th>维度</th>
+<th>关心的问题</th>
+<th>例子</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>阻塞 vs 非阻塞</strong></td>
+<td><strong>调用本身</strong>：数据没准备好时，这个调用是挂起等待，还是立刻返回</td>
+<td>阻塞 socket 的 <code>read</code> 会挂起；非阻塞 socket 的 <code>read</code> 立刻返回 <code>EAGAIN</code></td>
+</tr>
+<tr>
+<td><strong>同步 vs 异步</strong></td>
+<td><strong>结果怎么拿到</strong>：是你的线程自己把数据取回来（同步），还是内核把事情全做完后通知你（异步）</td>
+<td><code>read</code> 是同步的：数据要靠你调用它才会拷贝进来；io_uring 是异步的：完成时结果已经在你的 buf 里了</td>
+</tr>
+</tbody>
+</table>
+<p>按 POSIX 的定义：<strong>同步 I/O 操作会让请求进程阻塞，直到 I/O 操作完成；异步 I/O 操作则不会</strong>。这里的「I/O 操作完成」包括阶段 ②。所以：</p>
+<ul>
+<li>阻塞 I/O、非阻塞 I/O、I/O 多路复用、信号驱动 I/O，都是<strong>同步 I/O</strong>；</li>
+<li>只有异步 I/O 是<strong>异步 I/O</strong>；</li>
+<li><strong>epoll 是同步非阻塞模型</strong>（通常和非阻塞 fd 一起使用），不是异步 I/O。「非阻塞」不等于「异步」。</li>
+</ul>
+<p>一个生活化的比喻：去餐厅取餐。</p>
+<ul>
+<li>阻塞：站在窗口一直等，餐好了自己端走；</li>
+<li>非阻塞轮询：每隔一分钟去窗口问一次「好了没」；</li>
+<li>多路复用：同时点了十家的餐，坐在大厅看叫号屏，哪家号亮了就去哪家端；</li>
+<li>异步：外卖，做好了直接送到你桌上。</li>
+</ul>
+<p>前三种，最后都是<strong>你自己去端</strong>（同步）；只有外卖是<strong>送到手上</strong>（异步）。</p>
+<h3 id="linux-io-aio-io_uring">Linux 上的异步 I/O：从 AIO 到 io_uring</h3>
+<p>Linux 在异步 I/O 上走过不少弯路：</p>
+<ul>
+<li><strong>POSIX AIO</strong>（<code>aio_read</code> 等）：glibc 的实现其实是在用户态用线程池模拟的；</li>
+<li><strong>Linux 原生 AIO</strong>（<code>io_submit</code>，常配合 libaio 使用）：主要在 <code>O_DIRECT</code>（绕过页缓存的直接 I/O）读写文件时才是真正异步的，对网络 socket 支持很差，主要被数据库等少数软件使用；</li>
+<li><strong>io_uring</strong>（Linux 5.1 引入）：用户态和内核共享两个环形队列，<strong>提交队列（SQ）</strong>和<strong>完成队列（CQ）</strong>。应用把请求写进 SQ，内核完成后把结果放进 CQ。它同时支持文件和网络 I/O，还能批量提交，大幅减少系统调用次数，甚至可以配置内核线程主动轮询 SQ，做到提交时不需要系统调用。</li>
+</ul>
+<p>io_uring 功能强大，但接口和安全模型都比较复杂，一些发行版和容器运行时出于安全考虑默认限制了它的使用。目前主流的网络框架仍以 epoll 为主，io_uring 正在逐步被采用。</p>
+<h3 id="java-io">Java 的三种 I/O</h3>
+<table>
+<thead>
+<tr>
+<th>Java API</th>
+<th>引入版本</th>
+<th>对应模型</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>java.io</code>（<code>InputStream</code>、<code>Socket</code>）</td>
+<td>JDK 1.0</td>
+<td>阻塞 I/O</td>
+<td>常说的 <strong>BIO</strong></td>
+</tr>
+<tr>
+<td><code>java.nio</code>（<code>Channel</code>、<code>Buffer</code>、<code>Selector</code>）</td>
+<td>JDK 1.4</td>
+<td>I/O 多路复用</td>
+<td>常说的 <strong>NIO</strong>；Linux 上 Selector 基于 epoll</td>
+</tr>
+<tr>
+<td><code>AsynchronousSocketChannel</code> 等</td>
+<td>JDK 7（NIO.2）</td>
+<td>异步 I/O（API 形式）</td>
+<td>常说的 <strong>AIO</strong>；Windows 上基于 IOCP，<strong>Linux 上内部用 epoll + 线程池模拟</strong></td>
+</tr>
+</tbody>
+</table>
+<p>因为 Linux 上的 Java AIO 并不是内核级的异步，性能没有明显优势，所以 Netty 等主流框架在 Linux 上都基于 NIO（或直接调用 epoll 的原生传输）。</p>
+<h2 id="reactor">Reactor 模式：把多路复用组织起来</h2>
+<figure><img src="img/f-77.5.jpg" alt="Reactor 的三种线程模型" loading="lazy"><figcaption>Reactor 的三种线程模型</figcaption></figure>
+<p>epoll 只是一个系统调用。要用它写出一个结构清晰的服务器，需要一种组织方式，这就是 <strong>Reactor 模式</strong>（反应器模式）：</p>
+<ol>
+<li><strong>等事件</strong>：调用 <code>epoll_wait</code> / <code>selector.select()</code>，阻塞等待任意 fd 上的事件；</li>
+<li><strong>分发</strong>：根据事件类型，交给对应的处理器：新连接交给 <strong>Acceptor</strong>，可读 / 可写交给连接对应的 <strong>Handler</strong>；</li>
+<li><strong>处理</strong>：Handler 读数据、执行业务逻辑、写响应；</li>
+<li>回到第 1 步。</li>
+</ol>
+<p>这个循环就叫<strong>事件循环</strong>（event loop）。Redis 的 ae、Nginx、Node.js 的 libuv、Netty 的 EventLoop，本质都是它。</p>
+<h3 id="java-nio">Java NIO 三件套</h3>
+<p>Java NIO 正好提供了实现 Reactor 所需的三块积木：</p>
+<table>
+<thead>
+<tr>
+<th>组件</th>
+<th>作用</th>
+<th>对应的底层概念</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Channel</strong></td>
+<td>一个连接（或文件），可以设置为非阻塞，读写都要经过 Buffer</td>
+<td>fd</td>
+</tr>
+<tr>
+<td><strong>Buffer</strong></td>
+<td>一块内存，有 <code>position</code>、<code>limit</code>、<code>capacity</code> 三个指针；写完要 <code>flip()</code> 才能读</td>
+<td>用户空间的 buf</td>
+</tr>
+<tr>
+<td><strong>Selector</strong></td>
+<td>多路复用器：Channel 注册到它上面，<code>select()</code> 返回就绪的 SelectionKey</td>
+<td>epoll 实例</td>
+</tr>
+</tbody>
+</table>
+<h3 id="_7">三种线程模型</h3>
+<p><strong>① 单 Reactor 单线程</strong></p>
+<p>所有事情都在一个线程里：等事件、accept、读、业务处理、写。</p>
+<ul>
+<li>优点：没有线程切换，没有锁，实现简单；</li>
+<li>缺点：只能用一个 CPU 核；<strong>任何一个处理慢了，所有连接都要等</strong>；</li>
+<li>例子：<strong>Redis 6.0 之前的主处理流程</strong>。Redis 的命令绝大多数是内存操作，非常快，所以单线程反而是优势。这也是为什么 Redis 里要警惕 <code>KEYS *</code>、大 key 删除等慢操作，它们会卡住所有客户端。</li>
+</ul>
+<p><strong>② 单 Reactor 多线程</strong></p>
+<p>Reactor 线程负责等事件和 I/O 读写，读到完整请求后，把<strong>业务处理</strong>交给线程池，处理完再由 Reactor 线程写回。</p>
+<ul>
+<li>优点：耗时的业务逻辑不再阻塞事件循环，能利用多核；</li>
+<li>缺点：所有连接的 I/O 仍然由<strong>一个</strong> Reactor 线程完成，连接数和流量都很大时，它会成为瓶颈；业务线程和 Reactor 线程之间要做好线程安全。</li>
+</ul>
+<p><strong>③ 主从 Reactor（多 Reactor 多线程）</strong></p>
+<ul>
+<li><strong>主 Reactor</strong>（通常 1 个线程）：只负责 <code>accept</code> 新连接，然后把连接分配给某个从 Reactor；</li>
+<li><strong>从 Reactor</strong>（多个线程，一般与 CPU 核数相当）：每个都有自己的 Selector / epoll 实例，负责一批连接的读写；一个连接从始至终由同一个从 Reactor 处理，不需要加锁；</li>
+<li>耗时业务可以再交给单独的业务线程池。</li>
+</ul>
+<p>这是目前高性能网络框架的主流方案：</p>
+<ul>
+<li><strong>Netty</strong>：<code>bossGroup</code> 就是主 Reactor，<code>workerGroup</code> 就是从 Reactor，每个 <code>EventLoop</code> 是一个线程加一个 Selector；</li>
+<li><strong>Kafka</strong> 的网络层：一个 Acceptor 线程接收连接，多个 Processor 线程（<code>num.network.threads</code>）各自用 Selector 处理读写，再把请求交给 I/O 线程池（<code>num.io.threads</code>）；</li>
+<li><strong>Redis 6.0 起</strong>可以开启 I/O 线程（<code>io-threads</code>）分担网络读写和协议解析，但<strong>命令仍然由主线程串行执行</strong>，所以「Redis 执行命令是单线程的」这一点没变。</li>
+</ul>
+<p>Netty 中的典型写法（参考写法，Netty 4.1 风格的 API，未在本机运行）：</p>
+<pre><code class="language-java">EventLoopGroup boss = new NioEventLoopGroup(1);      // 主 Reactor：1 个线程负责 accept
+EventLoopGroup worker = new NioEventLoopGroup();     // 从 Reactor：默认 CPU 核数 × 2 个线程
+try {
+    new ServerBootstrap()
+        .group(boss, worker)
+        .channel(NioServerSocketChannel.class)
+        .childHandler(new ChannelInitializer&lt;SocketChannel&gt;() {
+            @Override
+            protected void initChannel(SocketChannel ch) {
+                ch.pipeline().addLast(new EchoHandler());   // 在 worker 线程中执行
+            }
+        })
+        .bind(8080).sync()
+        .channel().closeFuture().sync();
+} finally {
+    boss.shutdownGracefully();
+    worker.shutdownGracefully();
+}
+</code></pre>
+<p><strong>Netty 开发的铁律：不要在 EventLoop 线程里做阻塞操作</strong>（查数据库、调用远程接口、<code>Thread.sleep</code>）。一个 EventLoop 线程负责成百上千个连接，它一卡，这些连接全都跟着卡。耗时操作要交给业务线程池。</p>
+<h3 id="reactor-proactor">Reactor 与 Proactor</h3>
+<p>Reactor 基于<strong>同步</strong> I/O：内核告诉你「可以读了」，你自己去读。对应地，基于<strong>异步</strong> I/O 的模式叫 <strong>Proactor</strong>：你发起「读到这个 buf」的请求，内核读完后通知你「已经读好了」，你直接处理数据。Windows 的 IOCP 是典型的 Proactor 基础设施；Linux 上 io_uring 也让 Proactor 风格的实现成为可能。</p>
+<h3 id="bio-epoll">题外话：写法是 BIO，底层是 epoll</h3>
+<p>Reactor 模型性能好，但代码被拆成了一个个回调，不如 BIO 好写好读。于是新的思路出现了：<strong>让程序员写阻塞风格的代码，由运行时在底层换成 epoll</strong>。</p>
+<ul>
+<li><strong>Go</strong>：goroutine 里调用 <code>conn.Read()</code> 看起来是阻塞的，实际上 Go 运行时的 netpoller 把 socket 设为非阻塞并注册到 epoll，goroutine 被挂起，数据就绪后再被唤醒；</li>
+<li><strong>Java 21 虚拟线程</strong>：在虚拟线程中调用阻塞的 socket 读写时，JDK 会把虚拟线程从载体线程上卸下，由内部基于 epoll 的 poller 等待就绪，再把虚拟线程调度回来。</li>
+</ul>
+<p>于是「一连接一（虚拟）线程」的写法重新变得可行。这部分内容详见本系列《进程、线程与协程》。</p>
+<h2 id="_8">零拷贝：让数据少绕路</h2>
+<p>回到「阶段 ② 拷贝数据」。读网络是这样，<strong>发文件</strong>的时候拷贝更多。比如一个静态文件服务器、Kafka 把消息日志发给消费者，最朴素的写法是：</p>
+<pre><code class="language-c">read(file_fd, buf, len);     // 磁盘 → 内核页缓存 → 用户 buf
+write(sock_fd, buf, len);    // 用户 buf → socket 缓冲区 → 网卡
+</code></pre>
+<p>数据从磁盘出发，先进内核的<strong>页缓存</strong>，再拷到用户空间的 <code>buf</code>，再拷回内核的 socket 缓冲区，最后到网卡。应用程序对这些数据<strong>什么也没做</strong>，却让它在用户空间绕了一圈。</p>
+<figure>
+<svg viewBox="0 0 440 330" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="传统 read + write 与 sendfile 的数据路径对比">
+  <rect width="440" height="330" fill="#0f0e1c"/>
+  <defs>
+    <marker id="za" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#ffd38a"/></marker>
+    <marker id="zb" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#ff8a8a"/></marker>
+    <marker id="zc" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#86efac"/></marker>
+  </defs>
+  <g font-family="PingFang SC, Noto Sans SC, sans-serif" text-anchor="middle">
+    <text x="220" y="22" fill="#f4ede4" font-size="15" font-weight="800">read + write：4 次拷贝，其中 2 次是 CPU 拷贝</text>
+    <text x="22" y="56" fill="#9a93a8" font-size="11" text-anchor="start">用户</text>
+    <text x="22" y="106" fill="#9a93a8" font-size="11" text-anchor="start">内核</text>
+    <text x="22" y="150" fill="#9a93a8" font-size="11" text-anchor="start">硬件</text>
+    <line x1="14" y1="76" x2="426" y2="76" stroke="rgba(255,255,255,.15)" stroke-dasharray="4 4"/>
+    <rect x="170" y="38" width="100" height="30" rx="8" fill="rgba(240,171,252,.14)" stroke="#f0abfc"/>
+    <text x="220" y="58" fill="#f0abfc" font-size="13" font-weight="700">用户 buf</text>
+    <rect x="62" y="88" width="96" height="30" rx="8" fill="rgba(255,255,255,.06)" stroke="#9a93a8"/>
+    <text x="110" y="108" fill="#f4ede4" font-size="13" font-weight="700">页缓存</text>
+    <rect x="282" y="88" width="120" height="30" rx="8" fill="rgba(255,255,255,.06)" stroke="#9a93a8"/>
+    <text x="342" y="108" fill="#f4ede4" font-size="13" font-weight="700">socket 缓冲区</text>
+    <rect x="62" y="134" width="96" height="28" rx="8" fill="rgba(255,255,255,.04)" stroke="#9a93a8"/>
+    <text x="110" y="153" fill="#f4ede4" font-size="13">磁盘</text>
+    <rect x="294" y="134" width="96" height="28" rx="8" fill="rgba(255,255,255,.04)" stroke="#9a93a8"/>
+    <text x="342" y="153" fill="#f4ede4" font-size="13">网卡</text>
+    <line x1="110" y1="134" x2="110" y2="122" stroke="#ffd38a" stroke-width="2.2" marker-end="url(#za)"/>
+    <line x1="140" y1="88" x2="174" y2="70" stroke="#ff8a8a" stroke-width="2.2" marker-end="url(#zb)"/>
+    <line x1="266" y1="70" x2="302" y2="88" stroke="#ff8a8a" stroke-width="2.2" marker-end="url(#zb)"/>
+    <line x1="342" y1="118" x2="342" y2="131" stroke="#ffd38a" stroke-width="2.2" marker-end="url(#za)"/>
+    <text x="220" y="188" fill="#9a93a8" font-size="12"><tspan fill="#ffd38a">黄色：DMA 拷贝</tspan>　<tspan fill="#ff8a8a">红色：CPU 拷贝</tspan>　另有 4 次用户态 / 内核态切换</text>
+    <line x1="14" y1="204" x2="426" y2="204" stroke="rgba(255,255,255,.12)"/>
+    <text x="220" y="228" fill="#86efac" font-size="15" font-weight="800">sendfile（网卡支持 SG-DMA）：不经过用户空间</text>
+    <rect x="62" y="248" width="96" height="30" rx="8" fill="rgba(255,255,255,.06)" stroke="#9a93a8"/>
+    <text x="110" y="268" fill="#f4ede4" font-size="13" font-weight="700">页缓存</text>
+    <rect x="282" y="248" width="120" height="30" rx="8" fill="rgba(255,255,255,.06)" stroke="#9a93a8" stroke-dasharray="4 3"/>
+    <text x="342" y="268" fill="#9a93a8" font-size="12">只放描述符</text>
+    <rect x="294" y="294" width="96" height="28" rx="8" fill="rgba(255,255,255,.04)" stroke="#9a93a8"/>
+    <text x="342" y="313" fill="#f4ede4" font-size="13">网卡</text>
+    <rect x="62" y="294" width="96" height="28" rx="8" fill="rgba(255,255,255,.04)" stroke="#9a93a8"/>
+    <text x="110" y="313" fill="#f4ede4" font-size="13">磁盘</text>
+    <line x1="110" y1="294" x2="110" y2="282" stroke="#ffd38a" stroke-width="2.2" marker-end="url(#za)"/>
+    <line x1="158" y1="270" x2="290" y2="304" stroke="#86efac" stroke-width="2.2" marker-end="url(#zc)"/>
+    <text x="226" y="318" fill="#86efac" font-size="11">DMA 直接取页缓存</text>
+  </g>
+</svg>
+<figcaption>传统方式让数据在内核与用户空间之间来回拷贝；sendfile 让数据留在内核里，网卡支持分散/聚集 DMA 时，连内核内部的 CPU 拷贝也省掉了</figcaption>
+</figure>
+
+<h3 id="_9">几种方式对比</h3>
+<table>
+<thead>
+<tr>
+<th>方式</th>
+<th>系统调用</th>
+<th>上下文切换</th>
+<th>拷贝次数</th>
+<th>其中 CPU 拷贝</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>read</code> + <code>write</code></td>
+<td>2</td>
+<td>4 次</td>
+<td>4 次</td>
+<td>2 次</td>
+</tr>
+<tr>
+<td><code>mmap</code> + <code>write</code></td>
+<td>2</td>
+<td>4 次</td>
+<td>3 次</td>
+<td>1 次（页缓存 → socket 缓冲区）</td>
+</tr>
+<tr>
+<td><code>sendfile</code></td>
+<td>1</td>
+<td>2 次</td>
+<td>3 次</td>
+<td>1 次</td>
+</tr>
+<tr>
+<td><code>sendfile</code> + SG-DMA 网卡</td>
+<td>1</td>
+<td>2 次</td>
+<td>2 次</td>
+<td>0 次</td>
+</tr>
+</tbody>
+</table>
+<p>（以上按一次完整传输的经典分析计；实际的系统调用次数取决于每次传输的数据量。）</p>
+<ul>
+<li><strong>mmap</strong>：把文件映射进进程的地址空间，用户态访问这段内存就等于直接访问页缓存，省掉「页缓存 → 用户 buf」这次拷贝。RocketMQ 读写 CommitLog、很多数据库和搜索引擎都大量使用 mmap；</li>
+<li><strong>sendfile</strong>：直接告诉内核「把这个文件的这一段发到这个 socket」，数据全程留在内核。Java 中对应 <code>FileChannel.transferTo</code>，Nginx 中是 <code>sendfile on;</code>，Kafka 把日志发给消费者时也用的是它；</li>
+<li>「零拷贝」中的「零」，指的是<strong>没有在内核与用户空间之间的 CPU 拷贝</strong>，并不是一次拷贝都没有，DMA 拷贝始终存在。</li>
+</ul>
+<p>零拷贝也有限制：数据在发送前<strong>不能被应用修改</strong>。比如开启了 TLS 的连接，数据要在用户态加密（除非使用内核 TLS 等特殊机制），就享受不到 sendfile 的好处。</p>
+<h3 id="strace">实验：用 strace 数一数系统调用</h3>
+<p>发送一个 64 MB 的文件，分别用「read + 发送」和 <code>sendfile</code> 两种方式：</p>
+<pre><code class="language-python">import os, socket, sys, threading
+
+PATH, MODE = &quot;big.bin&quot;, sys.argv[1]           # MODE: copy 或 sendfile
+size = os.path.getsize(PATH)
+
+def sink(srv):                                 # 接收端：把数据读完丢掉
+    conn, _ = srv.accept()
+    got = 0
+    while (chunk := conn.recv(1 &lt;&lt; 20)):
+        got += len(chunk)
+    print(f&quot;接收端收到 {got // (1 &lt;&lt; 20)} MB&quot;)
+
+srv = socket.create_server((&quot;127.0.0.1&quot;, 0))
+t = threading.Thread(target=sink, args=(srv,)); t.start()
+s = socket.create_connection(srv.getsockname())
+
+with open(PATH, &quot;rb&quot;) as f:
+    if MODE == &quot;copy&quot;:                         # 传统方式：read 进用户空间，再发出去
+        while (buf := f.read(64 * 1024)):
+            s.sendall(buf)
+    else:                                      # 零拷贝：sendfile，数据不经过用户空间
+        os.sendfile(s.fileno(), f.fileno(), 0, size)
+s.close(); t.join()
+print(MODE, &quot;完成&quot;)
+</code></pre>
+<pre><code class="language-bash">head -c 64M /dev/urandom &gt; big.bin
+strace -f -c -e trace=read,sendto,recvfrom,sendfile python3 zerocopy.py copy
+strace -f -c -e trace=read,sendto,recvfrom,sendfile python3 zerocopy.py sendfile
+</code></pre>
+<p>输出（<code>recvfrom</code> 是接收端线程的调用；<code>read</code> 里有约 70 次是 Python 启动时读取模块文件）：</p>
+<pre><code class="language-text">接收端收到 64 MB
+copy 完成
+% time     seconds  usecs/call     calls    errors syscall
+------ ----------- ----------- --------- --------- ----------------
+ 55.36    0.110956         108      1025           recvfrom
+ 32.53    0.065208          63      1024           sendto
+ 12.11    0.024265          22      1095           read
+------ ----------- ----------- --------- --------- ----------------
+100.00    0.200429          63      3144           total
+
+接收端收到 64 MB
+sendfile 完成
+% time     seconds  usecs/call     calls    errors syscall
+------ ----------- ----------- --------- --------- ----------------
+ 54.80    0.033890       33890         1           sendfile
+ 44.76    0.027678          61       449           recvfrom
+  0.44    0.000274           3        71           read
+------ ----------- ----------- --------- --------- ----------------
+100.00    0.061842         118       521           total
+</code></pre>
+<p>传统方式在发送端做了 1024 次 <code>read</code>（1095 次减去启动时的约 70 次）+ 1024 次 <code>sendto</code>（64 MB ÷ 64 KB），每一次都伴随着用户态与内核态的切换和一次 CPU 拷贝；<code>sendfile</code> 只有 <strong>1 次</strong>系统调用，数据一个字节都没有进入 Python 进程。</p>
+<p>（strace 本身会拖慢系统调用，表里的耗时没有参考意义，只看调用次数。在本机回环网络和文件已在页缓存的条件下，两种方式的总耗时差距不大；真实的收益体现在大流量、CPU 紧张的服务器上。）</p>
+<h2 id="echo">动手：写一个单线程 echo 服务器</h2>
+<p>理论讲完，来写一个真正的服务器。功能很简单：客户端发什么，服务器就把它转成大写发回去。我们用同样的客户端压力（200 个客户端同时连接，每个发 3 条消息，每条间隔 0.1 秒），对比两种写法。</p>
+<h3 id="io_1">版本一：阻塞 I/O，一连接一线程</h3>
+<pre><code class="language-python">import socket, threading, time
+
+server = socket.create_server((&quot;127.0.0.1&quot;, 0), backlog=1024)
+port = server.getsockname()[1]
+peak = {&quot;threads&quot;: 0}
+lock = threading.Lock()
+active = {&quot;n&quot;: 0}
+
+def handle(conn):                             # 每个连接一个线程
+    with lock:
+        active[&quot;n&quot;] += 1
+        peak[&quot;threads&quot;] = max(peak[&quot;threads&quot;], active[&quot;n&quot;])
+    with conn:
+        while True:
+            data = conn.recv(4096)            # 没数据就阻塞在这里
+            if not data:
+                break
+            conn.sendall(data.upper())
+    with lock:
+        active[&quot;n&quot;] -= 1
+
+def acceptor():
+    while True:
+        conn, _ = server.accept()             # 阻塞等新连接
+        threading.Thread(target=handle, args=(conn,), daemon=True).start()
+
+threading.Thread(target=acceptor, daemon=True).start()
+
+N = 200
+ok = []
+def client(i):
+    with socket.create_connection((&quot;127.0.0.1&quot;, port)) as s:
+        for j in range(3):
+            msg = f&quot;hello {i}-{j}&quot;.encode()
+            s.sendall(msg)
+            assert s.recv(4096) == msg.upper()
+            time.sleep(0.1)
+        ok.append(i)
+
+t0 = time.time()
+threads = [threading.Thread(target=client, args=(i,)) for i in range(N)]
+for t in threads: t.start()
+for t in threads: t.join()
+time.sleep(0.1)
+print(f&quot;{len(ok)} 个客户端全部收到正确回显，耗时 {time.time() - t0:.2f}s&quot;)
+print(f&quot;服务端同时存在的处理线程峰值：{peak['threads']} 个&quot;)
+</code></pre>
+<p>输出：</p>
+<pre><code class="language-text">200 个客户端全部收到正确回显，耗时 0.50s
+服务端同时存在的处理线程峰值：200 个
+</code></pre>
+<p>200 个连接，服务端就有 200 个线程，而它们在 0.5 秒里的绝大部分时间都阻塞在 <code>recv</code> 上。连接数到 2 万、20 万时，这条路就走不通了。</p>
+<h3 id="selectorsepoll">版本二：selectors（epoll）单线程事件循环</h3>
+<p>Python 标准库的 <code>selectors</code> 模块会自动选择平台上最好的多路复用机制，Linux 上就是 epoll：</p>
+<pre><code class="language-python">import selectors, socket, threading, time
+
+sel = selectors.DefaultSelector()            # Linux 上是 EpollSelector
+print(&quot;选择器:&quot;, type(sel).__name__)
+
+def accept(server):
+    conn, _ = server.accept()                 # 监听 socket 可读 = 有新连接
+    conn.setblocking(False)
+    sel.register(conn, selectors.EVENT_READ, handle)
+
+def handle(conn):
+    data = conn.recv(4096)                    # 已经就绪，不会阻塞
+    if data:
+        conn.sendall(data.upper())            # 回显（小数据，示例里直接发送）
+    else:                                     # 对端关闭
+        sel.unregister(conn)
+        conn.close()
+
+server = socket.create_server((&quot;127.0.0.1&quot;, 0), backlog=1024)
+server.setblocking(False)
+sel.register(server, selectors.EVENT_READ, accept)
+port = server.getsockname()[1]
+
+stats = {&quot;loops&quot;: 0, &quot;events&quot;: 0, &quot;max_ready&quot;: 0}
+def event_loop():                             # Reactor：等事件 → 分发 → 处理
+    while True:
+        ready = sel.select()                  # 底层是 epoll_wait
+        stats[&quot;loops&quot;] += 1
+        stats[&quot;events&quot;] += len(ready)
+        stats[&quot;max_ready&quot;] = max(stats[&quot;max_ready&quot;], len(ready))
+        for key, _ in ready:
+            key.data(key.fileobj)             # 分发给 accept 或 handle
+
+threading.Thread(target=event_loop, daemon=True).start()
+
+# ---------- 客户端：N 个线程同时连上来，每个发 3 条消息 ----------
+N = 200
+ok = []
+def client(i):
+    with socket.create_connection((&quot;127.0.0.1&quot;, port)) as s:
+        for j in range(3):
+            msg = f&quot;hello {i}-{j}&quot;.encode()
+            s.sendall(msg)
+            assert s.recv(4096) == msg.upper()
+            time.sleep(0.1)
+        ok.append(i)
+
+t0 = time.time()
+threads = [threading.Thread(target=client, args=(i,)) for i in range(N)]
+for t in threads: t.start()
+for t in threads: t.join()
+time.sleep(0.1)                              # 等最后几个关闭事件处理完
+print(f&quot;{len(ok)} 个客户端全部收到正确回显，耗时 {time.time() - t0:.2f}s&quot;)
+print(&quot;服务端只用了 1 个事件循环线程&quot;)
+print(f&quot;事件循环转了 {stats['loops']} 圈，处理 {stats['events']} 个事件，&quot;
+      f&quot;单次最多同时就绪 {stats['max_ready']} 个&quot;)
+</code></pre>
+<p>输出（圈数和单次就绪数每次运行略有不同）：</p>
+<pre><code class="language-text">选择器: EpollSelector
+200 个客户端全部收到正确回显，耗时 0.47s
+服务端只用了 1 个事件循环线程
+事件循环转了 389 圈，处理 1000 个事件，单次最多同时就绪 73 个
+</code></pre>
+<p>1000 个事件 = 200 次新连接 + 600 条消息 + 200 次连接关闭。一个线程、几百次 <code>epoll_wait</code>，就把它们全部处理完了，单次最多有几十个连接同时就绪，一次系统调用就全部拿到。</p>
+<p>这里的 <code>accept</code> 和 <code>handle</code> 就是 Reactor 模式里的 Acceptor 和 Handler，<code>event_loop</code> 就是 Reactor。这正是「单 Reactor 单线程」。</p>
+<p>用 strace 看一下事件循环实际调用了哪些系统调用：</p>
+<pre><code class="language-bash">strace -f -c -e trace=epoll_ctl,epoll_wait,accept4 python3 echo_selectors.py
+</code></pre>
+<pre><code class="language-text">选择器: EpollSelector
+200 个客户端全部收到正确回显，耗时 1.14s
+服务端只用了 1 个事件循环线程
+事件循环转了 228 圈，处理 1000 个事件，单次最多同时就绪 167 个
+% time     seconds  usecs/call     calls    errors syscall
+------ ----------- ----------- --------- --------- ----------------
+ 68.89    0.023711         103       228           epoll_wait
+ 15.89    0.005471          27       200           accept4
+ 15.22    0.005238          13       401           epoll_ctl
+------ ----------- ----------- --------- --------- ----------------
+100.00    0.034420          41       829           total
+</code></pre>
+<p>数字完全对得上：<code>epoll_wait</code> 228 次 = 事件循环 228 圈；<code>epoll_ctl</code> 401 次 = 监听 socket 注册 1 次 + 200 个连接各注册 1 次、注销 1 次；<code>accept4</code> 200 次 = 200 个新连接。注册只在连接建立和关闭时发生，平时只有 <code>epoll_wait</code>。</p>
+<blockquote>
+<p>这个示例为了简洁做了简化：<code>sendall</code> 在非阻塞 socket 上如果遇到发送缓冲区满，会抛出 <code>BlockingIOError</code>。生产代码要把没发完的数据存起来，注册 <code>EVENT_WRITE</code> 事件，等 socket 可写时再继续发。另外，事件循环里不能有任何慢操作，否则所有连接都会被拖慢。实际项目中更推荐直接使用 <code>asyncio</code>，它就是在 selectors 之上实现的事件循环。</p>
+</blockquote>
+<h3 id="java-nio-selector">版本三：Java NIO Selector</h3>
+<p>同样的单线程 Reactor，用 Java NIO 写（客户端用 Java 21 的虚拟线程，每个客户端都是普通的阻塞写法）：</p>
+<pre><code class="language-java">import java.net.InetSocketAddress;
+import java.nio.ByteBuffer;
+import java.nio.channels.*;
+import java.nio.charset.StandardCharsets;
+import java.util.Iterator;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicInteger;
+
+public class NioEcho {
+    public static void main(String[] args) throws Exception {
+        Selector selector = Selector.open();                       // 多路复用器
+        System.out.println(&quot;Selector 实现类: &quot; + selector.getClass().getName());
+
+        ServerSocketChannel server = ServerSocketChannel.open();   // 监听 Channel
+        server.bind(new InetSocketAddress(&quot;127.0.0.1&quot;, 0));
+        server.configureBlocking(false);                           // 必须是非阻塞
+        server.register(selector, SelectionKey.OP_ACCEPT);
+        int port = ((InetSocketAddress) server.getLocalAddress()).getPort();
+
+        Thread loop = new Thread(() -&gt; {                           // 单线程 Reactor
+            try {
+                while (true) {
+                    selector.select();                             // 等事件（epoll_wait）
+                    Iterator&lt;SelectionKey&gt; it = selector.selectedKeys().iterator();
+                    while (it.hasNext()) {
+                        SelectionKey key = it.next();
+                        it.remove();                               // 处理过的要手动移除
+                        if (key.isAcceptable()) {                  // 新连接
+                            SocketChannel ch = server.accept();
+                            ch.configureBlocking(false);
+                            ch.register(selector, SelectionKey.OP_READ, ByteBuffer.allocate(1024));
+                        } else if (key.isReadable()) {             // 有数据可读
+                            SocketChannel ch = (SocketChannel) key.channel();
+                            ByteBuffer buf = (ByteBuffer) key.attachment();
+                            int n = ch.read(buf);                  // Channel → Buffer
+                            if (n &lt; 0) { key.cancel(); ch.close(); continue; }
+                            buf.flip();                            // 写模式 → 读模式
+                            ch.write(buf);                         // Buffer → Channel（示例数据小，一次写完）
+                            buf.clear();
+                        }
+                    }
+                }
+            } catch (Exception e) { e.printStackTrace(); }
+        }, &quot;reactor&quot;);
+        loop.setDaemon(true);
+        loop.start();
+
+        // 客户端：200 个虚拟线程，每个用普通的阻塞写法连上来
+        int n = 200;
+        AtomicInteger ok = new AtomicInteger();
+        long t0 = System.nanoTime();
+        try (ExecutorService pool = Executors.newVirtualThreadPerTaskExecutor()) {
+            for (int i = 0; i &lt; n; i++) {
+                int id = i;
+                pool.submit(() -&gt; {
+                    try (SocketChannel c = SocketChannel.open(new InetSocketAddress(&quot;127.0.0.1&quot;, port))) {
+                        for (int j = 0; j &lt; 3; j++) {
+                            byte[] msg = (&quot;hello &quot; + id + &quot;-&quot; + j).getBytes(StandardCharsets.UTF_8);
+                            c.write(ByteBuffer.wrap(msg));
+                            ByteBuffer r = ByteBuffer.allocate(64);
+                            while (r.position() &lt; msg.length) c.read(r);
+                            if (!new String(r.array(), 0, r.position(), StandardCharsets.UTF_8).equals(&quot;hello &quot; + id + &quot;-&quot; + j))
+                                throw new IllegalStateException(&quot;回显错误&quot;);
+                            Thread.sleep(100);
+                        }
+                        ok.incrementAndGet();
+                    }
+                    return null;
+                });
+            }
+        }
+        System.out.printf(&quot;%d 个客户端全部收到正确回显，耗时 %.2fs%n&quot;, ok.get(), (System.nanoTime() - t0) / 1e9);
+        System.out.println(&quot;服务端事件循环线程: &quot; + loop.getName() + &quot;（只有 1 个）&quot;);
+    }
+}
+</code></pre>
+<p>用 JDK 21 直接运行源文件：<code>java NioEcho.java</code>，输出：</p>
+<pre><code class="language-text">Selector 实现类: sun.nio.ch.EPollSelectorImpl
+200 个客户端全部收到正确回显，耗时 1.58s
+服务端事件循环线程: reactor（只有 1 个）
+</code></pre>
+<p>第一行就说明了一切：在 Linux 上，<code>Selector.open()</code> 拿到的就是基于 epoll 的实现。</p>
+<p>几个 Java NIO 的易错点，都在这段代码里：</p>
+<ul>
+<li>注册到 Selector 的 Channel <strong>必须</strong> <code>configureBlocking(false)</code>，否则会抛 <code>IllegalBlockingModeException</code>；</li>
+<li><code>selectedKeys()</code> 里的 key 处理完要<strong>手动 <code>remove()</code></strong>，否则下一轮还会出现；</li>
+<li>Buffer 写入后要 <strong><code>flip()</code></strong> 才能读，读完要 <code>clear()</code> 或 <code>compact()</code>；</li>
+<li><code>read</code> 返回 <code>-1</code> 表示对端关闭，要 <code>cancel</code> 并关闭 Channel，否则 LT 模式下会一直触发可读事件，CPU 被打满。</li>
+</ul>
+<p>正是因为原生 NIO 这么多坑，实际项目一般都用 Netty。</p>
+<h2 id="_10">工程实践与常见坑</h2>
+<h3 id="_11">怎么选</h3>
+<table>
+<thead>
+<tr>
+<th>场景</th>
+<th>推荐</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>连接少、每个连接都很忙（比如数据库连接池）</td>
+<td>阻塞 I/O + 线程池就够了，简单可靠</td>
+</tr>
+<tr>
+<td>大量长连接（网关、推送、IM、游戏服务器、RPC 框架）</td>
+<td>epoll / Netty 主从 Reactor</td>
+</tr>
+<tr>
+<td>Java 业务代码，想要高并发又不想写回调</td>
+<td>Java 21 虚拟线程 + 阻塞写法</td>
+</tr>
+<tr>
+<td>Go 服务</td>
+<td>直接用 goroutine + 阻塞写法，运行时帮你做了 epoll</td>
+</tr>
+<tr>
+<td>大文件下载、日志 / 消息分发</td>
+<td>sendfile / <code>transferTo</code> 零拷贝</td>
+</tr>
+<tr>
+<td>追求极致的磁盘 I/O 或系统调用开销</td>
+<td>评估 io_uring</td>
+</tr>
+</tbody>
+</table>
+<h3 id="_12">常见的坑</h3>
+<ol>
+<li><strong>在事件循环里做阻塞操作</strong>：这是 Reactor 程序最常见、后果最严重的问题。一次慢查询就会让同一个 EventLoop 上的所有连接一起卡顿，表现为「偶发的、成片的超时」。</li>
+<li><strong>ET 模式没有读到 <code>EAGAIN</code></strong>：数据「卡」在缓冲区里，表现为请求偶尔没有响应，对端再发一点数据又好了。</li>
+<li><strong>忘记处理写不完</strong>：非阻塞 <code>write</code> 可能只写了一部分。要把剩余数据存起来，注册可写事件；写完后要<strong>取消</strong>可写事件，否则在 LT 模式下 socket 几乎一直可写，事件循环会空转。</li>
+<li><strong>文件描述符上限</strong>：每个连接占一个 fd。Linux 默认的 <code>ulimit -n</code> 往往只有 1024，上线前要调大，否则会出现 <code>Too many open files</code>。</li>
+<li><strong>惊群</strong>：多个进程或线程等待同一个监听 socket，一个新连接到来时，它们可能被同时唤醒，但只有一个能 accept 成功。现代内核和软件通过 <code>EPOLLEXCLUSIVE</code>、<code>SO_REUSEPORT</code>（每个进程一个独立的监听 socket）、加锁 accept 等方式缓解。</li>
+<li><strong>把 epoll 用在普通文件上</strong>：会直接失败（<code>EPERM</code>）。磁盘 I/O 要用线程池（比如 Node.js 的 libuv 就是用线程池做文件 I/O）或 io_uring。</li>
+<li><strong>只看平均值</strong>：事件循环模型对「个别慢请求」非常敏感，要监控事件循环的延迟（比如每轮循环耗时、任务排队时长）和 P99 延迟。</li>
+</ol>
+<h2 id="_13">高频面试题速答</h2>
+<p><strong>Q：一次网络读取经历哪两个阶段？</strong>
+① 等待数据就绪：数据从网络到达，进入内核的 socket 接收缓冲区；② 拷贝数据：内核把数据从 socket 缓冲区拷贝到用户空间。各种 I/O 模型的区别就在这两个阶段是否阻塞。</p>
+<p><strong>Q：BIO、NIO、AIO 有什么区别？</strong>
+BIO 是阻塞 I/O，一个连接一个线程；NIO 基于 I/O 多路复用（Selector），一个线程管理很多连接，是同步非阻塞；AIO 是异步 I/O，发起读写后立即返回，完成后回调通知。Java 的 AIO 在 Linux 上内部是用 epoll 加线程池模拟的，所以用得不多。</p>
+<p><strong>Q：select、poll、epoll 的区别？</strong>
+select 用位图，fd 编号不能超过 1024，每次全量拷贝和遍历；poll 用数组，去掉了 1024 限制，但仍然每次全量拷贝和遍历；epoll 注册和等待分离，内核用红黑树管理 fd，就绪时回调放入就绪链表，<code>epoll_wait</code> 只返回就绪的 fd，复杂度与就绪数成正比。</p>
+<p><strong>Q：epoll 为什么高效？</strong>
+fd 只需注册一次，不用每次拷贝；内核通过回调维护就绪链表，不需要遍历全部 fd；返回的只有就绪事件，用户也不用遍历。在「连接多、活跃少」的场景下优势最明显。</p>
+<p><strong>Q：LT 和 ET 的区别？ET 为什么必须用非阻塞 fd？</strong>
+LT 只要缓冲区还有数据就一直通知；ET 只在有新数据到来时通知一次。ET 下必须一次读完，判断读完的方法是读到 <code>EAGAIN</code>，如果 fd 是阻塞的，最后一次读会卡住整个线程。</p>
+<p><strong>Q：同步 / 异步和阻塞 / 非阻塞有什么区别？</strong>
+阻塞 / 非阻塞看调用本身：数据没就绪时是挂起还是立即返回。同步 / 异步看数据怎么到手：是线程自己去读（包括等待拷贝完成），还是内核拷贝完再通知。epoll 是同步非阻塞，只有 AIO、io_uring、IOCP 这类才是异步。</p>
+<p><strong>Q：Redis 为什么单线程还这么快？</strong>
+命令执行基于内存，非常快；基于 epoll 的单 Reactor 事件循环，一个线程就能处理大量连接；单线程没有锁和线程切换开销。6.0 之后可以开启 I/O 线程分担网络读写，但命令执行仍然是单线程的。</p>
+<p><strong>Q：Netty 的线程模型是什么？</strong>
+主从 Reactor：bossGroup 负责 accept 新连接，workerGroup 中的每个 EventLoop（一个线程 + 一个 Selector）负责一批连接的读写；一个 Channel 始终由同一个 EventLoop 处理，无需加锁。耗时业务应交给单独的业务线程池。</p>
+<p><strong>Q：什么是零拷贝？</strong>
+减少数据在内核与用户空间之间的 CPU 拷贝。mmap 把文件映射进用户空间，省掉一次拷贝；sendfile 让数据全程留在内核，网卡支持 SG-DMA 时可以完全没有 CPU 拷贝。Java 中对应 <code>FileChannel.transferTo</code> 和 <code>MappedByteBuffer</code>，Kafka、Nginx 都在使用。</p>
+<p><strong>Q：Reactor 和 Proactor 的区别？</strong>
+Reactor 基于同步 I/O：内核通知「可以读了」，应用自己去读；Proactor 基于异步 I/O：应用发起读操作，内核读完后通知「已经读好了」。</p>
+<h2 id="_14">总结</h2>
+<figure><img src="img/f-83.jpg" alt="四个关键点" loading="lazy"><figcaption>四个关键点</figcaption></figure>
+<ul>
+<li>一次网络读取分两个阶段：<strong>① 等数据就绪，② 从内核拷贝到用户空间</strong>；五种 I/O 模型的区别，就是这两个阶段谁在等；</li>
+<li><strong>BIO</strong> 一连接一线程，简单但扛不住 C10K；<strong>非阻塞 I/O</strong> 不卡线程，但只能空转轮询；</li>
+<li><strong>I/O 多路复用</strong>让一个线程同时等很多 fd：select 有 1024 限制且每次全量拷贝遍历，poll 去掉了限制，<strong>epoll</strong> 用红黑树 + 就绪链表 + 回调，只返回就绪的 fd；</li>
+<li>epoll 有 <strong>LT</strong>（有数据就一直提醒）和 <strong>ET</strong>（只在变化时提醒一次，必须非阻塞读到 EAGAIN）两种触发方式；</li>
+<li>阻塞 / 非阻塞看调用是否挂起，同步 / 异步看数据是谁拷贝到手的：<strong>epoll 是同步非阻塞</strong>，io_uring、IOCP 才是异步；</li>
+<li><strong>Reactor</strong> 把多路复用组织成事件循环：Redis（6.0 前）是单 Reactor 单线程，Netty 和 Kafka 是主从 Reactor；</li>
+<li><strong>零拷贝</strong>（sendfile、mmap）让数据少在用户空间绕路；</li>
+<li>一句话：<strong>别让线程等数据，让就绪的数据来找线程。</strong></li>
+</ul>
+<div class="refs">
+<h3 id="_15">参考资料</h3>
+<ul>
+<li>Linux man-pages：select(2)、poll(2)、epoll(7)、epoll_ctl(2)、epoll_wait(2)、sendfile(2)、mmap(2)、io_uring(7).</li>
+<li>Linux 内核源码：fs/eventpoll.c.</li>
+<li>POSIX.1-2017（The Open Group Base Specifications Issue 7）：Definitions — Synchronous I/O Operation、Asynchronous I/O Operation.</li>
+<li>《UNIX 网络编程 卷 1：套接字联网 API》（第 3 版），第 6 章「I/O 复用」.</li>
+<li>The C10K problem（kegel.com/c10k.html）.</li>
+<li>Reactor: An Object Behavioral Pattern for Demultiplexing and Dispatching Handles for Synchronous Events. <em>Pattern Languages of Program Design</em>, 1995.</li>
+<li>Scalable IO in Java（讲义，gee.cs.oswego.edu）.</li>
+<li>Java SE 21 API 文档：java.nio.channels.Selector、SocketChannel、FileChannel.transferTo；JEP 444: Virtual Threads.</li>
+<li>Netty 文档：User Guide for 4.x；Redis 文档：Redis configuration（io-threads）.</li>
+<li>Apache Kafka 文档：Design — Efficiency（sendfile 与零拷贝）.</li>
+<li>Python 文档：selectors — High-level I/O multiplexing；select — Waiting for I/O completion.</li>
+</ul>
+</div>
+  </article>
+  <div class="foot"><a href="../index.html">← 拾星首页</a><a href="landscape.html">▶ 看配套视频</a></div>
+</div>
+</body>
+</html>
