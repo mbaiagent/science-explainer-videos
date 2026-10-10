@@ -1,0 +1,240 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<link rel="icon" href="/assets/favicon.ico" sizes="any">
+<link rel="icon" type="image/png" sizes="32x32" href="/assets/favicon-32x32.png">
+<link rel="icon" type="image/png" sizes="16x16" href="/assets/favicon-16x16.png">
+<link rel="apple-touch-icon" href="/assets/apple-touch-icon.png">
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Transformer 详解：拆开大模型的骨架</title>
+</head>
+<body style="margin:0;padding:0;background:#fff;">
+<div style="max-width:677px;margin:0 auto;padding:24px 16px;font-family:-apple-system,BlinkMacSystemFont,'PingFang SC','Hiragino Sans GB','Microsoft YaHei',sans-serif;color:#333;font-size:15px;line-height:1.75;">
+
+<!-- 标题区 -->
+<h1 style="font-size:24px;line-height:1.4;margin:0 0 8px 0;color:#111;">Transformer 详解：拆开大模型的骨架</h1>
+<p style="font-size:14px;color:#888;margin:0 0 20px 0;">从输入到输出的完整流程，自注意力的 Q、K、V 与公式推导，因果掩码、多头注意力、前馈网络、残差与归一化、位置编码，附一段可运行的 NumPy 实现</p>
+
+<!-- 头图 -->
+<figure style="margin:0 0 24px 0;text-align:center;">
+<img src="img/f-5.jpg" alt="几乎所有大语言模型，骨架都是 Transformer" style="max-width:100%;border-radius:8px;">
+<figcaption style="font-size:13px;color:#999;margin-top:8px;">几乎所有大语言模型，骨架都是 Transformer</figcaption>
+</figure>
+
+<!-- 正文开始 -->
+<h2 style="font-size:20px;color:#111;margin:32px 0 12px 0;padding-left:12px;border-left:4px solid #ec4899;">为什么要单独讲 Transformer</h2>
+<p>GPT 的全称是 Generative Pre-trained <strong>Transformer</strong>。不只是 GPT，Claude、Gemini、Llama、DeepSeek、Qwen 等几乎所有大语言模型，核心结构都是 Transformer。它出自 2017 年 Google 研究人员发表的论文《Attention Is All You Need》，最初用于机器翻译，后来成为了整个大模型时代的基石。</p>
+<p>本系列《什么是 LLM》从「猜下一个词」的角度介绍了大模型，这一篇深入一层，把 Transformer 内部的每个部件拆开来看。</p>
+
+<h2 style="font-size:20px;color:#111;margin:32px 0 12px 0;padding-left:12px;border-left:4px solid #ec4899;">从输入到输出：完整流程</h2>
+<figure style="margin:0 0 16px 0;text-align:center;">
+<img src="img/f-17.jpg" alt="从一句话到下一个词" style="max-width:100%;border-radius:8px;">
+<figcaption style="font-size:13px;color:#999;margin-top:8px;">从一句话到下一个词</figcaption>
+</figure>
+<p>今天的大语言模型多采用<strong>只有解码器</strong>（decoder-only）的 Transformer。生成一个词的完整流程是：</p>
+<ol style="padding-left:20px;">
+<li><strong>分词</strong>：把输入文字切成 token，比如「小猫 | 追着 | 球」，每个 token 对应词表中的一个编号；</li>
+<li><strong>词嵌入</strong>：通过查表，把每个 token 编号变成一个向量（比如 4096 维），这个向量表示 token 的含义（见本系列《Embedding 向量》）；</li>
+<li><strong>位置编码</strong>：给每个向量加上位置信息，让模型知道 token 的先后顺序；</li>
+<li><strong>N 层 Transformer 块</strong>：每一层包含「多头自注意力」和「前馈网络」，向量经过一层层加工，逐渐融合上下文信息；</li>
+<li><strong>输出层</strong>：把最后一个位置的向量映射到整个词表，经过 softmax 得到每个 token 作为下一个词的概率；</li>
+<li><strong>采样</strong>：选出一个 token（比如「跑」），拼回输入，重复整个过程。</li>
+</ol>
+<p>模型的「参数」，主要就是嵌入表、注意力层和前馈网络中那些矩阵里的数字。大模型往往有几十层甚至上百层这样的 Transformer 块。</p>
+<blockquote style="margin:16px 0;padding:12px 16px;border-left:3px solid #f9a8d4;background:#fdf2f8;border-radius:0 8px 8px 0;color:#555;font-size:14px;">
+原始论文中的 Transformer 包括<strong>编码器</strong>和<strong>解码器</strong>两部分：编码器读入源语言句子，解码器生成目标语言。BERT 只用了编码器，GPT 系列只用了解码器。
+</blockquote>
+
+<h2 style="font-size:20px;color:#111;margin:32px 0 12px 0;padding-left:12px;border-left:4px solid #ec4899;">核心：自注意力</h2>
+<figure style="margin:0 0 16px 0;text-align:center;">
+<img src="img/f-31.jpg" alt="用 Q、K、V 计算「它」应该关注谁" style="max-width:100%;border-radius:8px;">
+<figcaption style="font-size:13px;color:#999;margin-top:8px;">用 Q、K、V 计算「它」应该关注谁</figcaption>
+</figure>
+
+<h3 style="font-size:17px;color:#111;margin:24px 0 10px 0;">要解决的问题</h3>
+<p>在「小猫追着球跑，因为它饿了」这句话中，模型处理「它」时，需要知道「它」指的是小猫。也就是说，每个 token 的表示都应该融合上下文中与它相关的信息。<strong>自注意力</strong>（self-attention）就是完成这件事的机制。</p>
+
+<h3 style="font-size:17px;color:#111;margin:24px 0 10px 0;">Q、K、V 三个向量</h3>
+<p>对于每个 token 的向量 x，用三个可学习的矩阵分别相乘，得到三个新向量：</p>
+<table style="width:100%;border-collapse:collapse;font-size:14px;margin:12px 0;">
+<thead><tr>
+<th style="border:1px solid #e5e7eb;padding:8px 10px;background:#fdf2f8;text-align:left;">向量</th>
+<th style="border:1px solid #e5e7eb;padding:8px 10px;background:#fdf2f8;text-align:left;">计算</th>
+<th style="border:1px solid #e5e7eb;padding:8px 10px;background:#fdf2f8;text-align:left;">含义</th>
+</tr></thead>
+<tbody>
+<tr><td style="border:1px solid #e5e7eb;padding:8px 10px;"><strong>Q</strong>（Query，查询）</td><td style="border:1px solid #e5e7eb;padding:8px 10px;">x · W_Q</td><td style="border:1px solid #e5e7eb;padding:8px 10px;">我在找什么样的信息？</td></tr>
+<tr><td style="border:1px solid #e5e7eb;padding:8px 10px;"><strong>K</strong>（Key，键）</td><td style="border:1px solid #e5e7eb;padding:8px 10px;">x · W_K</td><td style="border:1px solid #e5e7eb;padding:8px 10px;">我能提供什么样的信息？</td></tr>
+<tr><td style="border:1px solid #e5e7eb;padding:8px 10px;"><strong>V</strong>（Value，值）</td><td style="border:1px solid #e5e7eb;padding:8px 10px;">x · W_V</td><td style="border:1px solid #e5e7eb;padding:8px 10px;">我实际携带的信息内容</td></tr>
+</tbody>
+</table>
+<p>可以类比图书馆检索：Q 是你的检索词，K 是每本书的索引标签，V 是书的内容。检索词和标签越匹配，你从这本书里获取的内容就越多。</p>
+
+<h3 style="font-size:17px;color:#111;margin:24px 0 10px 0;">三步计算</h3>
+<p>以「它」为例：</p>
+<ol style="padding-left:20px;">
+<li><strong>算相关度</strong>：用「它」的 Q，分别和每个 token 的 K 做点积，得到一组分数。点积越大，说明越相关；</li>
+<li><strong>归一化</strong>：对分数做 softmax，变成一组加起来等于 1 的权重，比如「小猫」46%、「它」自己 18%、「球」12%……</li>
+<li><strong>加权求和</strong>：用这些权重，对所有 token 的 V 加权求和，得到「它」的新表示。这个新表示中，包含了大量来自「小猫」的信息。</li>
+</ol>
+<p>每个 token 都会同时进行这样的计算。</p>
+
+<h2 style="font-size:20px;color:#111;margin:32px 0 12px 0;padding-left:12px;border-left:4px solid #ec4899;">注意力矩阵与公式</h2>
+<figure style="margin:0 0 16px 0;text-align:center;">
+<img src="img/f-43.5.jpg" alt="注意力矩阵与因果掩码" style="max-width:100%;border-radius:8px;">
+<figcaption style="font-size:13px;color:#999;margin-top:8px;">注意力矩阵与因果掩码</figcaption>
+</figure>
+<p>把所有 token 的 Q、K、V 分别堆成矩阵，所有位置的注意力就可以用一次矩阵运算算完：</p>
+<div style="margin:16px 0;padding:16px;background:#fdf2f8;border-radius:8px;text-align:center;font-size:16px;">
+<strong>Attention(Q, K, V) = softmax( Q·K<sup>T</sup> / √d ) · V</strong>
+</div>
+<ul style="padding-left:20px;">
+<li><code style="background:#f3f4f6;padding:2px 6px;border-radius:4px;font-size:13px;">Q·Kᵀ</code>：得到一个 n × n 的分数矩阵，第 i 行第 j 列表示第 i 个 token 对第 j 个 token 的关注程度；</li>
+<li><code style="background:#f3f4f6;padding:2px 6px;border-radius:4px;font-size:13px;">/ √d</code>：d 是 K 向量的维度。维度高时点积的数值会很大，导致 softmax 的输出过于极端、梯度很小，除以 √d 进行缩放可以让训练更稳定；</li>
+<li><code style="background:#f3f4f6;padding:2px 6px;border-radius:4px;font-size:13px;">softmax</code>：对每一行做归一化；</li>
+<li><code style="background:#f3f4f6;padding:2px 6px;border-radius:4px;font-size:13px;">· V</code>：按权重对 V 加权求和。</li>
+</ul>
+
+<h3 style="font-size:17px;color:#111;margin:24px 0 10px 0;">因果掩码</h3>
+<p>生成文字时，模型是一个词一个词往后写的，第 i 个位置<strong>不应该看到后面的词</strong>（否则训练时就等于偷看了答案）。所以在 softmax 之前，把分数矩阵右上角（j &gt; i 的部分）全部设为负无穷，softmax 之后这些位置的权重就变成了 0。这叫<strong>因果掩码</strong>（causal mask）。</p>
+
+<h3 style="font-size:17px;color:#111;margin:24px 0 10px 0;">一段可运行的实现</h3>
+<p>用 NumPy 实现带因果掩码的单头自注意力：</p>
+<pre style="background:#282c34;color:#abb2bf;padding:16px;border-radius:8px;font-size:13px;line-height:1.6;overflow-x:auto;font-family:'SF Mono',Consolas,'Courier New',monospace;"><code>import numpy as np
+
+def softmax(x):
+    e = np.exp(x - x.max(axis=-1, keepdims=True))
+    return e / e.sum(axis=-1, keepdims=True)
+
+def causal_self_attention(X, Wq, Wk, Wv):
+    """X: (n, d_model)，n 个 token 的向量"""
+    Q, K, V = X @ Wq, X @ Wk, X @ Wv                 # (n, d)
+    d = Q.shape[-1]
+    scores = Q @ K.T / np.sqrt(d)                    # (n, n)
+    mask = np.triu(np.ones_like(scores), k=1)        # 右上角为 1
+    scores = np.where(mask == 1, -1e9, scores)       # 遮住「未来」
+    weights = softmax(scores)                        # 每行加起来等于 1
+    return weights @ V, weights
+
+rng = np.random.default_rng(0)
+n, d_model, d = 5, 16, 8
+X = rng.normal(size=(n, d_model))
+Wq, Wk, Wv = (rng.normal(size=(d_model, d)) * 0.2 for _ in range(3))   # 随机初始化的小权重
+out, w = causal_self_attention(X, Wq, Wk, Wv)
+print(out.shape)          # (5, 8)
+print(np.round(w, 2))     # 下三角矩阵：每个位置只关注自己和前面的 token</code></pre>
+
+<h2 style="font-size:20px;color:#111;margin:32px 0 12px 0;padding-left:12px;border-left:4px solid #ec4899;">多头注意力</h2>
+<figure style="margin:0 0 16px 0;text-align:center;">
+<img src="img/f-54.jpg" alt="不同的头关注不同的关系" style="max-width:100%;border-radius:8px;">
+<figcaption style="font-size:13px;color:#999;margin-top:8px;">不同的头关注不同的关系</figcaption>
+</figure>
+<p>只用一组 Q、K、V，模型只能学到一种「关注方式」。但语言中的关系是多种多样的：指代关系、语法搭配、相邻词语、语义相似……</p>
+<p><strong>多头注意力</strong>（multi-head attention）的做法是：</p>
+<ol style="padding-left:20px;">
+<li>准备 h 组独立的 W_Q、W_K、W_V（比如 32 组），每组叫一个「头」；</li>
+<li>每个头独立计算注意力，各自可以学会关注不同类型的关系；</li>
+<li>把所有头的输出拼接起来，再乘以一个输出矩阵 W_O，得到最终结果。</li>
+</ol>
+<p>为了不增加计算量，每个头的维度通常是总维度除以头数。比如总维度 4096、32 个头，每个头就是 128 维。</p>
+<p>研究者确实在训练好的模型中发现了一些专门负责特定功能的头，但大多数头的作用并不容易用人类语言解释。视频中的三种关系只是示意。</p>
+
+<h2 style="font-size:20px;color:#111;margin:32px 0 12px 0;padding-left:12px;border-left:4px solid #ec4899;">一层的完整结构</h2>
+<figure style="margin:0 0 16px 0;text-align:center;">
+<img src="img/f-65.jpg" alt="一层 Transformer 块的结构" style="max-width:100%;border-radius:8px;">
+<figcaption style="font-size:13px;color:#999;margin-top:8px;">一层 Transformer 块的结构</figcaption>
+</figure>
+<p>一个 Transformer 块（以现代大模型常用的「前置归一化」结构为例）：</p>
+<pre style="background:#282c34;color:#abb2bf;padding:16px;border-radius:8px;font-size:13px;line-height:1.6;overflow-x:auto;font-family:'SF Mono',Consolas,'Courier New',monospace;"><code>x = x + MultiHeadAttention(LayerNorm(x))     # 子层 1：token 之间交换信息
+x = x + FeedForward(LayerNorm(x))            # 子层 2：每个 token 单独加工</code></pre>
+
+<h3 style="font-size:17px;color:#111;margin:24px 0 10px 0;">前馈网络（FFN）</h3>
+<p>对每个 token 的向量<strong>单独</strong>做两次线性变换，中间加一个非线性激活函数：</p>
+<div style="margin:16px 0;padding:16px;background:#fdf2f8;border-radius:8px;text-align:center;font-size:16px;">
+<strong>FFN(x) = W₂ · activation(W₁ · x)</strong>
+</div>
+<p>中间层通常比输入宽好几倍（比如 4 倍）。注意力负责在 token 之间「交换信息」，前馈网络负责对每个 token「深加工」。研究认为，模型学到的大量事实性知识存储在前馈网络的参数中。在很多大模型里，前馈网络占了参数的大头。</p>
+
+<h3 style="font-size:17px;color:#111;margin:24px 0 10px 0;">残差连接</h3>
+<p><code style="background:#f3f4f6;padding:2px 6px;border-radius:4px;font-size:13px;">x = x + 子层(x)</code>：把子层的输入直接加到输出上。它像一条「高速公路」，让信息和梯度可以直接跨层传递，使得几十上百层的深度网络也能顺利训练。</p>
+
+<h3 style="font-size:17px;color:#111;margin:24px 0 10px 0;">层归一化</h3>
+<p>把每个向量的数值调整到稳定的范围，避免在层层传递中数值变得过大或过小。现代模型常用其变体 RMSNorm。</p>
+
+<h3 style="font-size:17px;color:#111;margin:24px 0 10px 0;">位置编码</h3>
+<p>自注意力本身是「无序」的：把句子中的词打乱，每个位置算出的注意力结果不变。所以必须额外告诉模型每个 token 的位置。原论文使用固定的正弦、余弦函数生成位置编码；现在很多大模型使用<strong>旋转位置编码</strong>（RoPE），它把位置信息融入 Q 和 K 的计算中，更好地表达 token 之间的相对距离。</p>
+
+<h2 style="font-size:20px;color:#111;margin:32px 0 12px 0;padding-left:12px;border-left:4px solid #ec4899;">为什么 Transformer 能胜出</h2>
+<figure style="margin:0 0 16px 0;text-align:center;">
+<img src="img/f-76.jpg" alt="RNN 与 Transformer 的对比" style="max-width:100%;border-radius:8px;">
+<figcaption style="font-size:13px;color:#999;margin-top:8px;">RNN 与 Transformer 的对比</figcaption>
+</figure>
+<p>在 Transformer 之前，处理序列的主流方法是 <strong>RNN</strong>（循环神经网络，包括 LSTM）。RNN 按顺序一个词一个词地处理，每一步都依赖上一步的结果。</p>
+<table style="width:100%;border-collapse:collapse;font-size:14px;margin:12px 0;">
+<thead><tr>
+<th style="border:1px solid #e5e7eb;padding:8px 10px;background:#fdf2f8;text-align:left;"></th>
+<th style="border:1px solid #e5e7eb;padding:8px 10px;background:#fdf2f8;text-align:left;">RNN / LSTM</th>
+<th style="border:1px solid #e5e7eb;padding:8px 10px;background:#fdf2f8;text-align:left;">Transformer</th>
+</tr></thead>
+<tbody>
+<tr><td style="border:1px solid #e5e7eb;padding:8px 10px;"><strong>计算方式</strong></td><td style="border:1px solid #e5e7eb;padding:8px 10px;">按顺序逐个处理</td><td style="border:1px solid #e5e7eb;padding:8px 10px;">所有位置同时计算</td></tr>
+<tr><td style="border:1px solid #e5e7eb;padding:8px 10px;"><strong>训练并行度</strong></td><td style="border:1px solid #e5e7eb;padding:8px 10px;">低，难以利用大量 GPU</td><td style="border:1px solid #e5e7eb;padding:8px 10px;">高，非常适合 GPU</td></tr>
+<tr><td style="border:1px solid #e5e7eb;padding:8px 10px;"><strong>长距离依赖</strong></td><td style="border:1px solid #e5e7eb;padding:8px 10px;">信息要经过很多步传递，容易丢失</td><td style="border:1px solid #e5e7eb;padding:8px 10px;">任意两个位置一步直达</td></tr>
+<tr><td style="border:1px solid #e5e7eb;padding:8px 10px;"><strong>扩展性</strong></td><td style="border:1px solid #e5e7eb;padding:8px 10px;">难以做得很大</td><td style="border:1px solid #e5e7eb;padding:8px 10px;">可以稳定地扩展到上千亿参数</td></tr>
+</tbody>
+</table>
+<p><strong>可并行</strong>、<strong>能直接建模长距离关系</strong>、<strong>容易扩展</strong>，这三点使 Transformer 能够在海量数据和算力上训练出越来越大的模型，从而有了今天的大模型。</p>
+
+<h3 style="font-size:17px;color:#111;margin:24px 0 10px 0;">代价</h3>
+<ul style="padding-left:20px;">
+<li><strong>注意力的计算量与序列长度的平方成正比</strong>：序列长度翻倍，注意力部分的计算量大约变成 4 倍。这是长上下文昂贵的主要原因之一，也催生了 FlashAttention、稀疏注意力等大量优化方法；</li>
+<li><strong>KV Cache</strong>：生成时，每生成一个新 token，都要和之前所有 token 的 K、V 做注意力计算。为了避免重复计算，推理时会把之前算好的 K、V 缓存起来。它大大加快了生成速度，但会占用大量显存，上下文越长、并发越多，占用越大。</li>
+</ul>
+
+<h2 style="font-size:20px;color:#111;margin:32px 0 12px 0;padding-left:12px;border-left:4px solid #ec4899;">一些常见的模型参数</h2>
+<table style="width:100%;border-collapse:collapse;font-size:14px;margin:12px 0;">
+<thead><tr>
+<th style="border:1px solid #e5e7eb;padding:8px 10px;background:#fdf2f8;text-align:left;">概念</th>
+<th style="border:1px solid #e5e7eb;padding:8px 10px;background:#fdf2f8;text-align:left;">含义</th>
+</tr></thead>
+<tbody>
+<tr><td style="border:1px solid #e5e7eb;padding:8px 10px;">层数</td><td style="border:1px solid #e5e7eb;padding:8px 10px;">Transformer 块堆叠的数量</td></tr>
+<tr><td style="border:1px solid #e5e7eb;padding:8px 10px;">隐藏维度（d_model）</td><td style="border:1px solid #e5e7eb;padding:8px 10px;">每个 token 向量的长度</td></tr>
+<tr><td style="border:1px solid #e5e7eb;padding:8px 10px;">头数</td><td style="border:1px solid #e5e7eb;padding:8px 10px;">多头注意力中头的数量</td></tr>
+<tr><td style="border:1px solid #e5e7eb;padding:8px 10px;">FFN 维度</td><td style="border:1px solid #e5e7eb;padding:8px 10px;">前馈网络中间层的宽度</td></tr>
+<tr><td style="border:1px solid #e5e7eb;padding:8px 10px;">上下文长度</td><td style="border:1px solid #e5e7eb;padding:8px 10px;">一次能处理的最大 token 数</td></tr>
+<tr><td style="border:1px solid #e5e7eb;padding:8px 10px;">词表大小</td><td style="border:1px solid #e5e7eb;padding:8px 10px;">分词器中 token 的总数</td></tr>
+</tbody>
+</table>
+<p>这些数字共同决定了模型的参数量和计算量。</p>
+
+<h2 style="font-size:20px;color:#111;margin:32px 0 12px 0;padding-left:12px;border-left:4px solid #ec4899;">总结</h2>
+<figure style="margin:0 0 16px 0;text-align:center;">
+<img src="img/f-83.jpg" alt="四个关键部件" style="max-width:100%;border-radius:8px;">
+<figcaption style="font-size:13px;color:#999;margin-top:8px;">四个关键部件</figcaption>
+</figure>
+<ul style="padding-left:20px;">
+<li>Transformer 是几乎所有大语言模型的骨架，今天的主流是<strong>只有解码器</strong>的结构；</li>
+<li><strong>自注意力</strong>：用 Q 和 K 的点积衡量相关度，softmax 后对 V 加权求和，让每个 token 融合上下文；</li>
+<li><strong>因果掩码</strong>让生成时只能看到前面的 token；<strong>多头注意力</strong>从多个角度同时建模关系；</li>
+<li>每一层由<strong>注意力 + 前馈网络</strong>组成，配合<strong>残差连接</strong>和<strong>层归一化</strong>，再堆叠 N 层；</li>
+<li>它胜在<strong>并行、长距离、可扩展</strong>；代价是注意力随长度平方增长，推理需要 <strong>KV Cache</strong>。</li>
+</ul>
+
+<hr style="border:none;border-top:1px solid #eee;margin:32px 0;">
+<h3 style="font-size:16px;color:#111;margin:0 0 10px 0;">参考资料</h3>
+<ol style="font-size:13px;color:#666;padding-left:20px;line-height:1.8;">
+<li>Vaswani, A., et al. (2017). Attention Is All You Need. <em>NeurIPS</em>.</li>
+<li>Radford, A., et al. (2019). Language Models are Unsupervised Multitask Learners (GPT-2). OpenAI.</li>
+<li>Su, J., et al. (2021). RoFormer: Enhanced Transformer with Rotary Position Embedding. <em>arXiv:2104.09864</em>.</li>
+<li>Dao, T., et al. (2022). FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness. <em>NeurIPS</em>.</li>
+<li>Alammar, J. The Illustrated Transformer. jalammar.github.io</li>
+<li>Geva, M., et al. (2021). Transformer Feed-Forward Layers Are Key-Value Memories. <em>EMNLP</em>.</li>
+</ol>
+
+<p style="font-size:13px;color:#999;margin-top:32px;padding-top:16px;border-top:1px solid #eee;">本文首发于 AI 脉动科普站 · explainer.aipulse.lol</p>
+
+</div>
+</body>
+</html>
