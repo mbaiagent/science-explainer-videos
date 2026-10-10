@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>拾星电子书 · 用代码画出看得懂的原理</title>
+<meta name="description" content="拾星电子书：24 章图文详解目录，每章独立成页，配配套视频。">
+<link rel="stylesheet" href="assets/article.css">
+<style>
+  body{padding-top:0}
+  main.ebook{max-width:900px;margin:0 auto;padding:40px 16px 80px}
+  .cover{text-align:center;padding:16px 0 8px}
+  .cover h1{font-size:40px;margin:0 0 8px;letter-spacing:.12em}
+  .cover .slogan{color:#ffd38a;font-size:17px;letter-spacing:.06em;margin:0 0 12px}
+  .cover p{color:var(--muted);line-height:1.8;max-width:640px;margin:0 auto 8px}
+  .cover .back{display:inline-block;margin:12px 8px 0;color:var(--acc);text-decoration:none;font-size:15px}
+  #toc{margin:36px 0 8px}
+  #toc h2.toc-h{font-size:22px;margin:0 0 16px;border:none;padding:0}
+  .toc-cat{color:var(--acc);font-size:16px;margin:22px 0 4px;letter-spacing:.1em;font-weight:700}
+  .toc-sub{color:var(--fg);font-size:14.5px;margin:12px 0 2px;padding-left:12px;font-weight:600;opacity:.85}
+  .toc-item{display:flex;gap:12px;align-items:baseline;padding:9px 12px 9px 28px;border-radius:10px;
+    color:var(--fg);text-decoration:none;font-size:15.5px}
+  .toc-item:hover{background:var(--card)}
+  .toc-no{color:var(--muted);font-variant-numeric:tabular-nums;font-size:13px;min-width:26px}
+  footer{text-align:center;color:var(--muted);font-size:14px;margin-top:72px}
+  footer a{color:var(--acc);text-decoration:none}
+  .sitenav{display:flex;justify-content:space-between;align-items:center;max-width:900px;margin:0 auto;padding:14px 16px}
+  .sitenav .brand{color:var(--fg);text-decoration:none;font-weight:700;font-size:17px}
+  .sitenav .brand span{color:var(--acc);font-size:13px;margin-left:6px}
+  .sitenav nav a{color:var(--muted);text-decoration:none;margin-left:18px;font-size:15px}
+  .sitenav nav a.cur{color:var(--acc)}
+</style>
+</head>
+<body>
+<header class="sitenav">
+  <a class="brand" href="index.html">拾星<span>电子书</span></a>
+  <nav><a href="index.html">首页</a><a href="videos.html">视频</a><a href="ebook.html" class="cur">电子书</a></nav>
+</header>
+<main class="ebook">
+  <div class="cover">
+    <h1>拾星电子书</h1>
+    <p class="slogan">用代码，画出看得懂的原理</p>
+    <p>24 章图文详解，每章独立成页，按顺序读完。每章配一段配套视频，文章页顶部可看。</p>
+    <a class="back" href="videos.html">🎬 去视频站</a><a class="back" href="index.html">← 回到拾星首页</a>
+  </div>
+  <nav id="toc"><h2 class="toc-h">目录</h2>
+<div class="toc-cat">AI 与大模型</div>
+<div class="toc-sub">大模型原理</div>
+<a class="toc-item" href="llm/article.html"><span class="toc-no">01</span>什么是 LLM</a>
+<a class="toc-item" href="embedding/article.html"><span class="toc-no">02</span>Embedding 向量</a>
+<a class="toc-item" href="rag/article.html"><span class="toc-no">03</span>RAG 是什么</a>
+<div class="toc-sub">Agent 与应用</div>
+<a class="toc-item" href="claude-code/article.html"><span class="toc-no">04</span>从零做一个 Claude Code</a>
+<a class="toc-item" href="function-calling-mcp/article.html"><span class="toc-no">05</span>Function Calling 与 MCP</a>
+<a class="toc-item" href="prompt-engineering/article.html"><span class="toc-no">06</span>Prompt 工程与结构化输出</a>
+<a class="toc-item" href="agent-patterns/article.html"><span class="toc-no">07</span>Agent 设计模式</a>
+<div class="toc-sub">跨界趣味</div>
+<a class="toc-item" href="opus-video/article.html"><span class="toc-no">08</span>Opus 5.5 是怎么做视频的</a>
+<div class="toc-cat">计算机与后端</div>
+<div class="toc-sub">计算机基础</div>
+<a class="toc-item" href="jvm/article.html"><span class="toc-no">09</span>JVM 是什么</a>
+<a class="toc-item" href="process-thread-coroutine/article.html"><span class="toc-no">10</span>进程、线程与协程</a>
+<a class="toc-item" href="thread-pool/article.html"><span class="toc-no">11</span>线程池是什么</a>
+<a class="toc-item" href="tcp-handshake/article.html"><span class="toc-no">12</span>TCP 三次握手</a>
+<a class="toc-item" href="http-request/article.html"><span class="toc-no">13</span>按下回车后发生了什么</a>
+<div class="toc-sub">数据库</div>
+<a class="toc-item" href="mysql-mvcc/article.html"><span class="toc-no">14</span>MySQL 的 MVCC</a>
+<a class="toc-item" href="bplus-tree/article.html"><span class="toc-no">15</span>数据库索引：为什么是 B+ 树</a>
+<a class="toc-item" href="transaction-acid/article.html"><span class="toc-no">16</span>事务与 ACID</a>
+<a class="toc-item" href="redis-cache/article.html"><span class="toc-no">17</span>Redis 缓存</a>
+<a class="toc-item" href="mysql-lock/article.html"><span class="toc-no">18</span>MySQL 的锁</a>
+<div class="toc-sub">架构设计</div>
+<a class="toc-item" href="message-queue/article.html"><span class="toc-no">19</span>消息队列</a>
+<a class="toc-item" href="cap-theorem/article.html"><span class="toc-no">20</span>CAP 与 BASE</a>
+<a class="toc-item" href="rate-limiting/article.html"><span class="toc-no">21</span>限流算法</a>
+<div class="toc-cat">心理学 · 人生</div>
+<div class="toc-sub">幸福</div>
+<a class="toc-item" href="happiness/article.html"><span class="toc-no">22</span>幸福的科学</a>
+<a class="toc-item" href="positive-psychology/article.html"><span class="toc-no">23</span>积极心理学</a>
+<div class="toc-sub">意义</div>
+<a class="toc-item" href="meaning-of-life/article.html"><span class="toc-no">24</span>人生的意义</a>
+  </nav>
+  <footer>拾星 · 用代码，画出看得懂的原理<br><a href="videos.html">视频站</a> · <a href="index.html">回到首页</a></footer>
+</main>
+</body>
+</html>

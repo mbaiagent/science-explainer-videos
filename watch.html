@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>观看 · 拾星视频站</title>
+<style>
+  :root{--bg:#0b0c17;--card:#14142a;--fg:#f4ede4;--muted:#9a93a8;--line:rgba(255,255,255,.08);--accent:#6ee7c8}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);
+    font-family:-apple-system,"PingFang SC","Noto Sans SC","Microsoft YaHei",sans-serif;
+    min-height:100vh;padding:0 0 64px}
+  header.top{position:sticky;top:0;z-index:10;background:rgba(11,12,23,.92);backdrop-filter:blur(8px);
+    border-bottom:1px solid var(--line);padding:14px 20px;display:flex;align-items:center;gap:14px}
+  header.top .logo{font-size:22px;font-weight:700;letter-spacing:.1em}
+  header.top .logo span{color:#ffd38a}
+  header.top nav{margin-left:auto;display:flex;gap:16px;font-size:15px}
+  header.top nav a{color:var(--muted);text-decoration:none}
+  header.top nav a:hover{color:var(--fg)}
+  main{max-width:900px;margin:0 auto;padding:24px 20px 0}
+  .player{position:relative;width:100%;aspect-ratio:16/9;background:#000;border-radius:14px;overflow:hidden;border:1px solid var(--line)}
+  .player iframe{position:absolute;inset:0;width:100%;height:100%;border:0}
+  .player:fullscreen,.player:-webkit-full-screen{aspect-ratio:auto;width:100%;height:100%;border-radius:0;border:0}
+  .player.pseudofs{position:fixed;inset:0;z-index:9999;aspect-ratio:auto;width:100%;height:100%;border-radius:0;border:0}
+  /* 手机竖屏伪全屏：把播放器转 90°，横放手机即得横屏大视频 */
+  @media (orientation: portrait){
+    .player.pseudofs{width:100vh;height:100vw;top:50%;left:50%;transform:translate(-50%,-50%) rotate(-90deg)}
+    .player.pseudofs .fsbtn{transform:rotate(90deg)}
+    .player.pseudofs .fs-hint{display:flex}
+  }
+  .fs-hint{display:none;position:absolute;top:50%;left:50%;transform:translate(-50%,-50%) rotate(90deg);
+    z-index:6;background:rgba(0,0,0,.7);color:#fff;font-size:15px;padding:10px 20px;border-radius:999px;
+    pointer-events:none;white-space:nowrap;animation:hintfade 3.5s forwards}
+  @keyframes hintfade{0%,65%{opacity:1}100%{opacity:0}}
+  .fsbtn{position:absolute;top:10px;right:10px;z-index:5;background:rgba(0,0,0,.55);color:#fff;
+    border:1px solid rgba(255,255,255,.25);border-radius:8px;font-size:15px;padding:6px 11px;cursor:pointer}
+  .fsbtn:hover{background:rgba(0,0,0,.85)}
+  .vtitle{font-size:24px;margin:18px 0 6px}
+  .vmeta{color:var(--muted);font-size:14px;margin:0 0 8px}
+  .vnav{display:flex;justify-content:space-between;margin:18px 0 0;font-size:15px}
+  .vnav a{color:var(--fg);text-decoration:none}
+  .vnav .dim{color:var(--muted);opacity:.4}
+  .arttoggle{display:block;margin-top:24px;padding:14px;text-decoration:none;text-align:center;border:1px solid var(--line);border-radius:12px;
+    background:var(--card);color:var(--fg);font-size:16px;cursor:pointer;font-family:inherit}
+  .arttoggle:hover{border-color:var(--accent)}
+  .err{color:var(--muted);padding:40px 0;text-align:center}
+  footer{text-align:center;color:var(--muted);font-size:14px;margin-top:56px}
+  footer a{color:var(--accent);text-decoration:none}
+</style>
+</head>
+<body>
+<header class="top">
+  <div class="logo">拾星<span>视频站</span></div>
+  <nav><a href="index.html">首页</a><a href="videos.html">视频</a><a href="ebook.html">电子书</a></nav>
+</header>
+<main>
+  <div class="player"><iframe id="player" allowfullscreen title="视频"></iframe><button class="fsbtn" id="fsbtn" title="全屏播放">⛶ 全屏</button><div class="fs-hint">⟳ 横放手机观看</div></div>
+  <h1 class="vtitle" id="vtitle">加载中…</h1>
+  <p class="vmeta" id="vmeta"></p>
+  <div class="vnav"><span id="prev"></span><span id="next"></span></div>
+  <a class="arttoggle" id="artlink" href="#">📖 查看图文详解 →</a>
+  <footer>拾星 · 用代码，画出看得懂的原理</footer>
+</main>
+<script>
+const CHAPTERS = [{"topic":"llm","title":"什么是 LLM","desc":"猜下一个词、训练、注意力机制","cat":"AI 与大模型","dur":72},{"topic":"embedding","title":"Embedding 向量","desc":"语义空间、向量运算、对比学习、余弦相似度","cat":"AI 与大模型","dur":80},{"topic":"rag","title":"RAG 是什么","desc":"开卷考试、向量检索、拼提示词再生成","cat":"AI 与大模型","dur":72},{"topic":"claude-code","title":"从零做一个 Claude Code","desc":"大模型 + 工具 + 循环，十几行核心代码","cat":"AI 与大模型","dur":84},{"topic":"function-calling-mcp","title":"Function Calling 与 MCP","desc":"工具调用五步、工具设计、MCP 架构与安全","cat":"AI 与大模型","dur":80},{"topic":"prompt-engineering","title":"Prompt 工程与结构化输出","desc":"好提示词的结构、少样本、思维链、JSON 输出与校验","cat":"AI 与大模型","dur":80},{"topic":"agent-patterns","title":"Agent 设计模式","desc":"工作流与智能体、五种模式、ReAct 循环、设计原则","cat":"AI 与大模型","dur":80},{"topic":"opus-video","title":"Opus 5.5 是怎么做出视频的","desc":"不生成像素，而是写代码；draw(t)、逐帧截图、自我检查","cat":"AI 与大模型","dur":76},{"topic":"jvm","title":"JVM 是什么","desc":"字节码、内存区域、垃圾回收、JIT","cat":"计算机与后端","dur":72},{"topic":"process-thread-coroutine","title":"进程、线程与协程","desc":"隔离的进程、共享的线程、上下文切换、用户态协程","cat":"计算机与后端","dur":80},{"topic":"thread-pool","title":"线程池是什么","desc":"银行柜台比喻、任务流转、7 个参数、拒绝策略","cat":"计算机与后端","dur":80},{"topic":"tcp-handshake","title":"TCP 三次握手","desc":"为什么是三次、四次挥手、重传与窗口、SYN 洪水","cat":"计算机与后端","dur":80},{"topic":"http-request","title":"按下回车后发生了什么","desc":"DNS、TCP 与 TLS 握手、HTTP 请求响应、浏览器渲染","cat":"计算机与后端","dur":80},{"topic":"mysql-mvcc","title":"MySQL 的 MVCC","desc":"隐藏列、undo 版本链、ReadView、RC 与 RR","cat":"计算机与后端","dur":80},{"topic":"bplus-tree","title":"数据库索引：为什么是 B+ 树","desc":"磁盘 IO、B+ 树查找、回表与覆盖索引、最左前缀","cat":"计算机与后端","dur":80},{"topic":"transaction-acid","title":"事务与 ACID","desc":"undo log、redo log 与 WAL、隔离级别、一致性","cat":"计算机与后端","dur":80},{"topic":"redis-cache","title":"Redis 缓存","desc":"为什么快、数据类型、旁路缓存、穿透击穿雪崩","cat":"计算机与后端","dur":80},{"topic":"mysql-lock","title":"MySQL 的锁","desc":"S/X 锁、记录锁·间隙锁·临键锁、死锁","cat":"计算机与后端","dur":80},{"topic":"message-queue","title":"消息队列","desc":"解耦异步削峰、Kafka 分区、不丢不重有序","cat":"计算机与后端","dur":84},{"topic":"cap-theorem","title":"CAP 与 BASE","desc":"分区时 C 与 A 二选一、三选二的误解、最终一致","cat":"计算机与后端","dur":80},{"topic":"rate-limiting","title":"限流算法","desc":"固定窗口、滑动窗口、漏桶、令牌桶，分布式限流","cat":"计算机与后端","dur":80},{"topic":"happiness","title":"幸福的科学","desc":"享乐适应、哈佛成人发展研究、心流","cat":"心理学 · 人生","dur":72},{"topic":"positive-psychology","title":"积极心理学","desc":"从修补问题到培养优势、PERMA、品格优势、3 个练习","cat":"心理学 · 人生","dur":72},{"topic":"meaning-of-life","title":"人生的意义","desc":"弗兰克尔、意义的三个来源、快乐≠意义","cat":"心理学 · 人生","dur":72}];
+(async function(){
+  const q = new URLSearchParams(location.search);
+  const topic = q.get('v');
+  const idx = CHAPTERS.findIndex(c => c.topic === topic);
+  const box = document.getElementById('article');
+  if (idx < 0) { document.getElementById('vtitle').textContent='视频不存在'; document.getElementById('artlink').style.display='none'; return; }
+  const ch = CHAPTERS[idx];
+  document.title = ch.title + ' · 拾星视频站';
+  document.getElementById('player').src = ch.topic + '/landscape.html';
+  document.getElementById('vtitle').textContent = ch.title;
+  document.getElementById('vmeta').textContent = ch.cat + ' · ' + ch.desc + (ch.dur ? ' · ' + Math.floor(ch.dur/60) + ':' + String(ch.dur%60).padStart(2,'0') : '');
+  const prev = document.getElementById('prev'), next = document.getElementById('next');
+  prev.innerHTML = idx > 0 ? `<a href="watch.html?v=${CHAPTERS[idx-1].topic}">← ${CHAPTERS[idx-1].title}</a>` : '<span class="dim">← 上一部</span>';
+  next.innerHTML = idx < CHAPTERS.length-1 ? `<a href="watch.html?v=${CHAPTERS[idx+1].topic}">${CHAPTERS[idx+1].title} →</a>` : '<span class="dim">下一部 →</span>';
+  document.getElementById('artlink').href = ch.topic + '/article.html';
+  // 全屏按钮（iPhone 不支持元素全屏 API，降级为伪全屏铺满）
+  const pwrap = document.querySelector('.player');
+  const fsbtn = document.getElementById('fsbtn');
+  function syncFsBtn(){
+    const on = !!(document.fullscreenElement || document.webkitFullscreenElement) || pwrap.classList.contains('pseudofs');
+    fsbtn.innerHTML = on ? '✕ 退出' : '⛶ 全屏';
+  }
+  function pseudoFs(on){
+    pwrap.classList.toggle('pseudofs', on);
+    document.body.style.overflow = on ? 'hidden' : '';
+    syncFsBtn();
+  }
+  fsbtn.addEventListener('click', () => {
+    if (document.fullscreenElement || document.webkitFullscreenElement) {
+      if (document.exitFullscreen) document.exitFullscreen();
+      else if (document.webkitExitFullscreen) document.webkitExitFullscreen();
+      return;
+    }
+    if (pwrap.classList.contains('pseudofs')) { pseudoFs(false); return; }
+    if (pwrap.requestFullscreen) {
+      const r = pwrap.requestFullscreen();
+      if (r && r.catch) r.catch(() => pseudoFs(true));
+    }
+    else if (pwrap.webkitRequestFullscreen) {
+      try { pwrap.webkitRequestFullscreen(); } catch(e) { pseudoFs(true); }
+    }
+    else pseudoFs(true);
+    setTimeout(syncFsBtn, 300);
+  });
+  document.addEventListener('fullscreenchange', syncFsBtn);
+  document.addEventListener('webkitfullscreenchange', syncFsBtn);})();
+</script>
+</body>
+</html>

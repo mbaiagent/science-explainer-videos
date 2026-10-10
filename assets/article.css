@@ -43,3 +43,11 @@ hr{border:none;border-top:1px solid var(--line);margin:40px 0}
 .foot{margin-top:56px;padding-top:20px;border-top:1px solid var(--line);display:flex;justify-content:space-between;gap:12px;font-size:14px}
 .foot a{color:var(--muted);text-decoration:none}
 @media (max-width:600px){body{font-size:16px}pre code{font-size:12.5px}header.hero h1{font-size:28px}h2{font-size:22px}}
+
+/* 电子书章节导航 */
+.chapternav{display:flex;justify-content:space-between;align-items:center;gap:12px;
+  margin:36px 0 8px;padding:16px 4px 0;border-top:1px dashed var(--line);font-size:15px}
+.chapternav a{color:var(--fg);text-decoration:none;max-width:42%}
+.chapternav a:hover{color:var(--acc)}
+.chapternav .toclink{color:var(--acc);white-space:nowrap}
+.chapternav .dim{color:var(--muted);opacity:.35;max-width:42%}
