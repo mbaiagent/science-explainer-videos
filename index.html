@@ -113,7 +113,10 @@ const VIDEOS = [
   {cat:'cs', title:"可观测性：日志、指标与链路追踪", desc:"大盘全绿用户却喊卡？日志、指标、链路追踪各管什么，P99、traceId 与 SLO 告警", path:'observability/landscape.html', dur:84, color:'#e9d5ff'},
   {cat:'ai', title:"上下文工程：决定 Agent 好坏的那块窗口", desc:"Agent 每一步只看得到窗口里的内容：放什么、放多少、怎么排，决定它的好坏", path:'context-engineering/article.html', dur:0, color:'#7dd3fc', video:false},
   {cat:'ai', title:"Agent 安全：提示词注入与权限边界", desc:"Agent 会读外部内容又能动手，一句藏起来的指令就能让它泄密：提示词注入与分层防御", path:'agent-security/article.html', dur:0, color:'#f87171', video:false},
-  {cat:'ai', title:"Agent 的记忆：记住你，也懂得忘记", desc:"模型为什么每次都失忆，记忆怎么写入、检索、更新和遗忘，以及隐私与记忆投毒", path:'agent-memory/article.html', dur:0, color:'#fcd5ce', video:false}
+  {cat:'ai', title:"Agent 的记忆：记住你，也懂得忘记", desc:"模型为什么每次都失忆，记忆怎么写入、检索、更新和遗忘，以及隐私与记忆投毒", path:'agent-memory/article.html', dur:0, color:'#fcd5ce', video:false},
+  {cat:'ai', title:"多 Agent 协作：什么时候该让 AI 组队", desc:"单 Agent 何时不够用？五种多 Agent 拓扑、派单与汇总、代价与适用场景", path:'multi-agent/article.html', dur:0, color:'#a7f3d0', video:false},
+  {cat:'ai', title:"Skills 技能包：按需翻阅的操作手册", desc:"把说明拆成按需加载的技能包：SKILL.md 格式、渐进式披露、与 MCP 的分工、写法与安全", path:'agent-skills/article.html', dur:0, color:'#f5d0fe', video:false},
+  {cat:'ai', title:"Token、上下文窗口与 KV Cache", desc:"token 怎么切、为什么输出更贵，KV Cache 为何这么占显存，提示词缓存为何又快又省", path:'tokens-kv-cache/article.html', dur:0, color:'#bfdbfe', video:false}
 ];
 const fmt = s => `${Math.floor(s/60)}:${String(s%60).padStart(2,'0')}`;
 const esc = s => s.replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));

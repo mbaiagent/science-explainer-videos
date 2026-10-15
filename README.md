@@ -57,6 +57,9 @@
 | 上下文工程：决定 Agent 好坏的那块窗口 | `context-engineering/article.html` | 图文 | — |
 | Agent 安全：提示词注入与权限边界 | `agent-security/article.html` | 图文 | — |
 | Agent 的记忆：记住你，也懂得忘记 | `agent-memory/article.html` | 图文 | — |
+| 多 Agent 协作：什么时候该让 AI 组队 | `multi-agent/article.html` | 图文 | — |
+| Skills 技能包：按需翻阅的操作手册 | `agent-skills/article.html` | 图文 | — |
+| Token、上下文窗口与 KV Cache | `tokens-kv-cache/article.html` | 图文 | — |
 
 ### 幸福的科学
 钩子 → 享乐适应（快乐曲线 + 跑步机）→ 哈佛成人发展研究（关系网络）→ 心流（挑战 × 技能坐标图）→ 今晚就能做的 3 件事 → 收尾
