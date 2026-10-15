@@ -54,6 +54,9 @@
 | Raft：让多台机器达成一致 | `raft/landscape.html` | 横屏 1920×1080 | 84s |
 | Git 原理：一个内容寻址的文件系统 | `git-internals/landscape.html` | 横屏 1920×1080 | 84s |
 | 可观测性：日志、指标与链路追踪 | `observability/landscape.html` | 横屏 1920×1080 | 84s |
+| 上下文工程：决定 Agent 好坏的那块窗口 | `context-engineering/article.html` | 图文 | — |
+| Agent 安全：提示词注入与权限边界 | `agent-security/article.html` | 图文 | — |
+| Agent 的记忆：记住你，也懂得忘记 | `agent-memory/article.html` | 图文 | — |
 
 ### 幸福的科学
 钩子 → 享乐适应（快乐曲线 + 跑步机）→ 哈佛成人发展研究（关系网络）→ 心流（挑战 × 技能坐标图）→ 今晚就能做的 3 件事 → 收尾

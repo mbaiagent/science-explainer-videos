@@ -40,6 +40,7 @@
   .card .acts a{flex:1;text-align:center;padding:8px 10px;border-radius:10px;font-size:14px;text-decoration:none;font-weight:600}
   .card .play{background:var(--accent);color:#14121f}
   .card .read{border:1px solid var(--accent);color:var(--accent)}
+  .card .badge{font-size:11px;font-weight:700;margin-left:8px;padding:2px 7px;border-radius:999px;border:1px solid var(--accent);color:var(--accent);vertical-align:middle}
   .card .read.off{border-color:var(--line);color:var(--muted);pointer-events:none}
   footer{margin-top:48px;color:var(--muted);font-size:13px;line-height:1.7}
   code{background:var(--chip);padding:2px 6px;border-radius:6px}
@@ -109,7 +110,10 @@ const VIDEOS = [
   {cat:'cs', title:"volatile 与 Java 内存模型", desc:"另一个线程为什么看不见你的写：JIT 优化、指令重排、happens-before 与双重检查锁", path:'volatile-jmm/landscape.html', dur:84, color:'#d8b4fe'},
   {cat:'cs', title:"Raft：让多台机器达成一致", desc:"主库挂了谁接班？任期、选举、日志复制与多数派提交，看 Raft 如何避免脑裂", path:'raft/landscape.html', dur:84, color:'#fef08a'},
   {cat:'cs', title:"Git 原理：一个内容寻址的文件系统", desc:"Git 存的是快照不是差异：blob、tree、commit，分支只是指针，merge、rebase 与 reflog", path:'git-internals/landscape.html', dur:84, color:'#ff9f80'},
-  {cat:'cs', title:"可观测性：日志、指标与链路追踪", desc:"大盘全绿用户却喊卡？日志、指标、链路追踪各管什么，P99、traceId 与 SLO 告警", path:'observability/landscape.html', dur:84, color:'#e9d5ff'}
+  {cat:'cs', title:"可观测性：日志、指标与链路追踪", desc:"大盘全绿用户却喊卡？日志、指标、链路追踪各管什么，P99、traceId 与 SLO 告警", path:'observability/landscape.html', dur:84, color:'#e9d5ff'},
+  {cat:'ai', title:"上下文工程：决定 Agent 好坏的那块窗口", desc:"Agent 每一步只看得到窗口里的内容：放什么、放多少、怎么排，决定它的好坏", path:'context-engineering/article.html', dur:0, color:'#7dd3fc', video:false},
+  {cat:'ai', title:"Agent 安全：提示词注入与权限边界", desc:"Agent 会读外部内容又能动手，一句藏起来的指令就能让它泄密：提示词注入与分层防御", path:'agent-security/article.html', dur:0, color:'#f87171', video:false},
+  {cat:'ai', title:"Agent 的记忆：记住你，也懂得忘记", desc:"模型为什么每次都失忆，记忆怎么写入、检索、更新和遗忘，以及隐私与记忆投毒", path:'agent-memory/article.html', dur:0, color:'#fcd5ce', video:false}
 ];
 const fmt = s => `${Math.floor(s/60)}:${String(s%60).padStart(2,'0')}`;
 const esc = s => s.replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
@@ -122,8 +126,10 @@ function render(){
   document.getElementById('list').innerHTML = CATS.filter(c => cur === 'all' || c.id === cur).map(c => {
     const vs = VIDEOS.filter(v => v.cat === c.id);
     if (!vs.length) return '';
-    return `<section><h2>${esc(c.name)} <small>${vs.length} 部</small></h2><div class="grid">` +
+    return `<section><h2>${esc(c.name)} <small>${vs.length} 篇</small></h2><div class="grid">` +
       vs.map(v => { const art = v.path.replace(/[^/]+$/, 'article.html');
+        if (v.video === false) return `<div class="card" style="--accent:${v.color};cursor:pointer" onclick="location.href='${art}'"><b>${esc(v.title)}<span class="badge">图文</span></b><span class="d">${esc(v.desc)}</span>` +
+          `<div class="acts"><a class="play" href="${art}" onclick="event.stopPropagation()">📖 读文章</a></div></div>`;
         return `<div class="card" style="--accent:${v.color};cursor:pointer" onclick="location.href='${v.path}'"><b>${esc(v.title)}</b><span class="d">${esc(v.desc)}</span>` +
           `<div class="acts"><a class="play" href="${v.path}" onclick="event.stopPropagation()">▶ 看视频 · ${fmt(v.dur)}</a>` +
           (v.article === false ? `<a class="read off">📖 文章撰写中</a>` : `<a class="read" href="${art}" onclick="event.stopPropagation()">📖 读文章</a>`) + `</div></div>`; }).join('') +

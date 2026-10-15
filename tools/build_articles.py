@@ -18,24 +18,29 @@ TPL = '''<!doctype html>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{title} · 拾星</title>
 <meta name="description" content="{subtitle_attr}">
+<link rel="icon" href="/assets/favicon.ico" sizes="any">
+<link rel="icon" type="image/png" sizes="32x32" href="/assets/favicon-32x32.png">
+<link rel="icon" type="image/png" sizes="16x16" href="/assets/favicon-16x16.png">
+<link rel="apple-touch-icon" href="/assets/apple-touch-icon.png">
 <link rel="stylesheet" href="../assets/article.css">
 <style>:root{{--acc:{color}}}</style>
 </head>
 <body>
 <div class="wrap">
-  <nav class="top"><a href="../index.html">← 拾星 · 全部内容</a><a class="watch" href="landscape.html">▶ 看视频</a></nav>
+  <nav class="top"><a href="../index.html">← 拾星 · 全部内容</a>{watch}</nav>
   <header class="hero">
     <div class="tag">拾星 · {tag}</div>
     <h1>{title}</h1>
     <p>{subtitle}</p>
-    <div class="meta">约 {minutes} 分钟读完 · 配套视频 {dur}</div>
+    <div class="meta">约 {minutes} 分钟读完{durtxt}</div>
   </header>
   {toc}
   <article>
 {body}
   </article>
-  <div class="foot"><a href="../index.html">← 拾星首页</a><a href="landscape.html">▶ 看配套视频</a></div>
+  <div class="foot"><a href="../index.html">← 拾星首页</a>{watch2}</div>
 </div>
+<script src="../assets/stats.js" data-kind="reads"></script>
 </body>
 </html>
 '''
@@ -51,12 +56,13 @@ def build(d):
     out = re.sub(r'<p>\s*<img alt="([^"]*)" src="([^"]+)"\s*/?>\s*</p>',
                  lambda m: f'<figure><img src="{m.group(2)}" alt="{m.group(1)}" loading="lazy"><figcaption>{m.group(1)}</figcaption></figure>', out)
     text_len = len(re.sub(r'<[^>]+>|\s', '', out))
-    vid = open(os.path.join(d, 'landscape.html'), encoding='utf-8').read()
+    vp = os.path.join(d, 'landscape.html'); has = os.path.exists(vp)
+    vid = open(vp, encoding='utf-8').read() if has else ''
     m = re.search(r'DUR = (\d+)', vid); dur = int(m.group(1)) if m else 72
     toc = md.toc.replace('<div class="toc">', '<nav class="toc">').replace('</div>', '</nav>') if md.toc_tokens else ''
     page = TPL.format(title=html.escape(meta['title']), subtitle=html.escape(meta['subtitle']), subtitle_attr=html.escape(meta['subtitle'], quote=True),
                       tag=html.escape(meta.get('tag', '科普')), color=meta.get('color', '#ffb36b'), minutes=max(3, round(text_len/450)),
-                      dur=f'{dur//60}:{dur%60:02d}', toc=toc, body=out)
+                      durtxt=(f' · 配套视频 {dur//60}:{dur%60:02d}' if has else ' · 图文'), watch=('<a class="watch" href="landscape.html">▶ 看视频</a>' if has else ''), watch2=('<a href="landscape.html">▶ 看配套视频</a>' if has else ''), toc=toc, body=out)
     open(os.path.join(d, 'article.html'), 'w', encoding='utf-8').write(page)
     print(f'{d}/article.html  {text_len} 字')
 
